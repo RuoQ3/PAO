@@ -1,0 +1,126 @@
+# pareto_tac_emissions_config.yaml — ADN 产量 vs 再沸器能耗双目标 Pareto 优化配置
+# 对应 Aspen 仿真文件：二级氢氰化工段.bkp
+#
+# 运行方式：
+#   python -m src.main cases/demo_case/pareto_tac_emissions_config.yaml
+#   python -m src.main cases/demo_case/pareto_tac_emissions_config.yaml --dry-run
+#
+# 优化目标：
+#   ADN_FLOW   最大化 ADN 产品质量流量（kg/hr）—— 代表产量/吞吐量
+#   REB_DUTY   最小化再沸器热负荷（kW）         —— 代表能耗/操作成本
+#
+# 为什么这两个目标存在真实权衡（而非原来的 TAC vs EMISSIONS）：
+#   - B:F（塔底采出比）主要控制 ADN_FLOW：B:F 越高 -> 产量越高
+#   - RR（回流比）主要控制 REB_DUTY：RR 越高 -> 能耗越高
+#   - 在高 B:F 下要维持 ADN 纯度 >= 0.9，必须提高 RR -> 能耗上升
+#   - 因此：高产量 <-> 高能耗，存在真实的 Pareto 权衡曲线
+#
+# 原 TAC vs EMISSIONS 配置的问题：
+#   两者均由 REB_DUTY 单一驱动（Pearson r = 1.0），不构成真正的多目标权衡。
+#
+# 约束：
+#   ADN 质量分数 >= 0.9（产品纯度下限）
+
+# ---------------------------------------------------------------------------
+# 仿真文件
+# ---------------------------------------------------------------------------
+simulator:
+  filepath: cases/demo_case/二级氢氰化工段.bkp
+  visible: false
+  suppress_dialogs: true
+  timeout: 300
+  reinit: true
+  verify_inputs: true
+  input_rtol: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# 设计变量
+# ---------------------------------------------------------------------------
+design_variables:
+  - name: T0301_BF
+    description: T0301 塔底采出比（主要控制 ADN 产量）
+    aspen_path: \Data\Blocks\T0301\Input\B:F
+    type: continuous
+    lower_bound: 0.3
+    upper_bound: 0.9
+    initial_value: 0.6
+    unit: "-"
+
+  - name: T0301_FEED_STAGE
+    description: T0301 进料板位置（固定，不参与优化）
+    aspen_path: \Data\Blocks\T0301\Input\FEED_STAGE\0318
+    type: integer
+    lower_bound: 10
+    upper_bound: 20
+    initial_value: 15
+    unit: "-"
+
+  - name: T0301_BASIS_RR
+    description: T0301 回流比（主要控制分离效果和能耗）
+    aspen_path: \Data\Blocks\T0301\Input\BASIS_RR
+    type: continuous
+    lower_bound: 1.0
+    upper_bound: 3.0
+    initial_value: 2.0
+    unit: "-"
+
+# ---------------------------------------------------------------------------
+# 输出节点（目标函数和约束函数从这里读取数值）
+# ---------------------------------------------------------------------------
+output_paths:
+  - \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN    # 用于纯度约束
+  - \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN    # 目标1：ADN 产量
+  - \Data\Blocks\T0301\Output\REB_DUTY             # 目标2：再沸器热负荷
+
+# ---------------------------------------------------------------------------
+# 目标函数
+# ---------------------------------------------------------------------------
+objectives:
+  - name: ADN_FLOW
+    type: aspen_path
+    aspen_path: \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
+    minimize: false    # 最大化产量
+    unit: "kg/hr"
+
+  - name: REB_DUTY
+    type: aspen_path
+    aspen_path: \Data\Blocks\T0301\Output\REB_DUTY
+    minimize: true     # 最小化能耗（再沸器热负荷，kW）
+    unit: "kW"
+
+# ---------------------------------------------------------------------------
+# 约束
+# ---------------------------------------------------------------------------
+constraints:
+  - name: purity_min
+    description: ADN 质量分数不低于 0.9（产品纯度下限）
+    aspen_path: \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+    operator: ">="
+    threshold: 0.9
+
+# ---------------------------------------------------------------------------
+# block/stream 提取配置
+# ---------------------------------------------------------------------------
+extraction:
+  check_status_paths:
+    - \Data\Blocks\T0301
+    - \Data\Streams\ADN
+  blocks:
+    - T0301
+  streams:
+    - ADN
+  block_max_depth: 3
+  stream_max_depth: 3
+  stream_output_subtree: "Output\\STR_MAIN"
+  strict_extraction: false
+
+# ---------------------------------------------------------------------------
+# 优化器（多目标 Pareto 贝叶斯优化）
+# ---------------------------------------------------------------------------
+optimizer:
+  type: pareto_bayesian
+  n_initial_points: 10
+  n_iterations: 30                  # 总仿真次数 = 10 + 30 = 40
+  scalarization: chebyshev          # 对非凸 Pareto 前沿覆盖更均匀
+  acquisition_function: EI
+  random_seed: 42

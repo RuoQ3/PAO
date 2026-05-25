@@ -1,0 +1,104 @@
+# case_config.yaml — ADN 生产工艺贝叶斯优化工况配置
+# 对应 Aspen 仿真文件：二级氢氰化工段.bkp
+# 原始参考：MAPO/example/ADN/config.json（NSGA-II 多目标优化）
+
+# ---------------------------------------------------------------------------
+# 仿真文件
+# ---------------------------------------------------------------------------
+simulator:
+  filepath: cases/demo_case/二级氢氰化工段.bkp
+  visible: false
+  suppress_dialogs: true
+  timeout: 300          # 单次仿真超时（秒）
+  reinit: true          # 每次运行前 reinit，清除上次结果
+  verify_inputs: true   # 写入后读回校验
+  input_rtol: 1.0e-6    # 输入读回校验相对容差
+
+# ---------------------------------------------------------------------------
+# 设计变量（优化器可调参数）
+# ---------------------------------------------------------------------------
+design_variables:
+  - name: T0301_BF
+    description: T0301 塔底采出比
+    aspen_path: \Data\Blocks\T0301\Input\B:F
+    type: continuous
+    lower_bound: 0.3
+    upper_bound: 0.9
+    initial_value: 0.6
+    unit: "-"
+
+  - name: T0301_FEED_STAGE
+    description: T0301 进料板位置
+    aspen_path: \Data\Blocks\T0301\Input\FEED_STAGE\0318
+    type: integer
+    lower_bound: 10
+    upper_bound: 20
+    initial_value: 15
+    unit: "-"
+
+  - name: T0301_BASIS_RR
+    description: T0301 回流比
+    aspen_path: \Data\Blocks\T0301\Input\BASIS_RR
+    type: continuous
+    lower_bound: 1.0
+    upper_bound: 3.0
+    initial_value: 2.0
+    unit: "-"
+
+# ---------------------------------------------------------------------------
+# 输出节点（SimulationRunner.output_paths）
+# ---------------------------------------------------------------------------
+output_paths:
+  - \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+  - \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
+
+# ---------------------------------------------------------------------------
+# 目标函数
+# ---------------------------------------------------------------------------
+objectives:
+  - name: ADN_FRAC
+    description: ADN 产品流股中 ADN 的质量分数
+    aspen_path: \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+    minimize: false     # 最大化
+    unit: ""
+    weight: 1.0
+
+  - name: ADN_FLOW
+    description: ADN 产品流股中 ADN 的质量流量
+    aspen_path: \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
+    minimize: false     # 最大化
+    unit: ""
+    weight: 1.0
+
+# ---------------------------------------------------------------------------
+# 约束（当前无约束）
+# ---------------------------------------------------------------------------
+constraints: []
+
+# ---------------------------------------------------------------------------
+# block/stream 提取配置（对应 RunCaseConfig）
+# ---------------------------------------------------------------------------
+extraction:
+  # 只检查和提取与本工况相关的 block 和 stream
+  # T0302 等其他 block 的收敛状态不影响 ADN 产品结果，不纳入检查
+  check_status_paths:
+    - \Data\Blocks\T0301
+    - \Data\Streams\ADN
+  blocks:
+    - T0301
+  streams:
+    - ADN
+  block_max_depth: 3          # T0301 Output 最深三级（如 B_K\1\HCN）
+  stream_max_depth: 3         # STR_MAIN 下最深三级（MOLEFLOW\MIXED\{comp}）
+  stream_output_subtree: "Output\\STR_MAIN"  # Aspen 将完整流股数据存放在 STR_MAIN
+  strict_extraction: false    # 节点级失败记录到 notes，不阻断目标计算
+
+# ---------------------------------------------------------------------------
+# 优化器参考配置（贝叶斯优化，供 optimize_case.py 读取）
+# ---------------------------------------------------------------------------
+optimizer:
+  type: bayesian          # 本项目使用贝叶斯优化替代原 NSGA-II
+  n_initial_points: 10    # 初始 DOE 采样点数（对应原 populationSize=10）
+  n_iterations: 50        # 贝叶斯优化迭代次数
+  acquisition_function: EI  # Expected Improvement
+  random_seed: 42

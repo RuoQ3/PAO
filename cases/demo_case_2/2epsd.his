@@ -1,0 +1,380 @@
+
+ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+ + +                                                                         + +
+ + +                      ASPEN PLUS CALCULATION HISTORY                     + +
+ + +                                                                         + +
+ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+
+ ASPEN PLUS IS A TRADEMARK OF           HOTLINE:
+ ASPEN TECHNOLOGY, INC.                 U.S.A. 888/996-7100
+ 781/221-6400                           EUROPE (44) 1189-226555
+
+ PLATFORM: WIN-X64                                       MAY 25, 2026        
+ VERSION: 40.0   Build 359                               MONDAY      
+ INSTALLATION:                                           7:50:41 P.M.        
+
+ THIS COPY OF ASPEN PLUS LICENSED TO                                 
+
+
+      ASPEN PLUS (R) IS A PROPRIETARY PRODUCT OF ASPEN TECHNOLOGY, INC.
+      (ASPENTECH), AND MAY BE USED ONLY UNDER AGREEMENT WITH ASPENTECH.
+      RESTRICTED RIGHTS LEGEND:  USE, REPRODUCTION, OR DISCLOSURE BY THE
+      U.S. GOVERNMENT IS SUBJECT TO RESTRICTIONS SET FORTH IN 
+      (i) FAR 52.227-14, Alt. III, (ii) FAR 52.227-19, (iii) DFARS 
+      252.227-7013(c)(1)(ii), or (iv) THE ACCOMPANYING LICENSE AGREEMENT,
+      AS APPLICABLE. FOR PURPOSES OF THE FAR, THIS SOFTWARE SHALL BE DEEMED
+      TO BE "UNPUBLISHED" AND LICENSED WITH DISCLOSURE PROHIBITIONS.
+      CONTRACTOR/SUBCONTRACTOR: ASPEN TECHNOLOGY, INC. 20 CROSBY DRIVE,
+      BEDFORD, MA 01730.
+ *** INPUT SUMMARY ***
+
+ >>CURRENT RUN
+
+   ORIGINAL RUN                           MAY 25, 2026        
+   7:50:41 P.M.                           MONDAY      
+   INPUT FILE: _5019anq.inm
+   RUN ID : _5019anq
+          1    ;
+          2    ;输入文件创建由Aspen Plus Rel. 40.0 at 19:50:41 Mon May 25, 2026
+          3    ;Directory E:\Project\GitHub Repo\PAO\cases\demo_case_2  Runid 2EPSD
+          4    ;
+          5
+          6
+          7    DYNAMICS
+          8        DYNAMICS RESULTS=ON
+          9
+         10    IN-UNITS MET VOLUME-FLOW='cum/hr' ENTHALPY-FLO=kW  &
+         11            HEAT-TRANS-C='kcal/hr-sqm-K' TEMPERATURE=C VOLUME=cum  &
+         12            DELTA-T=C HEAD=meter MOLE-DENSITY='kmol/cum'  &
+         13            MASS-DENSITY='kg/cum' MOLE-ENTHALP='kcal/mol'  &
+         14            MASS-ENTHALP='kcal/kg' HEAT=Gcal MOLE-CONC='mol/l'  &
+         15            SHORT-LENGTH=mm
+         16
+         17    DEF-STREAMS CONVEN ALL
+         18
+         19    MODEL-OPTION
+         20
+         21    DESCRIPTION "
+         22        General Simulation with Metric Units :
+         23        C, bar, kg/hr, kmol/hr, Gcal/hr, cum/hr.
+         24
+         25        Property Method: None
+         26
+         27        Flow basis for input: Mole
+         28
+         29        Stream report composition: Mole flow
+         30        "
+         31
+         32    DATABANKS 'APV140 PURE40' / 'APV140 AQUEOUS' / 'APV140 SOLIDS' &
+         33             / 'APV140 INORGANIC' / NOASPENPCD
+         34
+         35    PROP-SOURCES 'APV140 PURE40' / 'APV140 AQUEOUS' /  &
+         36            'APV140 SOLIDS' / 'APV140 INORGANIC'
+         37
+         38    COMPONENTS
+         39        PF C4H8O2-6 /
+         40        WATER H2O /
+         41        NPA C3H8O-1 /
+         42        EG C2H6O2
+         43
+         44    SOLVE
+         45        RUN-MODE MODE=SIM
+         46
+         47    FLOWSHEET
+         48        BLOCK T1 IN=S1 F1 OUT=D1 W1
+         49        BLOCK T2 IN=F2 S2 OUT=D2 W2
+         50        BLOCK T3 IN=F3 OUT=D3 W3
+         51        BLOCK P1 IN=W1 OUT=F2
+         52        BLOCK P2 IN=W2 OUT=F3
+         53        BLOCK H IN=W3 OUT=S9
+         54
+         55    PROPERTIES NRTL
+         56
+         57    ESTIMATE ALL
+         58        IN-UNITS MET VOLUME-FLOW='cum/hr' ENTHALPY-FLO='Gcal/hr'  &
+         59            HEAT-TRANS-C='kcal/hr-sqm-K' PRESSURE=bar TEMPERATURE=C  &
+         60            VOLUME=cum DELTA-T=C HEAD=meter MOLE-DENSITY='kmol/cum'  &
+         61            MASS-DENSITY='kg/cum' MOLE-ENTHALP='kcal/mol'  &
+         62            MASS-ENTHALP='kcal/kg' HEAT=Gcal MOLE-CONC='mol/l'  &
+         63            PDROP=bar SHORT-LENGTH=mm
+         64        NRTL ALL ALL UNIFAC
+         65
+         66    PROP-DATA NRTL-1
+         67        IN-UNITS MET VOLUME-FLOW='cum/hr' ENTHALPY-FLO=kW  &
+         68            HEAT-TRANS-C='kcal/hr-sqm-K' TEMPERATURE=C VOLUME=cum  &
+         69            DELTA-T=C HEAD=meter MOLE-DENSITY='kmol/cum'  &
+         70            MASS-DENSITY='kg/cum' MOLE-ENTHALP='kcal/mol'  &
+         71            MASS-ENTHALP='kcal/kg' HEAT=Gcal MOLE-CONC='mol/l'  &
+         72            SHORT-LENGTH=mm
+         73        PROP-LIST NRTL
+         74        BPVAL PF WATER -6.219960000 1825.080000 .1000000000 0.0  &
+         75            0.0 0.0 3.998000000 71.67400000
+         76        BPVAL WATER PF 11.15120000 -1709.920000 .1000000000 0.0  &
+         77            0.0 0.0 3.998000000 71.67400000
+         78        BPVAL PF NPA 0.0 348.4793000 .3000000000 0.0 0.0 0.0  &
+         79            82.50000000 94.00000000
+         80        BPVAL NPA PF 0.0 59.52370000 .3000000000 0.0 0.0 0.0  &
+         81            82.50000000 94.00000000
+         82        BPVAL WATER NPA 5.448600000 -861.1792000 .3000000000 0.0  &
+         83            0.0 0.0 25.00000000 100.0000000
+         84        BPVAL NPA WATER -1.741100000 576.4458000 .3000000000 0.0  &
+         85            0.0 0.0 25.00000000 100.0000000
+         86        BPVAL WATER EG .3479000000 34.82340000 .3000000000 0.0 0.0  &
+         87            0.0 30.40000000 196.7000000
+         88        BPVAL EG WATER -.0567000000 -147.1373000 .3000000000 0.0  &
+         89            0.0 0.0 30.40000000 196.7000000
+         90        BPVAL NPA EG 0.0 121.8521000 .2997000000 0.0 0.0 0.0  &
+         91            95.00000000 150.0000000
+         92        BPVAL EG NPA 0.0 172.8881000 .2997000000 0.0 0.0 0.0  &
+         93            95.00000000 150.0000000
+         94        BPVAL PF EG 0.0 273.0837950 .3000000000 0.0 0.0 0.0  &
+         95            25.00000000 25.00000000
+         96        BPVAL EG PF 0.0 199.6765230 .3000000000 0.0 0.0 0.0  &
+         97            25.00000000 25.00000000
+         98
+         99    STREAM F1
+        100        SUBSTREAM MIXED TEMP=30. PRES=10. MOLE-FLOW=100.
+        101        MOLE-FRAC PF 0.34 / WATER 0.33 / NPA 0.33
+        102
+        103    STREAM S1
+        104        SUBSTREAM MIXED TEMP=30. PRES=10. MOLE-FLOW=69.
+        105        MOLE-FRAC EG 1.
+        106
+        107    STREAM S2
+        108        SUBSTREAM MIXED TEMP=30. PRES=10. MOLE-FLOW=231.
+        109        MOLE-FRAC EG 1.
+        110
+        111    BLOCK H HEATER
+        112        PARAM TEMP=30. PRES=0. DPPARMOPT=NO
+        113
+        114    BLOCK T1 RADFRAC
+        115        SUBOBJECTS INTERNALS = CS-1
+        116        PARAM NSTAGE=50 ALGORITHM=NONIDEAL INIT-OPTION=STANDARD  &
+        117            HYDRAULIC=NO MAXOL=200 DAMPING=NONE
+        118        PARAM2 STATIC-DP=YES
+        119        COL-CONFIG CONDENSER=TOTAL CA-CONFIG=INT-1
+        120        FEEDS S1 3 / F1 28
+        121        PRODUCTS D1 1 L / W1 50 L
+        122        P-SPEC 1 0.05757547418
+        123        COL-SPECS DP-STAGE=0.0068 MOLE-D=34. MOLE-RR=0.83189854598
+        124        REPORT NOHYDRAULIC
+        125        INTERNALS CS-1 STAGE1=2 STAGE2=49 P-UPDATE=NO  &
+        126            TRAYTYPE=SIEVE NPASS=1 SYSFAC=1.000000000  &
+        127            OVER-DESIGN=1.000000000 WEIR-HT=50.80000000 <mm>  &
+        128            DC-CLEAR=38.10000000 <mm> DC-WTOP-SIDE=217.5128741 <mm>  &
+        129            DC-WBOT-SIDE=217.5128741 <mm> HOLE-DIAM=12.70000000 <mm>  &
+        130            HOLE-AREA=.1000000000 FLOOD-METH=GLITSCH6  &
+        131            DECK-THICK=0.134 <IN> PCT-FLOOD-FA=80.00000000  &
+        132            AER-PARAM-M=1.000000000 MAX-DC-LOAD=GLITSCH  &
+        133            MAX-ACC-DP=.0246730816 MAX-PCT-DCB=100.0000000  &
+        134            MAX-PCT-ENT=10.00000000 MIN-WEIR-LD=4.470981863  &
+        135            MAX-WEIR-LD=117.3721131 MIN-PCT-DCA=.1000000000
+        136        TRAY-SIZE 1 2 49 SIEVE
+        137
+        138    BLOCK T2 RADFRAC
+        139        SUBOBJECTS INTERNALS = CS-1
+        140        PARAM NSTAGE=118 ALGORITHM=NONIDEAL INIT-OPTION=STANDARD  &
+        141            HYDRAULIC=NO MAXOL=200 DAMPING=NONE
+        142        PARAM2 STATIC-DP=YES
+        143        COL-CONFIG CONDENSER=TOTAL CA-CONFIG=INT-1
+        144        FEEDS F2 108 / S2 7
+        145        PRODUCTS W2 118 L / D2 1 L
+        146        P-SPEC 1 0.1828397551
+        147        COL-SPECS DP-STAGE=0.0068 MOLE-D=33. MOLE-RR=0.22979066859
+        148        REPORT NOHYDRAULIC
+        149        INTERNALS CS-1 STAGE1=2 STAGE2=117 P-UPDATE=NO  &
+        150            TRAYTYPE=SIEVE NPASS=1 SYSFAC=1.000000000  &
+        151            OVER-DESIGN=1.000000000 WEIR-HT=50.80000000 <mm>  &
+        152            DC-CLEAR=38.10000000 <mm> DC-WTOP-SIDE=180.8662692 <mm>  &
+        153            DC-WBOT-SIDE=180.8662692 <mm> HOLE-DIAM=12.70000000 <mm>  &
+        154            HOLE-AREA=.1000000000 FLOOD-METH=GLITSCH6  &
+        155            DECK-THICK=0.134 <IN> PCT-FLOOD-FA=80.00000000  &
+        156            AER-PARAM-M=1.000000000 MAX-DC-LOAD=GLITSCH  &
+        157            MAX-ACC-DP=.0246730816 MAX-PCT-DCB=100.0000000  &
+        158            MAX-PCT-ENT=10.00000000 MIN-WEIR-LD=4.470981863  &
+        159            MAX-WEIR-LD=117.3721131 MIN-PCT-DCA=.1000000000
+        160        TRAY-SIZE 1 2 117 SIEVE
+        161
+        162    BLOCK T3 RADFRAC
+        163        SUBOBJECTS INTERNALS = CS-1
+        164        PARAM NSTAGE=14 ALGORITHM=STANDARD HYDRAULIC=NO MAXOL=200  &
+        165            DAMPING=NONE
+        166        PARAM2 STATIC-DP=YES
+        167        COL-CONFIG CONDENSER=TOTAL CA-CONFIG=INT-1
+        168        FEEDS F3 6
+        169        PRODUCTS W3 14 L / D3 1 L
+        170        P-SPEC 1 0.05982150178
+        171        COL-SPECS DP-STAGE=0.0068 MOLE-D=33. MOLE-RR=1.7687351639
+        172        REPORT NOHYDRAULIC
+        173        INTERNALS CS-1 STAGE1=2 STAGE2=13 P-UPDATE=NO  &
+        174            TRAYTYPE=SIEVE NPASS=1 SYSFAC=1.000000000  &
+        175            OVER-DESIGN=1.000000000 WEIR-HT=50.80000000 <mm>  &
+        176            DC-CLEAR=38.10000000 <mm> DC-WTOP-SIDE=211.0104572 <mm>  &
+        177            DC-WBOT-SIDE=211.0104572 <mm> HOLE-DIAM=12.70000000 <mm>  &
+        178            HOLE-AREA=.1000000000 FLOOD-METH=GLITSCH6  &
+        179            DECK-THICK=0.134 <IN> PCT-FLOOD-FA=80.00000000  &
+        180            AER-PARAM-M=1.000000000 MAX-DC-LOAD=GLITSCH  &
+        181            MAX-ACC-DP=.0246730816 MAX-PCT-DCB=100.0000000  &
+        182            MAX-PCT-ENT=10.00000000 MIN-WEIR-LD=4.470981863  &
+        183            MAX-WEIR-LD=117.3721131 MIN-PCT-DCA=.1000000000
+        184        TRAY-SIZE 1 2 13 SIEVE
+        185
+        186    BLOCK P1 PUMP
+        187        PARAM PRES=10.
+        188
+        189    BLOCK P2 PUMP
+        190        PARAM PRES=10.
+        191
+        192    EO-CONV-OPTI
+        193
+        194    STREAM-REPOR MOLEFLOW
+        195
+        196    PROPERTY-REP PCES
+        197    ;
+        198    ;
+        199    ;
+        200    ;
+        201    ;
+ *** INPUT TRANSLATOR MESSAGES ***
+
+  *** THIS RUN USES THE PROPERTIES ENTERPRISE DATABASE ***
+      SQLLOCALDB.APESV140 : (DATAVERSION - 40.0.0.13)                         
+      SQLLOCALDB.APV140 : (DATAVERSION - 40.0.0.13)                           
+      SQLLOCALDB.FACTV140 : (DATAVERSION - 40.0.0.12)                         
+      SQLLOCALDB.NISTV140 : (DATAVERSION - 40.0.0.12)                         
+ 
+ 
+
+ PDF updated                                                                      TIME =      0.96
+
+ *** CALCULATION TRACE ***
+
+
+ *** FLOWSHEET ANALYSIS MESSAGES ***
+
+ FLOWSHEET CONNECTIVITY BY STREAMS       
+
+   STREAM     SOURCE     DEST           STREAM     SOURCE     DEST
+   F1         ----       T1             S1         ----       T1      
+   S2         ----       T2             D1         T1         ----    
+   W1         T1         P1             D2         T2         ----    
+   W2         T2         P2             D3         T3         ----    
+   W3         T3         H              F2         P1         T2      
+   F3         P2         T3             S9         H          ----    
+
+ FLOWSHEET CONNECTIVITY BY BLOCKS        
+
+   BLOCK        INLETS                         OUTLETS
+   T1           S1 F1                          D1 W1                       
+   T2           F2 S2                          D2 W2                       
+   T3           F3                             D3 W3                       
+   P1           W1                             F2                          
+   P2           W2                             F3                          
+   H            W3                             S9                          
+
+      COMPUTATION ORDER FOR THE FLOWSHEET IS:
+      T1 P1 T2 P2 T3 H 
+
+Calculations begin                                                              time      0.25
+
+
+ SIMULATION CALCULATIONS BEGIN                                                    TIME =      0.26
+
+      ENTHALPY CALCULATION FOR INLET STREAM S1 OF BLOCK T1                        TIME =      0.26
+      KODE = 2  NTRIAL =   1  T = 303.1500  P = 1.013250E+06  V =  0.00000      Q =  0.00000    
+
+      ENTHALPY CALCULATION FOR INLET STREAM F1 OF BLOCK T1                        TIME =      0.26
+      KODE = 2  NTRIAL =   2  T = 303.1500  P = 1.013250E+06  V =  0.00000      Q =  0.00000    
+
+      UOS BLOCK T1       MODEL: RADFRAC                                           TIME =      0.26
+
+       Convergence iterations:
+         OL   ML   IL     Err/Tol
+          1    1    2      2617.9    
+          2    1    2      468.83    
+          3    1    2      117.49    
+          4    1    2      63.089    
+          5    1    2      25.666    
+          6    1    2      11.774    
+          7    1    2      3.4820    
+          8    1    2      1.3128    
+          9    1    2     0.38891    
+
+      UOS BLOCK P1       MODEL: PUMP                                              TIME =      0.28
+      VOL-FLOW   =  0.1999E-02 , DELTA P    =  0.9737E+06 , PUMP EFF   =  0.3706    
+      FLUID PWR  =   1946.     , BRAKE PWR  =   5253.     , ELEC PWR   =   5253.    
+
+      ENTHALPY CALCULATION FOR INLET STREAM S2 OF BLOCK T2                        TIME =      0.28
+      KODE = 2  NTRIAL =   1  T = 303.1500  P = 1.013250E+06  V =  0.00000      Q =  0.00000    
+
+      UOS BLOCK T2       MODEL: RADFRAC                                           TIME =      0.28
+
+       Convergence iterations:
+         OL   ML   IL     Err/Tol
+          1    1    3      4073.5    
+          2    1    2      1423.1    
+          3    1    2      472.22    
+          4    1    2      531.35    
+          5    1    2      612.54    
+          6    1    2      556.60    
+          7    1    2      442.91    
+          8    1    2      307.95    
+          9    1    2      112.64    
+         10    1    2      43.911    
+         11    1    2      16.882    
+         12    1    2      6.1720    
+         13    1    2      2.6648    
+         14    1    2      1.0661    
+         15    1    2     0.22960    
+
+      UOS BLOCK P2       MODEL: PUMP                                              TIME =      0.40
+      VOL-FLOW   =  0.5440E-02 , DELTA P    =  0.9141E+06 , PUMP EFF   =  0.5160    
+      FLUID PWR  =   4973.     , BRAKE PWR  =   9638.     , ELEC PWR   =   9638.    
+
+      UOS BLOCK T3       MODEL: RADFRAC                                           TIME =      0.40
+
+       Convergence iterations:
+         OL   ML   IL     Err/Tol
+          1    1    7      337.33    
+          2    1    5      191.19    
+          3    1    3      50.920    
+          4    1    3      11.753    
+          5    1    4      1.5651    
+          6    1    4     0.21974    
+
+      UOS BLOCK H        MODEL: HEATER                                            TIME =      0.40
+      KODE = 2  NTRIAL =   1  T = 303.1500  P =  15018.5      V =  0.00000      Q =-1.554476E+06
+
+      GENERATING RESULTS FOR UOS BLOCK P1       MODEL: PUMP                       TIME =      0.40
+      KODE = 5  NTRIAL =   3  T = 355.1018  P =  39595.4      V =  0.00000      Q =-2.235174E-09
+      VOL-FLOW   =  0.1999E-02 , DELTA P    =  0.9737E+06 , PUMP EFF   =  0.3706    
+      FLUID PWR  =   1946.     , BRAKE PWR  =   5253.     , ELEC PWR   =   5253.    
+      NPSH AVAIL =   0.000    
+
+      GENERATING RESULTS FOR UOS BLOCK P2       MODEL: PUMP                       TIME =      0.40
+      KODE = 5  NTRIAL =   3  T = 437.6340  P =  99140.4      V =  0.00000      Q =  0.00000    
+      VOL-FLOW   =  0.5440E-02 , DELTA P    =  0.9141E+06 , PUMP EFF   =  0.5160    
+      FLUID PWR  =   4973.     , BRAKE PWR  =   9638.     , ELEC PWR   =   9638.    
+      NPSH AVAIL =   0.000    
+
+      GENERATING RESULTS FOR UOS BLOCK H        MODEL: HEATER                     TIME =      0.40
+
+      CHECKING PHASE EQUILIBRIUM RESULTS                                          TIME =      0.40
+
+      CHECKING PHASE EQUILIBRIUM RESULTS                                          TIME =      0.40
+
+ Report Writer entered                                                            Time =      8.10
+
+ Results generated                                                                Time =      8.14
+
+ Report Writer entered                                                            Time =      9.88
+
+ Results generated                                                                Time =      9.93
+
+RUN SAVED
+
+
+
+ NO ERRORS OR WARNINGS GENERATED
