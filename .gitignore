@@ -69,3 +69,6 @@ ehthumbs.db
 
 
 提示词/
+.claude/
+scripts/
+.pytest_cache/
