@@ -157,6 +157,13 @@ def _build_run_config(cfg: dict) -> Any:
             ext.get("stream_output_subtree", "Output\\STR_MAIN")
         ),
         strict_extraction  = bool(ext.get("strict_extraction", True)),
+        extraction_mode    = str(ext.get("mode", "full")),
+        catalog_db_path    = ext.get("catalog_db") or None,
+        manifest_id        = str(ext.get("manifest_id", "auto")),
+        semantic_rules_dir = str(ext.get("semantic_rules_dir", "configs/aspen_semantics")),
+        build_manifest_if_missing = bool(ext.get("build_manifest_if_missing", True)),
+        write_node_values  = bool(ext.get("write_node_values", True)),
+        strict_manifest    = bool(ext.get("strict_manifest", True)),
     )
 
 

@@ -124,6 +124,11 @@ class ParetoOptimizeCaseConfig:
         SQLite 数据库路径，若指定则每次工况完成后自动持久化。None 不持久化。
     random_seed:
         随机种子，用于 LHS 采样和代理模型的可重复性。
+    warm_start_cases:
+        预热样本列表（如 Phase 1 DOE 结果）。这些工况不会被重新运行，
+        但会在 Phase 2 开始前告知代理模型，使 GP 从已有数据出发，
+        避免重复探索 Phase 1 已覆盖的区域。
+        warm_start_cases 不计入 n_total / n_success 统计，也不触发回调。
     """
     param_bounds: dict[str, tuple[float, float]]
     objective_names: list[str]
@@ -142,6 +147,7 @@ class ParetoOptimizeCaseConfig:
     on_case_complete: Callable[[ProcessCase, int, int], None] | None = None
     db_path: Path | str | None = None
     random_seed: int | None = None
+    warm_start_cases: list[ProcessCase] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +367,24 @@ def optimize_pareto_case(
             y_vec = _extract_all_objectives(c, config)
             optimizer.tell(x, y_vec, is_success=y_vec is not None)
 
-        n_success_so_far = sum(1 for c in cases if _extract_all_objectives(c, config) is not None)
+        # warm_start_cases：注入 Phase 1 数据，不重新运行，不计入统计
+        n_warm = 0
+        for c in config.warm_start_cases:
+            x = [c.design_vars.get(p) for p in paths]
+            if None in x:
+                continue
+            y_vec = _extract_all_objectives(c, config)
+            optimizer.tell(x, y_vec, is_success=y_vec is not None)
+            n_warm += 1
+        if n_warm > 0:
+            _log.info("warm_start：已注入 %d 个 Phase 1 样本到代理模型。", n_warm)
+
+        n_success_so_far = sum(
+            1 for c in cases if _extract_all_objectives(c, config) is not None
+        ) + sum(
+            1 for c in config.warm_start_cases
+            if _extract_all_objectives(c, config) is not None
+        )
         if n_success_so_far < config.n_initial_min:
             _log.warning(
                 "初始 DOE 成功样本数 %d < n_initial_min=%d，"

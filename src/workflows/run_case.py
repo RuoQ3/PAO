@@ -32,12 +32,14 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.exporter import TreeExporter, TreeValueRecord
 from ..aspen_driver.runner import SimulationRunner
 from ..models.block import BlockInput, BlockOutput, BlockResult, block_result_from_runner
+from ..models.node_catalog import SemanticBlock, SemanticField
 from ..models.process_case import (
     CaseStatus,
     ConstraintValue,
@@ -129,6 +131,23 @@ class RunCaseConfig:
     stream_max_depth: int = 3
     stream_output_subtree: str = "Output\\STR_MAIN"
     strict_extraction: bool = True
+    # ------------------------------------------------------------------ #
+    # manifest runtime 模式配置
+    # ------------------------------------------------------------------ #
+    # extraction_mode: "full"（默认，递归 TreeExporter）/ "manifest"（直接路径读取）
+    extraction_mode: str = "full"
+    # manifest runtime 模式所需的 NodeDB 路径
+    catalog_db_path: str | Path | None = None
+    # manifest_id: "auto" 表示自动查找最新 manifest；也可指定具体 ID
+    manifest_id: str = "auto"
+    # 语义规则目录，默认 configs/aspen_semantics
+    semantic_rules_dir: str | Path = "configs/aspen_semantics"
+    # 是否在 manifest 不存在时自动执行 catalog scan + build manifest
+    build_manifest_if_missing: bool = True
+    # 是否将 manifest 读取结果写入 NodeDB node_values
+    write_node_values: bool = True
+    # manifest invalid 时是否阻止优化（True=阻止，False=降级为 full 模式）
+    strict_manifest: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -190,34 +209,46 @@ def run_case(
         check_status_paths=config.check_status_paths,
     )
 
+    if not sim_result.success and sim_result.error:
+        _log.warning("仿真失败 [iter=%d, status=%s]：%s", iteration, sim_result.status.value, sim_result.error)
+
     # 2 & 3. 提取 block/stream 数据（仅在仿真收敛时）
     blocks:  dict[str, BlockResult]  = {}
     streams: dict[str, StreamResult] = {}
+    semantic_blocks: dict[str, SemanticBlock] = {}
     notes_parts: list[str] = []
     extraction_fatal = False
 
     if sim_result.success:
-        block_result  = _extract_blocks(exporter, sim_result, design_vars, config, run_id)
-        stream_result = _extract_streams(exporter, sim_result, config, run_id)
+        if config.extraction_mode == "manifest":
+            # manifest runtime 模式：直接路径读取，不递归 Elements
+            semantic_blocks, manifest_notes, extraction_fatal = _extract_by_manifest(
+                exporter, sim_result, config, iteration, run_id
+            )
+            notes_parts.extend(manifest_notes)
+        else:
+            # full/debug 模式：递归 TreeExporter（原有逻辑）
+            block_result  = _extract_blocks(exporter, sim_result, design_vars, config, run_id)
+            stream_result = _extract_streams(exporter, sim_result, config, run_id)
 
-        blocks  = block_result.data   # type: ignore[assignment]
-        streams = stream_result.data  # type: ignore[assignment]
+            blocks  = block_result.data   # type: ignore[assignment]
+            streams = stream_result.data  # type: ignore[assignment]
 
-        # 收集节点级失败信息
-        if block_result.failed_nodes:
-            parts = [f"  {k}: {v}" for k, v in block_result.failed_nodes.items()]
-            notes_parts.append("Block 节点提取失败：\n" + "\n".join(parts))
-        if stream_result.failed_nodes:
-            parts = [f"  {k}: {v}" for k, v in stream_result.failed_nodes.items()]
-            notes_parts.append("Stream 节点提取失败：\n" + "\n".join(parts))
+            # 收集节点级失败信息
+            if block_result.failed_nodes:
+                parts = [f"  {k}: {v}" for k, v in block_result.failed_nodes.items()]
+                notes_parts.append("Block 节点提取失败：\n" + "\n".join(parts))
+            if stream_result.failed_nodes:
+                parts = [f"  {k}: {v}" for k, v in stream_result.failed_nodes.items()]
+                notes_parts.append("Stream 节点提取失败：\n" + "\n".join(parts))
 
-        # 整批提取失败（strict_extraction=True 时节点级失败也会触发此路径）
-        if block_result.fatal_error:
-            notes_parts.append(f"Block 整批提取失败：{block_result.fatal_error}")
-            extraction_fatal = True
-        if stream_result.fatal_error:
-            notes_parts.append(f"Stream 整批提取失败：{stream_result.fatal_error}")
-            extraction_fatal = True
+            # 整批提取失败（strict_extraction=True 时节点级失败也会触发此路径）
+            if block_result.fatal_error:
+                notes_parts.append(f"Block 整批提取失败：{block_result.fatal_error}")
+                extraction_fatal = True
+            if stream_result.fatal_error:
+                notes_parts.append(f"Stream 整批提取失败：{stream_result.fatal_error}")
+                extraction_fatal = True
 
     # 4. 计算目标函数和约束
     objectives:  list[ObjectiveValue]  = []
@@ -254,6 +285,7 @@ def run_case(
                 source_filepath=sim_result.source_filepath,
                 run_id=run_id,
                 tags=tags or [],
+                semantic_blocks=semantic_blocks,
             )
             objectives  = _compute_objectives(config.objective_fns, _partial)
             constraints = _compute_constraints(config.constraint_fns, _partial)
@@ -269,12 +301,304 @@ def run_case(
         constraints=constraints,
         tags=tags,
         run_id=run_id,
+        semantic_blocks=semantic_blocks,
     )
 
     if notes_parts:
         case.notes = "\n\n".join(notes_parts)
 
     return case
+
+
+# ---------------------------------------------------------------------------
+# Manifest runtime 提取
+# ---------------------------------------------------------------------------
+
+def _extract_by_manifest(
+    exporter: TreeExporter,
+    sim_result: SimulationResult,
+    config: RunCaseConfig,
+    iteration: int,
+    run_id: str | None,
+) -> tuple[dict[str, SemanticBlock], list[str], bool]:
+    """
+    manifest runtime 模式：从 NodeDB 加载 manifest，直接路径读取节点值，
+    构建 SemanticBlock 字典。
+
+    Returns
+    -------
+    (semantic_blocks, notes_parts, extraction_fatal)
+    """
+    notes: list[str] = []
+    fatal = False
+
+    # 延迟导入，避免循环依赖
+    try:
+        from ..database.node_db import NodeDB
+        from ..aspen_driver.catalog import CatalogScanner, _compute_file_hash
+        from ..aspen_driver.manifest import ManifestBuilder
+        from ..models.read_manifest import ReadManifest
+    except ImportError as exc:
+        msg = f"manifest runtime 模式依赖导入失败：{exc}"
+        _log.error(msg)
+        notes.append(msg)
+        return {}, notes, True
+
+    db_path = config.catalog_db_path
+    if not db_path:
+        msg = "extraction_mode='manifest' 但未配置 catalog_db_path，降级为 full 模式"
+        _log.warning(msg)
+        notes.append(msg)
+        return {}, notes, False
+
+    try:
+        node_db = NodeDB(db_path)
+    except Exception as exc:
+        msg = f"打开 NodeDB 失败（{db_path}）：{exc}"
+        _log.error(msg)
+        notes.append(msg)
+        return {}, notes, config.strict_manifest
+
+    try:
+        manifest = _resolve_manifest(
+            node_db=node_db,
+            config=config,
+            driver=exporter._driver,
+            sim_result=sim_result,
+        )
+    except Exception as exc:
+        msg = f"manifest 解析失败：{exc}"
+        _log.error(msg)
+        notes.append(msg)
+        node_db.close()
+        return {}, notes, config.strict_manifest
+
+    if manifest is None:
+        msg = "未找到有效 manifest，降级为 full 模式"
+        _log.warning(msg)
+        notes.append(msg)
+        node_db.close()
+        return {}, notes, False
+
+    if not manifest.is_valid:
+        msg = f"manifest '{manifest.manifest_id}' 无效：{manifest.error}"
+        _log.warning(msg)
+        notes.append(msg)
+        if config.strict_manifest:
+            node_db.close()
+            return {}, notes, True
+
+    # 按 manifest 直接路径读取
+    try:
+        raw_by_source = exporter.export_values_by_manifest(
+            sim_result,
+            manifest,
+            strict_required=config.strict_manifest,
+            allow_failed=False,
+        )
+    except Exception as exc:
+        msg = f"manifest 直接路径读取失败：{exc}"
+        _log.error(msg)
+        notes.append(msg)
+        node_db.close()
+        return {}, notes, config.strict_manifest
+
+    # 将读取结果写入 NodeDB node_values
+    if config.write_node_values and run_id:
+        try:
+            from ..aspen_driver.exporter import TreeValueRecord as _TVR
+            for source_name, records in raw_by_source.items():
+                node_db.save_node_values(
+                    case_id=run_id,
+                    source=f"manifest:{source_name}",
+                    records=records,
+                )
+        except Exception as exc:
+            _log.warning("写入 node_values 失败：%s", exc)
+
+    # 构建 SemanticBlock 字典
+    semantic_blocks = _build_semantic_blocks(manifest, raw_by_source)
+
+    node_db.close()
+    return semantic_blocks, notes, False
+
+
+def _resolve_manifest(
+    node_db: Any,
+    config: RunCaseConfig,
+    driver: Any,
+    sim_result: Any,
+) -> Any:
+    """
+    解析 manifest：按 manifest_id 查找，或自动构建。
+
+    返回 ReadManifest 实例，或 None（无法解析时）。
+    """
+    from ..aspen_driver.catalog import CatalogScanner, _compute_file_hash
+    from ..aspen_driver.manifest import ManifestBuilder
+
+    mid = config.manifest_id
+
+    if mid and mid != "auto":
+        # 指定 manifest_id：直接从 DB 加载
+        meta = node_db.get_manifest(mid)
+        if meta is None:
+            raise ValueError(f"manifest_id='{mid}' 在 NodeDB 中不存在")
+        return _load_manifest_from_db(node_db, mid)
+
+    # auto 模式：查找最新 catalog，再查找最新 manifest
+    file_path = str(driver.filepath) if driver.filepath else ""
+    file_hash = _compute_file_hash(file_path) if file_path else ""
+
+    catalog_meta = node_db.get_latest_catalog_scan(file_hash) if file_hash else None
+
+    if catalog_meta is None:
+        if not config.build_manifest_if_missing:
+            _log.warning("未找到 catalog，build_manifest_if_missing=False，跳过 manifest 构建")
+            return None
+        # 执行 catalog scan
+        _log.info("未找到 catalog，开始自动扫描（file_hash=%s）", file_hash[:8] if file_hash else "N/A")
+        scanner = CatalogScanner(driver, node_db)
+        scan = scanner.scan(aspen_file_path=file_path, max_depth=6, strict=False)
+        catalog_id = scan.catalog_id
+    else:
+        catalog_id = catalog_meta["catalog_id"]
+
+    # 查找最新 manifest
+    manifest_meta = node_db.get_latest_manifest(catalog_id)
+    if manifest_meta is None:
+        if not config.build_manifest_if_missing:
+            _log.warning("未找到 manifest，build_manifest_if_missing=False，跳过")
+            return None
+        # 构建 manifest
+        _log.info("未找到 manifest，开始自动构建（catalog_id=%s）", catalog_id)
+        builder = ManifestBuilder(node_db, rules_dir=config.semantic_rules_dir)
+        # 从 objective_fns 名称推断 objective_names
+        obj_names = [getattr(fn, "__name__", "") for fn in (config.objective_fns or [])]
+        obj_names = [n for n in obj_names if n]
+        manifest = builder.build(
+            catalog_id=catalog_id,
+            objective_names=obj_names,
+            extra_paths=config.output_paths or [],
+        )
+        return manifest
+
+    return _load_manifest_from_db(node_db, manifest_meta["manifest_id"])
+
+
+def _load_manifest_from_db(node_db: Any, manifest_id: str) -> Any:
+    """从 NodeDB 加载 ReadManifest 对象。"""
+    from ..models.read_manifest import ReadManifest, ReadManifestItem
+
+    meta = node_db.get_manifest(manifest_id)
+    if meta is None:
+        return None
+    items_raw = node_db.get_manifest_items(manifest_id)
+    items = [
+        ReadManifestItem(
+            manifest_id=manifest_id,
+            source_type=r["source_type"],
+            source_name=r["source_name"],
+            equipment_type=r["equipment_type"],
+            semantic_field=r["semantic_field"],
+            abs_path=r["abs_path"],
+            rel_path=r["rel_path"],
+            unit_string=r["unit_string"],
+            value_type=r["value_type"],
+            required=bool(r["required"]),
+            confidence=r["confidence"],
+            rule_id=r["rule_id"],
+            error=r["error"],
+        )
+        for r in items_raw
+    ]
+    return ReadManifest(
+        manifest_id=manifest_id,
+        catalog_id=meta["catalog_id"],
+        objective_names=meta["objective_names"],
+        items=items,
+        is_valid=meta["is_valid"],
+        error=meta["error"],
+        created_at=meta["created_at"],
+    )
+
+
+def _build_semantic_blocks(
+    manifest: Any,
+    raw_by_source: dict[str, list[Any]],
+) -> dict[str, SemanticBlock]:
+    """
+    将 manifest + 读取结果转换为 {block_name: SemanticBlock} 字典。
+    """
+    # 构建 manifest item 索引：{(source_name, semantic_field): item}
+    item_index: dict[tuple[str, str], Any] = {}
+    for item in manifest.items:
+        item_index[(item.source_name, item.semantic_field)] = item
+
+    # 按 source_name 分组
+    source_names: set[str] = {item.source_name for item in manifest.items if item.source_name}
+
+    result: dict[str, SemanticBlock] = {}
+    for source_name in source_names:
+        records = raw_by_source.get(source_name, [])
+        # {semantic_field: TreeValueRecord}
+        rec_index = {r.rel_path: r for r in records}
+
+        fields: dict[str, SemanticField] = {}
+        missing_required: list[str] = []
+
+        for item in manifest.items:
+            if item.source_name != source_name:
+                continue
+            rec = rec_index.get(item.semantic_field)
+            if rec is None:
+                # 未读取到（可能是 error item 无路径）
+                available = False
+                value = None
+                unit = item.unit_string
+                vtype = item.value_type
+                error = item.error or f"未读取到字段 '{item.semantic_field}'"
+            else:
+                available = rec.error is None and rec.value is not None
+                value = rec.value
+                unit = rec.unit
+                vtype = rec.value_type
+                error = rec.error or ""
+
+            sf = SemanticField(
+                field_name=item.semantic_field,
+                abs_path=item.abs_path,
+                value=value,
+                unit=unit,
+                value_type=vtype,
+                available=available,
+                error=error,
+                required=item.required,
+                rule_id=item.rule_id,
+            )
+            fields[item.semantic_field] = sf
+
+            if item.required and not available:
+                missing_required.append(item.semantic_field)
+
+        # 获取 block_type（从 manifest items 中取）
+        block_type = ""
+        for item in manifest.items:
+            if item.source_name == source_name and item.equipment_type:
+                block_type = item.equipment_type
+                break
+
+        sb = SemanticBlock(
+            block_name=source_name,
+            block_type=block_type,
+            fields=fields,
+            is_complete=len(missing_required) == 0,
+            missing_required=missing_required,
+            manifest_id=manifest.manifest_id,
+        )
+        result[source_name] = sb
+
+    return result
 
 
 # ---------------------------------------------------------------------------

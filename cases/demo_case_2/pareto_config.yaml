@@ -1,0 +1,340 @@
+# pareto_config.yaml — 三塔萃取精馏工艺 CAPEX vs OPEX 双目标 Pareto 优化配置
+# 对应 Aspen 仿真文件：2epsd.bkp
+# 原始参考：Fun_Objective.m / Opt_simulationColumn.m（NSGA-II 多目标优化）
+#
+# 运行方式：
+#   python -m src.main cases/demo_case_2/pareto_config.yaml
+#   python -m src.main cases/demo_case_2/pareto_config.yaml --dry-run
+#
+# 工艺描述：
+#   三塔萃取精馏系统，分离 PROH（1-丙醇）、BUAC（乙酸丁酯）、WATER 三种产品。
+#   T1 → 塔顶产品 D1（PROH），T2 → 塔顶产品 D2（BUAC），T3 → 塔顶产品 D3（WATER）。
+#   S1、S2 为萃取剂进料流股。
+#
+# 优化目标（对应原 MATLAB 的 CAPEX vs OPEX）：
+#   TAC        最小化总年化成本（$/yr）—— 资本成本 + 操作成本
+#   EMISSIONS  最小化 CO₂-eq 排放量（tonne CO₂-eq/yr）—— 公用工程间接排放
+#
+# 为什么这两个目标存在真实权衡：
+#   - 回流比（RR）越高 → 分离效果越好，但再沸器/冷凝器负荷越大 → OPEX/EMISSIONS 上升
+#   - 塔压（P）越高 → 相对挥发度变化，影响分离难度和公用工程消耗
+#   - 萃取剂流量（SOL）越大 → 分离效果越好，但泵功耗和热负荷增加
+#   - 因此：高纯度/高回收率 <-> 高能耗/高排放，存在真实的 Pareto 权衡曲线
+#
+# 约束（对应原 MATLAB 的纯度约束）：
+#   D1 中 PF 摩尔分率 >= 0.999   （Aspen 内部组分名 PF，MATLAB 注释称 PROH/1-丙醇）
+#   D2 中 NPA 摩尔分率 >= 0.999  （Aspen 内部组分名 NPA，MATLAB 注释称 BUAC/乙酸丁酯）
+#   D3 中 WATER 摩尔分率 >= 0.999
+#
+# 设计变量策略：
+#   连续变量（参与贝叶斯优化）：各塔回流比（RR）、各塔操作压力（P）
+#   整数变量（固定为初始值）：理论板数（NSTAGE）、进料板位置（FEED_STAGE）、萃取剂流量（SOL）
+#   原 MATLAB 中 NSTAGE 等整数变量通过 NSGA-II 优化，PAO 贝叶斯优化不支持整数搜索，
+#   故固定为合理初始值，仅对连续变量做 Pareto 优化。
+#
+# 注意：本工艺为真空操作系统，各塔操作压力均在 0.06~0.18 atm 范围内。
+#   初始值和搜索范围均基于 .bkp 文件中的原始收敛解：
+#   T1: NSTAGE=50, RR=0.832, FEED_F1=28, FEED_S1=3, P=0.0576 atm
+#   T2: NSTAGE=118, RR=0.230, FEED_F2=108, FEED_S2=7, P=0.183 atm
+#   T3: NSTAGE=14, RR=1.769, FEED_F3=6, P=0.0598 atm
+#   S1=69 kmol/hr, S2=231 kmol/hr
+
+# ---------------------------------------------------------------------------
+# 仿真文件
+# ---------------------------------------------------------------------------
+simulator:
+  filepath: cases/demo_case_2/2epsd.bkp
+  visible: false
+  suppress_dialogs: true
+  timeout: 300
+  reinit: true
+  verify_inputs: true
+  input_rtol: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# 设计变量
+# ---------------------------------------------------------------------------
+# 连续变量（参与贝叶斯优化）：6 个
+# 整数变量（固定，不参与优化）：10 个
+design_variables:
+
+  # ── T1 塔 ──────────────────────────────────────────────────────────────
+  - name: T1_RR
+    description: T1 塔回流比（原始值=0.832，低回流比萃取精馏）
+    aspen_path: \Data\Blocks\T1\Input\BASIS_RR
+    type: continuous
+    lower_bound: 0.1
+    upper_bound: 3.0
+    initial_value: 0.832
+    unit: "-"
+
+  - name: T1_NSTAGE
+    description: T1 理论板数（固定，不参与优化；原始值=50）
+    aspen_path: \Data\Blocks\T1\Input\NSTAGE
+    type: integer
+    lower_bound: 10
+    upper_bound: 200
+    initial_value: 50
+    unit: "-"
+
+  - name: T1_FEED_F1
+    description: T1 主进料 F1 进料板位置（固定；原始值=28，须 < NSTAGE=50）
+    aspen_path: \Data\Blocks\T1\Input\FEED_STAGE\F1
+    type: integer
+    lower_bound: 3
+    upper_bound: 48
+    initial_value: 28
+    unit: "-"
+
+  - name: T1_FEED_S1
+    description: T1 萃取剂 S1 进料板位置（固定；原始值=3，须 < NSTAGE=50）
+    aspen_path: \Data\Blocks\T1\Input\FEED_STAGE\S1
+    type: integer
+    lower_bound: 2
+    upper_bound: 48
+    initial_value: 3
+    unit: "-"
+
+  - name: T1_PRES
+    description: T1 塔顶操作压力（真空操作；原始值=0.0576 atm）
+    aspen_path: \Data\Blocks\T1\Input\PRES1
+    type: continuous
+    lower_bound: 0.01
+    upper_bound: 0.5
+    initial_value: 0.0576
+    unit: "atm"
+
+  # ── T2 塔 ──────────────────────────────────────────────────────────────
+  - name: T2_RR
+    description: T2 塔回流比（原始值=0.230，极低回流比）
+    aspen_path: \Data\Blocks\T2\Input\BASIS_RR
+    type: continuous
+    lower_bound: 0.05
+    upper_bound: 2.0
+    initial_value: 0.230
+    unit: "-"
+
+  - name: T2_NSTAGE
+    description: T2 理论板数（固定，不参与优化；原始值=118）
+    aspen_path: \Data\Blocks\T2\Input\NSTAGE
+    type: integer
+    lower_bound: 20
+    upper_bound: 200
+    initial_value: 118
+    unit: "-"
+
+  - name: T2_FEED_F2
+    description: T2 主进料 F2 进料板位置（固定；原始值=108，须 < NSTAGE=118）
+    aspen_path: \Data\Blocks\T2\Input\FEED_STAGE\F2
+    type: integer
+    lower_bound: 3
+    upper_bound: 116
+    initial_value: 108
+    unit: "-"
+
+  - name: T2_FEED_S2
+    description: T2 萃取剂 S2 进料板位置（固定；原始值=7，须 < NSTAGE=118）
+    aspen_path: \Data\Blocks\T2\Input\FEED_STAGE\S2
+    type: integer
+    lower_bound: 2
+    upper_bound: 116
+    initial_value: 7
+    unit: "-"
+
+  - name: T2_PRES
+    description: T2 塔顶操作压力（真空操作；原始值=0.183 atm）
+    aspen_path: \Data\Blocks\T2\Input\PRES1
+    type: continuous
+    lower_bound: 0.05
+    upper_bound: 1.0
+    initial_value: 0.183
+    unit: "atm"
+
+  # ── T3 塔 ──────────────────────────────────────────────────────────────
+  - name: T3_RR
+    description: T3 塔回流比（原始值=1.769）
+    aspen_path: \Data\Blocks\T3\Input\BASIS_RR
+    type: continuous
+    lower_bound: 0.5
+    upper_bound: 5.0
+    initial_value: 1.769
+    unit: "-"
+
+  - name: T3_NSTAGE
+    description: T3 理论板数（固定，不参与优化；原始值=14）
+    aspen_path: \Data\Blocks\T3\Input\NSTAGE
+    type: integer
+    lower_bound: 5
+    upper_bound: 100
+    initial_value: 14
+    unit: "-"
+
+  - name: T3_FEED_F3
+    description: T3 主进料 F3 进料板位置（固定；原始值=6，须 < NSTAGE=14）
+    aspen_path: \Data\Blocks\T3\Input\FEED_STAGE\F3
+    type: integer
+    lower_bound: 2
+    upper_bound: 12
+    initial_value: 6
+    unit: "-"
+
+  - name: T3_PRES
+    description: T3 塔顶操作压力（真空操作；原始值=0.0598 atm）
+    aspen_path: \Data\Blocks\T3\Input\PRES1
+    type: continuous
+    lower_bound: 0.01
+    upper_bound: 0.5
+    initial_value: 0.0598
+    unit: "atm"
+
+  # ── 萃取剂流量 ──────────────────────────────────────────────────────────
+  - name: SOL1_FLOW
+    description: 萃取剂 S1 总摩尔流量（固定，不参与优化；原始值=69 kmol/hr）
+    aspen_path: \Data\Streams\S1\Input\TOTFLOW\MIXED
+    type: integer
+    lower_bound: 10
+    upper_bound: 2000
+    initial_value: 69
+    unit: "kmol/hr"
+
+  - name: SOL2_FLOW
+    description: 萃取剂 S2 总摩尔流量（固定，不参与优化；原始值=231 kmol/hr）
+    aspen_path: \Data\Streams\S2\Input\TOTFLOW\MIXED
+    type: integer
+    lower_bound: 10
+    upper_bound: 2000
+    initial_value: 231
+    unit: "kmol/hr"
+
+# ---------------------------------------------------------------------------
+# 输出节点（约束函数从这里读取数值）
+# ---------------------------------------------------------------------------
+output_paths:
+  - \Data\Streams\D1\Output\MOLEFRAC\MIXED\PF      # 约束1：D1 中 PF 摩尔分率（MATLAB 称 PROH）
+  - \Data\Streams\D2\Output\MOLEFRAC\MIXED\NPA     # 约束2：D2 中 NPA 摩尔分率（MATLAB 称 BUAC）
+  - \Data\Streams\D3\Output\MOLEFRAC\MIXED\WATER   # 约束3：D3 中 WATER 摩尔分率
+
+# ---------------------------------------------------------------------------
+# 目标函数（对应原 MATLAB 的 CAPEX vs OPEX）
+# ---------------------------------------------------------------------------
+objectives:
+  - name: TAC
+    type: tac
+    minimize: true
+    unit: "$/yr"
+    annualization_factor: 0.1        # 10 年直线折旧
+    operating_hours: 8000.0          # 年操作小时数
+    skip_missing: false              # 任一设备缺数据则 TAC=None，不低估成本
+    allow_partial_objective: false
+    utility_cost:
+      steam_price: 14.19             # $/GJ，低压蒸汽（Turton 2018）
+      cooling_water_price: 0.354     # $/GJ
+      electricity_price: 0.0775      # $/kWh
+    equipment_params:
+      cepci_current: 800.0           # 当前 CEPCI 估算值
+    # NSTAGE 在 Input 子树，需要 fallback 设计参数
+    # DIAM 节点（Output\DIAM）值=0 且单位为空，无效；
+    # 实际塔径在 Output\CA_DIAM6（单位 meter），通过 output_key_map 重定向
+    output_key_map:
+      RADFRAC:
+        diam: CA_DIAM6               # 重定向到 Column Internals 计算的实际塔径
+    block_design_params:
+      T1:
+        nstage: 50                   # 与 T1_NSTAGE initial_value 一致（原始值）
+      T2:
+        nstage: 118                  # 与 T2_NSTAGE initial_value 一致（原始值）
+      T3:
+        nstage: 14                   # 与 T3_NSTAGE initial_value 一致（原始值）
+
+  - name: EMISSIONS
+    type: emissions
+    minimize: true
+    unit: "tonne CO2-eq/yr"
+    operating_hours: 8000.0
+    skip_missing: false
+    allow_partial_objective: false
+    emission_factors:
+      steam_factor: 66.0             # kg CO₂/GJ，天然气锅炉 η=0.85
+      cooling_water_factor: 0.0      # 冷却水排放可忽略
+      electricity_factor: 0.581      # kg CO₂/kWh，中国电网 2023
+    ghg_components:
+      CO2: 1.0
+      CH4: 27.9
+      N2O: 273.0
+    vent_streams: []                 # 本工艺无直接排放流股（Scope 1 = 0）
+
+# ---------------------------------------------------------------------------
+# 约束（对应原 MATLAB 的纯度约束 >= 0.999 mol frac）
+# ---------------------------------------------------------------------------
+constraints:
+  - name: D1_PF_purity
+    description: D1 塔顶产品 PF 摩尔分率不低于 0.999（Aspen 组分名 PF，对应 MATLAB 中的 PROH）
+    aspen_path: \Data\Streams\D1\Output\MOLEFRAC\MIXED\PF
+    operator: ">="
+    threshold: 0.999
+
+  - name: D2_NPA_purity
+    description: D2 塔顶产品 NPA 摩尔分率不低于 0.999（Aspen 组分名 NPA，对应 MATLAB 中的 BUAC）
+    aspen_path: \Data\Streams\D2\Output\MOLEFRAC\MIXED\NPA
+    operator: ">="
+    threshold: 0.999
+
+  - name: D3_WATER_purity
+    description: D3 塔顶产品 WATER 摩尔分率不低于 0.999
+    aspen_path: \Data\Streams\D3\Output\MOLEFRAC\MIXED\WATER
+    operator: ">="
+    threshold: 0.999
+
+# ---------------------------------------------------------------------------
+# block/stream 提取配置
+# ---------------------------------------------------------------------------
+extraction:
+  # 只检查三个精馏塔和三个产品流股的收敛状态
+  check_status_paths:
+    - \Data\Blocks\T1
+    - \Data\Blocks\T2
+    - \Data\Blocks\T3
+    - \Data\Streams\D1
+    - \Data\Streams\D2
+    - \Data\Streams\D3
+  # 提取三个精馏塔的 Output 子树
+  # 注意：T2 有 118 块板，Output 子树极大（含 Column Internals 深层节点）
+  # block_max_depth=2 只取一级子节点（REB_DUTY、COND_DUTY、CA_DIAM6 等），
+  # 避免遍历 CA_ACT_AREA\INT-1\CS-1 等深层节点导致每次提取耗时 3 分钟
+  blocks:
+    - T1
+    - T2
+    - T3
+  # 提取三个产品流股（用于约束验证和结果分析）
+  streams:
+    - D1
+    - D2
+    - D3
+  block_max_depth: 2                 # 从 3 降为 2，避免遍历 Column Internals 深层节点
+  stream_max_depth: 3
+  stream_output_subtree: "Output\\STR_MAIN"
+  strict_extraction: false           # 节点级失败记录到 notes，不阻断目标计算
+
+  # ── manifest runtime 模式（可选，启用后替代递归 TreeExporter）──────────────
+  # 启用方式：将 mode 改为 manifest，首次运行会自动 catalog scan + build manifest
+  # 优势：直接路径读取，COM 访问次数最小化，解决 CA_DIAM* 深层节点截断问题
+  mode: manifest
+  catalog_db: cases/demo_case_2/output/node.db
+  manifest_id: auto                  # auto=自动查找最新 manifest；或指定具体 ID
+  semantic_rules_dir: configs/aspen_semantics
+  build_manifest_if_missing: true    # 首次运行自动 catalog scan + build manifest
+  write_node_values: true            # 将读取结果写入 node.db node_values 表
+  strict_manifest: true              # manifest invalid 时阻止优化（不把缺数据当有效样本）
+
+# ---------------------------------------------------------------------------
+# 优化器（多目标 Pareto 贝叶斯优化）
+# ---------------------------------------------------------------------------
+optimizer:
+  type: pareto_bayesian
+  n_initial_points: 15               # 6 个连续变量，建议初始 DOE >= 2~3 倍维度
+  n_iterations: 45                   # 总仿真次数 = 15 + 45 = 60
+  scalarization: chebyshev           # Chebyshev 标量化对非凸 Pareto 前沿覆盖更均匀
+  acquisition_function: EI           # Expected Improvement
+  random_seed: 42
+  n_initial_min: 5                   # 启用 GP 所需的最少成功样本数
+  hv_margin: 0.1                     # 自动推断参考点时各维度扩展 10%

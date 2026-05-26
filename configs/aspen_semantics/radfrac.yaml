@@ -1,0 +1,159 @@
+# radfrac.yaml — RADFRAC 精馏塔语义规则
+#
+# 格式说明
+# --------
+# equipment_type: Aspen HAP_RECORDTYPE 字符串，与 catalog 中 block_type 匹配。
+#
+# fields.<field_name>:
+#   required_for: 触发此字段读取的目标函数名称列表（TAC/EMISSIONS/ENERGY）。
+#                 空列表 [] 表示始终读取（如 nstage）。
+#   required: true 表示缺失时 manifest 标记 invalid；false 表示 optional。
+#   candidates: 候选路径规则列表，按 priority 降序尝试匹配。
+#     pattern: 相对于 block 根节点（\Data\Blocks\<name>）的路径模式。
+#              支持 glob 通配符（* 匹配单段，** 匹配多段）。
+#              路径分隔符使用反斜杠 \。
+#     priority: 匹配优先级，数值越大越优先（0-100）。
+#   validators:
+#     value_type: numeric（1=INTEGER 或 2=REAL）/ string / any
+#     unit_dimension: energy_rate / length / dimensionless / area / power / any
+#                     "" 或 any 表示不校验单位维度。
+#
+# 注意
+# ----
+# - 不要在此文件中硬编码 block 名称（T1/T2/T3 等）。
+# - pattern 中的 * 只匹配单个路径段（不含 \）。
+# - 路径大小写不敏感（Aspen 树路径通常全大写）。
+
+equipment_type: RADFRAC
+
+fields:
+
+  reboiler_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\REB_DUTY"
+        priority: 100
+      - pattern: "Output\\QREB"
+        priority: 90
+      - pattern: "Output\\QREB*"
+        priority: 80
+      - pattern: "Output\\COND_DUTY2"
+        priority: 10
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  condenser_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\COND_DUTY"
+        priority: 100
+      - pattern: "Output\\QCOND"
+        priority: 90
+      - pattern: "Output\\QCOND*"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  column_diameter:
+    required_for: [TAC]
+    required: true
+    candidates:
+      - pattern: "Output\\DIAM_STAGE"
+        priority: 100
+      - pattern: "Output\\DIAM"
+        priority: 95
+      - pattern: "Output\\CA_DIAM*"
+        priority: 80
+      - pattern: "Output\\DIAM*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: length
+
+  nstage:
+    required_for: [TAC]
+    required: true
+    candidates:
+      - pattern: "Input\\NSTAGE"
+        priority: 100
+      - pattern: "Output\\NSTAGE"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  reflux_ratio:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\RR"
+        priority: 100
+      - pattern: "Output\\MOLE_RR"
+        priority: 90
+      - pattern: "Input\\RR"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  distillate_rate:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_D"
+        priority: 100
+      - pattern: "Output\\MASS_D"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  bottoms_rate:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_B"
+        priority: 100
+      - pattern: "Output\\MASS_B"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  condenser_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TEMP_COND"
+        priority: 100
+      - pattern: "Output\\B_TEMP\\1"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  reboiler_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TEMP_REB"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  column_pressure:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Input\\PRES1"
+        priority: 100
+      - pattern: "Output\\B_PRES\\1"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: pressure

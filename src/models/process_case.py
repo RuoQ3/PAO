@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .block import BlockResult
+from .node_catalog import SemanticBlock
 from .simulation_result import RunStatus, SimulationResult
 from .stream import StreamResult
 
@@ -204,6 +205,9 @@ class ProcessCase:
     run_id: str | None = None
     tags: list[str] = field(default_factory=list)
     notes: str = ""
+    # manifest runtime 模式产出的语义字段集合，{block_name: SemanticBlock}
+    # 非 manifest 模式时为空字典
+    semantic_blocks: dict[str, SemanticBlock] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     # 便捷属性
@@ -429,6 +433,7 @@ def process_case_from_sim_result(
     constraints: list[ConstraintValue] | None = None,
     tags: list[str] | None = None,
     run_id: str | None = None,
+    semantic_blocks: dict[str, SemanticBlock] | None = None,
 ) -> ProcessCase:
     """
     从 SimulationResult 构建 ProcessCase。
@@ -481,4 +486,5 @@ def process_case_from_sim_result(
         source_filepath=sim_result.source_filepath,
         run_id=run_id,
         tags=tags or [],
+        semantic_blocks=semantic_blocks or {},
     )

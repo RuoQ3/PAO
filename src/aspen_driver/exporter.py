@@ -8,6 +8,8 @@ exporter.py — Aspen Plus 仿真结果导出工具。
      任意子树的叶节点值。
      必须传入 success=True 的 SimulationResult 才能导出，
      或显式传入已校验的 block/stream 路径列表。
+     新增 export_values_by_paths() 和 export_values_by_manifest()：
+     直接路径读取，不递归 Elements，性能更好，适合 manifest runtime 模式。
 
 不持有 COM 连接，TreeExporter 通过 AspenDriver 委托执行树访问。
 """
@@ -420,10 +422,143 @@ class TreeExporter:
         return buf.getvalue()
 
     # ------------------------------------------------------------------ #
-    # 内部工具
+    # 直接路径读取（manifest runtime 模式）
     # ------------------------------------------------------------------ #
 
-    def _enumerate_names(self, parent_path: str, strict: bool) -> list[str]:
+    def export_values_by_paths(
+        self,
+        result: SimulationResult,
+        paths: list[str],
+        *,
+        strict: bool = True,
+        allow_failed: bool = False,
+    ) -> list[TreeValueRecord]:
+        """
+        按绝对路径列表直接读取节点值，不递归 Elements。
+
+        与 export_block_outputs() 的区别：
+        - 不递归子树，每个路径直接 FindNode(path)。
+        - 适合 manifest runtime 模式：路径已由 ManifestBuilder 确定，
+          无需重新发现，COM 访问次数最小化。
+        - 失败时返回 TreeValueRecord(error=...) 或 strict=True 时抛出。
+
+        Parameters
+        ----------
+        result:
+            当前仿真的 SimulationResult，用于校验结果可信性。
+        paths:
+            Aspen 绝对路径列表，如 [r"\Data\Blocks\T1\Output\REB_DUTY", ...]。
+        strict:
+            True（默认）：任意路径读取失败时抛出 AspenNodeError。
+            False：失败路径记录 error 字段，value=None，继续读取其余路径。
+        allow_failed:
+            False（默认）：result.success=False 时抛出 ValueError。
+
+        Returns
+        -------
+        list[TreeValueRecord]，顺序与 paths 一致。
+        """
+        _require_result_success(result, allow_failed)
+        _check_consistency(result, self._driver, allow_failed)
+
+        records: list[TreeValueRecord] = []
+        for path in paths:
+            record = self._read_single_path(path, strict)
+            records.append(record)
+        return records
+
+    def export_values_by_manifest(
+        self,
+        result: SimulationResult,
+        manifest: Any,
+        *,
+        strict_required: bool = True,
+        allow_failed: bool = False,
+    ) -> dict[str, list[TreeValueRecord]]:
+        """
+        按 ReadManifest 读取所有 items 的节点值。
+
+        返回 {source_name: [TreeValueRecord, ...]} 字典，
+        source_name 为 block/stream 名称（global items 归入 "__global__"）。
+
+        required item 读取失败时：
+        - strict_required=True（默认）：抛出 AspenNodeError。
+        - strict_required=False：记录 error 字段，继续读取。
+
+        optional item 读取失败时：始终记录 error 字段，不抛出。
+
+        Parameters
+        ----------
+        result:
+            当前仿真的 SimulationResult。
+        manifest:
+            ReadManifest 实例（src.models.read_manifest.ReadManifest）。
+        strict_required:
+            True（默认）：required item 失败时抛出。
+        allow_failed:
+            False（默认）：result.success=False 时抛出 ValueError。
+
+        Returns
+        -------
+        {source_name: [TreeValueRecord, ...]}
+        """
+        _require_result_success(result, allow_failed)
+        _check_consistency(result, self._driver, allow_failed)
+
+        out: dict[str, list[TreeValueRecord]] = {}
+
+        for item in manifest.items:
+            if not item.abs_path:
+                # 构建时未找到路径的 error item，直接生成 error record
+                rec = _error_record(
+                    abs_path="",
+                    rel_path=item.semantic_field,
+                    error=item.error or f"manifest item '{item.semantic_field}' 无有效路径",
+                )
+                source_key = item.source_name or "__global__"
+                out.setdefault(source_key, []).append(rec)
+                if item.required and strict_required:
+                    raise AspenNodeError(
+                        f"required manifest item '{item.source_name}.{item.semantic_field}' "
+                        f"无有效路径：{item.error}"
+                    )
+                continue
+
+            strict_this = item.required and strict_required
+            rec = self._read_single_path(item.abs_path, strict=strict_this)
+            # 将 rel_path 替换为语义字段名，便于上层识别
+            rec = TreeValueRecord(
+                path=rec.path,
+                rel_path=item.semantic_field,
+                value=rec.value,
+                unit=rec.unit,
+                value_type=rec.value_type,
+                error=rec.error,
+            )
+            source_key = item.source_name or "__global__"
+            out.setdefault(source_key, []).append(rec)
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 内部：单路径直接读取
+    # ------------------------------------------------------------------ #
+
+    def _read_single_path(self, path: str, strict: bool) -> TreeValueRecord:
+        """直接读取单个绝对路径的节点值，不递归子节点。"""
+        if not self._driver.node_exists(path):
+            err = f"节点不存在：'{path}'"
+            if strict:
+                raise AspenNodeError(err)
+            return _error_record(path, path.rsplit("\\", 1)[-1], err)
+
+        node = AspenNode(self._driver, path)
+        rel_path = path.rsplit("\\", 1)[-1]
+        return _read_node_record(node, path, rel_path, strict)
+
+    # ------------------------------------------------------------------ #
+    # 内部工具（递归子树）
+    # ------------------------------------------------------------------ #
         """枚举父节点下的直接子节点名称列表。"""
         if not self._driver.node_exists(parent_path):
             if strict:

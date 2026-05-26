@@ -6,10 +6,14 @@ tac.py — 基于 Turton 方法的总年化成本（TAC）计算模块。
 接收一次仿真工况（ProcessCase）的 block 结果，按设备类型估算资本成本（CAPEX）
 和年度公用工程成本（OPEX），汇总为 TAC（$/yr）。
 
-输入
-----
-- ProcessCase：包含 blocks 字典（{block_name: BlockResult}）
-- TACConfig：年化因子、操作小时数、公用工程单价、Turton 系数、键名映射
+输入优先级
+----------
+1. case.semantic_blocks（manifest runtime 模式产出的语义字段）
+   - 直接按字段名读取 reboiler_duty / condenser_duty / column_diameter / nstage 等
+   - 单位来自 SemanticField.unit，由 normalize_* 处理
+2. case.blocks（full/debug 模式产出的 BlockResult）
+   - 通过 _DEFAULT_KEY_MAP 按 BlockOutput.name 查找
+3. TACConfig.block_design_params（fallback 设计参数）
 
 输出
 ----
@@ -19,6 +23,7 @@ tac.py — 基于 Turton 方法的总年化成本（TAC）计算模块。
 与框架的接口关系
 ----------------
 - 消费 src/models/block.py 中的 BlockResult / BlockOutput
+- 消费 src/models/node_catalog.py 中的 SemanticBlock / SemanticField
 - 消费 src/models/process_case.py 中的 ProcessCase / ObjectiveValue
 - 消费 src/economics/units.py 中的 normalize_* 函数（单位归一化）
 - 产出 ObjectiveFn 类型（Callable[[ProcessCase], ObjectiveValue]）
@@ -36,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..models.block import BlockResult, BlockType
+from ..models.node_catalog import SemanticBlock
 from ..models.process_case import ObjectiveValue, ProcessCase
 from .units import normalize_area, normalize_duty, normalize_length, normalize_power, normalize_volume
 
@@ -260,6 +266,34 @@ def _power_kw_to_annual_cost(power_kw: float, price_per_kwh: float, hours: float
 
 
 # ---------------------------------------------------------------------------
+# 语义字段读取辅助
+# ---------------------------------------------------------------------------
+
+def _get_semantic_val(
+    semantic_block: SemanticBlock | None,
+    field_name: str,
+) -> tuple[Any, str, str | None]:
+    """
+    从 SemanticBlock 读取语义字段，返回 (raw_value, unit, fetch_error)。
+
+    - semantic_block 为 None：(None, "", "无 semantic_block")
+    - 字段不存在：(None, "", "字段 '{field_name}' 不在 semantic_block 中")
+    - 字段不可用（error 非空）：(None, "", error_msg)
+    - 成功：(value, unit, None)
+    """
+    if semantic_block is None:
+        return None, "", "无 semantic_block（非 manifest 模式）"
+    sf = semantic_block.get(field_name)
+    if sf is None:
+        return None, "", f"字段 '{field_name}' 不在 semantic_block 中"
+    if not sf.available:
+        return None, sf.unit, (
+            sf.error or f"字段 '{field_name}' 不可用（value=None）"
+        )
+    return sf.value, sf.unit, None
+
+
+# ---------------------------------------------------------------------------
 # 各设备类型成本计算
 # ---------------------------------------------------------------------------
 
@@ -267,9 +301,15 @@ def _calc_column_cost(
     block: BlockResult,
     config: TACConfig,
     design_params: dict[str, float] | None = None,
+    semantic_block: SemanticBlock | None = None,
 ) -> EquipmentCost:
     """
     精馏塔 CAPEX + OPEX。
+
+    读取优先级（每个字段独立）：
+    1. semantic_block（manifest runtime 模式）
+    2. block.outputs（full 模式，通过 key_map 查找）
+    3. design_params（fallback 设计参数）
 
     塔体积估算：V = π/4 * D² * N * tray_spacing（工程估算，tray_spacing=0.6m）。
     此公式将塔视为等截面圆柱，忽略封头和裙座，适用于概念设计阶段精度（±30%）。
@@ -282,24 +322,30 @@ def _calc_column_cost(
         来自 TACConfig.block_design_params[block.name] 的设计参数 fallback，
         格式 ``{semantic_key: SI_value}``，如 ``{"diam": 2.5, "nstage": 30}``。
         当 Aspen Output 子树缺少节点或值无效时使用，触发时记录到 notes。
+    semantic_block:
+        manifest runtime 模式产出的 SemanticBlock，优先于 block.outputs 读取。
     """
     btype_val = block.block_type.value
     key_map   = _resolve_key_map(btype_val, config.output_key_map)
     ep        = config.equipment_params
     uc        = config.utility_cost
 
-    diam_raw, diam_unit, diam_ferr   = _get_val(block, "diam",   key_map)
-    nstage_raw, _, nstage_ferr        = _get_val(block, "nstage", key_map)
-
     notes_parts: list[str] = []
     capex: float | None = None
+
+    # --- 塔径 ---
+    diam_raw, diam_unit, diam_ferr = _get_semantic_val(semantic_block, "column_diameter")
+    if diam_raw is None and diam_ferr and semantic_block is not None:
+        notes_parts.append(f"[semantic] column_diameter: {diam_ferr}，尝试 block.outputs fallback")
+    if diam_raw is None:
+        diam_raw, diam_unit, diam_ferr = _get_val(block, "diam", key_map)
 
     diam: float | None = None
     if diam_raw is None:
         if design_params and "diam" in design_params:
             diam = float(design_params["diam"])
             notes_parts.append(
-                f"DIAM 不在 Output 子树（{diam_ferr}），使用设计参数 diam={diam:.3f} m"
+                f"DIAM 不可用（{diam_ferr}），使用设计参数 diam={diam:.3f} m"
             )
         else:
             notes_parts.append(diam_ferr or "缺少塔径（diam），无法计算 CAPEX")
@@ -316,6 +362,13 @@ def _calc_column_cost(
         else:
             diam = diam_norm
 
+    # --- 板数 ---
+    nstage_raw, _, nstage_ferr = _get_semantic_val(semantic_block, "nstage")
+    if nstage_raw is None and nstage_ferr and semantic_block is not None:
+        notes_parts.append(f"[semantic] nstage: {nstage_ferr}，尝试 block.outputs fallback")
+    if nstage_raw is None:
+        nstage_raw, _, nstage_ferr = _get_val(block, "nstage", key_map)
+
     nstage: float | None = None
     if nstage_raw is None:
         if design_params and "nstage" in design_params:
@@ -327,7 +380,7 @@ def _calc_column_cost(
             else:
                 nstage = float(round(n_val))
                 notes_parts.append(
-                    f"NSTAGE 不在 Output 子树（{nstage_ferr}），使用设计参数 nstage={int(nstage)}"
+                    f"NSTAGE 不可用（{nstage_ferr}），使用设计参数 nstage={int(nstage)}"
                 )
         else:
             notes_parts.append(nstage_ferr or "缺少板数（nstage），无法计算 CAPEX")
@@ -352,8 +405,19 @@ def _calc_column_cost(
             notes_parts.append(f"CAPEX 计算失败：{exc}")
             capex = None
 
-    reb_raw, reb_unit, reb_ferr   = _get_val(block, "reb_duty",  key_map)
-    cond_raw, cond_unit, cond_ferr = _get_val(block, "cond_duty", key_map)
+    # --- 再沸器负荷 ---
+    reb_raw, reb_unit, reb_ferr = _get_semantic_val(semantic_block, "reboiler_duty")
+    if reb_raw is None and reb_ferr and semantic_block is not None:
+        notes_parts.append(f"[semantic] reboiler_duty: {reb_ferr}，尝试 block.outputs fallback")
+    if reb_raw is None:
+        reb_raw, reb_unit, reb_ferr = _get_val(block, "reb_duty", key_map)
+
+    # --- 冷凝器负荷 ---
+    cond_raw, cond_unit, cond_ferr = _get_semantic_val(semantic_block, "condenser_duty")
+    if cond_raw is None and cond_ferr and semantic_block is not None:
+        notes_parts.append(f"[semantic] condenser_duty: {cond_ferr}，尝试 block.outputs fallback")
+    if cond_raw is None:
+        cond_raw, cond_unit, cond_ferr = _get_val(block, "cond_duty", key_map)
 
     opex: float = 0.0
     opex_valid = True
@@ -602,10 +666,15 @@ def _calc_reactor_cost(block: BlockResult, config: TACConfig) -> EquipmentCost:
 # 分发函数
 # ---------------------------------------------------------------------------
 
-def _calc_equipment_cost(block: BlockResult, config: TACConfig) -> EquipmentCost:
+def _calc_equipment_cost(
+    block: BlockResult,
+    config: TACConfig,
+    semantic_block: SemanticBlock | None = None,
+) -> EquipmentCost:
     """
     根据 block_type 分发到对应计算函数。
 
+    semantic_block 优先于 block.outputs 读取语义字段（manifest runtime 模式）。
     不支持的类型（如 FLASH2、MIXER 等）返回 capex=None, opex_annual=None，
     notes 中说明原因，不抛出异常，由上层 skip_missing 策略决定如何处理。
     """
@@ -613,7 +682,7 @@ def _calc_equipment_cost(block: BlockResult, config: TACConfig) -> EquipmentCost
     design_params = config.block_design_params.get(block.name)
 
     if btype_val in _COLUMN_TYPES:
-        return _calc_column_cost(block, config, design_params)
+        return _calc_column_cost(block, config, design_params, semantic_block)
     if btype_val in _HEATX_TYPES:
         return _calc_heatx_cost(block, config)
     if btype_val in _PUMP_TYPES:
@@ -642,6 +711,7 @@ def calculate_tac(case: ProcessCase, config: TACConfig) -> TACResult:
     计算整个 ProcessCase 的 TAC。
 
     遍历 case.blocks，对每个 converged 的 block 调用 _calc_equipment_cost。
+    若 case.semantic_blocks 非空，优先从语义字段读取（manifest runtime 模式）。
     未收敛的 block 直接进入 skipped_blocks，不影响其他 block 的计算。
     tac=None 的设备（不支持类型或关键数据缺失）也进入 skipped_blocks。
 
@@ -653,6 +723,10 @@ def calculate_tac(case: ProcessCase, config: TACConfig) -> TACResult:
     skipped_blocks: list[str] = []
     global_notes: list[str] = []
 
+    use_semantic = bool(case.semantic_blocks)
+    if use_semantic:
+        global_notes.append("使用 semantic_blocks（manifest runtime 模式）读取设备参数")
+
     for block_name, block in case.blocks.items():
         if not block.converged:
             skipped_blocks.append(block_name)
@@ -660,7 +734,8 @@ def calculate_tac(case: ProcessCase, config: TACConfig) -> TACResult:
                 f"Block '{block_name}'({block.block_type.value}) 未收敛，跳过"
             )
             continue
-        ec = _calc_equipment_cost(block, config)
+        semantic_block = case.semantic_blocks.get(block_name) if use_semantic else None
+        ec = _calc_equipment_cost(block, config, semantic_block)
         equipment_costs.append(ec)
         if ec.tac is None:
             skipped_blocks.append(block_name)

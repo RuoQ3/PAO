@@ -458,6 +458,7 @@ class ProgressLogger:
         value: float | None,
         status: str,
         elapsed: float,
+        error: str | None = None,
     ) -> None:
         """
         记录单次迭代结果。
@@ -469,6 +470,7 @@ class ProgressLogger:
         value   : 目标函数值（None 表示失败/不可用）
         status  : 工况状态字符串（如 "success"、"sim_failed"、"infeasible"）
         elapsed : 本次工况耗时（秒）
+        error   : 底层错误信息（SimulationResult.error），失败时传入以便写入日志
         """
         now = time.perf_counter()
         self._iter_times.append(now - self._last_iter_t)
@@ -496,6 +498,8 @@ class ProgressLogger:
             self._objective_name, val_str, best_mark,
             status, elapsed, eta_str,
         )
+        if error:
+            self._log.warning("  └─ sim error: %s", error)
         self._log.debug("  params: %s", param_str)
 
     def end(self) -> None:

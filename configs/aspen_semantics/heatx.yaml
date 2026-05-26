@@ -1,0 +1,53 @@
+# heatx.yaml — HEATX / HEATER 换热器语义规则
+
+equipment_type: HEATX
+
+fields:
+
+  heat_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\DUTY"
+        priority: 100
+      - pattern: "Output\\QNET"
+        priority: 90
+      - pattern: "Output\\Q*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  heat_transfer_area:
+    required_for: [TAC]
+    required: true
+    candidates:
+      - pattern: "Output\\AREA"
+        priority: 100
+      - pattern: "Output\\CALC_AREA"
+        priority: 90
+      - pattern: "Output\\AREA*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: area
+
+  hot_inlet_temperature:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\TEMP_HOT_IN"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  cold_outlet_temperature:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\TEMP_COLD_OUT"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
