@@ -49,8 +49,14 @@ _DDL = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
-CREATE TABLE IF NOT EXISTS cases (
+-- 硬迁移：重建 cases 表（新增 session_id 列）
+DROP TABLE IF EXISTS tags;
+DROP TABLE IF EXISTS objectives;
+DROP TABLE IF EXISTS cases;
+
+CREATE TABLE cases (
     case_id               TEXT    PRIMARY KEY,
+    session_id            TEXT    NOT NULL DEFAULT '',
     iteration             INTEGER NOT NULL,
     status                TEXT    NOT NULL,
     simulation_valid      INTEGER NOT NULL,
@@ -105,7 +111,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_case_tag ON tags (case_id, tag);
 
 # query_cases / query_by_objective 返回的摘要列（不含 blocks/streams/sim_result）
 _SUMMARY_COLS = (
-    "case_id", "iteration", "status",
+    "case_id", "session_id", "iteration", "status",
     "simulation_valid", "success", "feasible",
     "has_constraints", "objectives_available", "constraints_available",
     "run_time", "source_filepath", "run_id", "notes",
@@ -209,18 +215,19 @@ class SimulationDB:
         self._conn.execute(
             """
             INSERT OR REPLACE INTO cases (
-                case_id, iteration, status,
+                case_id, session_id, iteration, status,
                 simulation_valid, success, feasible,
                 has_constraints, objectives_available, constraints_available,
                 run_time, source_filepath, run_id, notes,
                 design_vars, objectives_json, constraints_json, tags_json,
                 sim_result, blocks, streams, created_at
             ) VALUES (
-                ?,?,?,  ?,?,?,  ?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,  ?
+                ?,?,?,?,  ?,?,?,  ?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,  ?
             )
             """,
             (
                 case_id,
+                d.get("session_id", ""),
                 d.get("iteration", 0),
                 d.get("status", "pending"),
                 int(bool(simulation_valid)),
@@ -299,6 +306,7 @@ class SimulationDB:
         self,
         *,
         status: str | None = None,
+        session_id: str | None = None,
         tags: list[str] | None = None,
         iteration_min: int | None = None,
         iteration_max: int | None = None,
@@ -338,6 +346,9 @@ class SimulationDB:
         if status is not None:
             conditions.append("cases.status = ?")
             params.append(status)
+        if session_id is not None:
+            conditions.append("cases.session_id = ?")
+            params.append(session_id)
         if iteration_min is not None:
             conditions.append("cases.iteration >= ?")
             params.append(iteration_min)

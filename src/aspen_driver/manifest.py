@@ -37,6 +37,42 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# 路径段感知 glob 匹配（模块级工具函数）
+# ---------------------------------------------------------------------------
+
+def _match_segs(
+    path_segs: list[str], pi: int,
+    pat_segs: list[str], qi: int,
+) -> bool:
+    """递归匹配路径段列表。"""
+    while qi < len(pat_segs):
+        seg = pat_segs[qi]
+        if seg == "**":
+            qi += 1
+            # ** 匹配零或多段
+            for skip in range(len(path_segs) - pi + 1):
+                if _match_segs(path_segs, pi + skip, pat_segs, qi):
+                    return True
+            return False
+        if pi >= len(path_segs):
+            return False
+        if not fnmatch.fnmatch(path_segs[pi], seg):
+            return False
+        pi += 1
+        qi += 1
+    return pi == len(path_segs)
+
+
+def _glob_match_path(path: str, pattern: str) -> bool:
+    """
+    路径段感知的 glob 匹配。
+
+    * 只匹配单个路径段（不含 \\\\），** 匹配任意数量的路径段。
+    路径分隔符为反斜杠，大小写由调用方统一处理。
+    """
+    return _match_segs(path.split("\\"), 0, pattern.split("\\"), 0)
+
 from ..models.read_manifest import ReadManifest, ReadManifestItem
 
 try:
@@ -46,6 +82,9 @@ except ImportError:
     _YAML_AVAILABLE = False
 
 _log = logging.getLogger(__name__)
+
+# manifest 构建器版本号：规则格式或校验逻辑变化时递增，触发旧 manifest 失效
+MANIFEST_BUILDER_VERSION = "2"
 
 # 单位维度 → 可接受的 UnitString 关键词（大小写不敏感子串匹配）
 _UNIT_DIMENSION_KEYWORDS: dict[str, list[str]] = {
@@ -114,6 +153,29 @@ def load_semantic_rules(rules_dir: str | Path) -> dict[str, dict[str, Any]]:
     return result
 
 
+def compute_rules_hash(rules_dir: str | Path) -> str:
+    """
+    计算 rules_dir 下所有 *.yaml 文件内容的 SHA256 哈希。
+
+    按文件名排序后依次 update，保证顺序确定性。
+    rules_dir 不存在或无 yaml 文件时返回空字符串。
+    """
+    import hashlib
+    rules_path = Path(rules_dir)
+    if not rules_path.exists():
+        return ""
+    yaml_files = sorted(rules_path.glob("*.yaml"))
+    if not yaml_files:
+        return ""
+    h = hashlib.sha256()
+    for f in yaml_files:
+        try:
+            h.update(f.read_bytes())
+        except OSError:
+            pass
+    return h.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # ManifestBuilder
 # ---------------------------------------------------------------------------
@@ -135,8 +197,10 @@ class ManifestBuilder:
         node_db: Any,
         rules_dir: str | Path = "configs/aspen_semantics",
     ) -> None:
-        self._node_db  = node_db
-        self._rules    = load_semantic_rules(rules_dir)
+        self._node_db    = node_db
+        self._rules_dir  = Path(rules_dir)
+        self._rules      = load_semantic_rules(rules_dir)
+        self._rules_hash = compute_rules_hash(rules_dir)
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -175,6 +239,27 @@ class ManifestBuilder:
         now  = datetime.now(timezone.utc).isoformat()
         items: list[ReadManifestItem] = []
         errors: list[str] = []
+
+        # 规则为空但有目标函数：无法生成语义字段，直接标记无效
+        if objective_names and not self._rules:
+            error_msg = (
+                f"语义规则为空（rules_dir={self._rules_dir}），"
+                f"无法为目标 {objective_names} 生成 manifest"
+            )
+            _log.warning("manifest '%s' 无效：%s", mid, error_msg)
+            manifest = ReadManifest(
+                manifest_id=mid,
+                catalog_id=catalog_id,
+                objective_names=objective_names,
+                items=[],
+                is_valid=False,
+                error=error_msg,
+                created_at=now,
+                rules_hash=self._rules_hash,
+                builder_version=MANIFEST_BUILDER_VERSION,
+            )
+            self._node_db.save_manifest(manifest)
+            return manifest
 
         # 获取 catalog 中所有 block 的类型映射
         block_types = self._node_db.get_catalog_block_types(catalog_id)
@@ -235,6 +320,8 @@ class ManifestBuilder:
             is_valid=is_valid,
             error=error_msg,
             created_at=now,
+            rules_hash=self._rules_hash,
+            builder_version=MANIFEST_BUILDER_VERSION,
         )
 
         self._node_db.save_manifest(manifest)
@@ -285,24 +372,40 @@ class ManifestBuilder:
             )
 
             best_item: ReadManifestItem | None = None
+            rejection_details: list[str] = []
             for idx, cand in enumerate(sorted_candidates):
                 pattern = cand.get("pattern", "")
                 priority = cand.get("priority", 0)
                 rule_id = f"{block_type.lower()}.{field_name}.{idx}"
 
-                matched = self._match_pattern(
+                matched_entries = self._match_pattern_all(
                     block_name, pattern, path_index, catalog_id
                 )
-                if matched is None:
+                if not matched_entries:
+                    rejection_details.append(f"'{pattern}' 无路径匹配")
                     continue
 
-                entry = matched
-                # 校验
-                val_err = self._validate_entry(entry, validators)
-                if val_err:
-                    _log.debug(
-                        "block '%s' 字段 '%s' 候选 '%s' 校验失败：%s",
-                        block_name, field_name, pattern, val_err,
+                # 对同一 pattern 的所有匹配项逐个校验，选第一个通过的
+                entry_errors: list[str] = []
+                chosen_entry: dict[str, Any] | None = None
+                for entry in matched_entries:
+                    val_err = self._validate_entry(entry, validators)
+                    if val_err:
+                        entry_errors.append(
+                            f"{entry['abs_path'].rsplit(chr(92), 1)[-1]}：{val_err}"
+                        )
+                        _log.debug(
+                            "block '%s' 字段 '%s' 候选 '%s' 路径 '%s' 校验失败：%s",
+                            block_name, field_name, pattern, entry["abs_path"], val_err,
+                        )
+                    else:
+                        chosen_entry = entry
+                        break
+
+                if chosen_entry is None:
+                    detail = "；".join(entry_errors) if entry_errors else "无有效匹配"
+                    rejection_details.append(
+                        f"'{pattern}' 校验失败（{len(matched_entries)} 项均未通过）：{detail}"
                     )
                     continue
 
@@ -313,10 +416,10 @@ class ManifestBuilder:
                     source_name=block_name,
                     equipment_type=block_type,
                     semantic_field=field_name,
-                    abs_path=entry["abs_path"],
-                    rel_path=entry["rel_path"],
-                    unit_string=entry.get("unit_string", ""),
-                    value_type=entry.get("value_type", 0),
+                    abs_path=chosen_entry["abs_path"],
+                    rel_path=chosen_entry["rel_path"],
+                    unit_string=chosen_entry.get("unit_string", ""),
+                    value_type=chosen_entry.get("value_type", 0),
                     required=is_required,
                     confidence=confidence,
                     rule_id=rule_id,
@@ -325,10 +428,11 @@ class ManifestBuilder:
                 break  # 找到最高优先级匹配，停止
 
             if best_item is None:
-                # 未找到匹配路径
+                # 未找到匹配路径，附带每个候选的拒绝原因
+                rejection_summary = "；".join(rejection_details) if rejection_details else "无候选"
                 err_msg = (
                     f"block '{block_name}'（{block_type}）字段 '{field_name}' "
-                    f"在 catalog 中未找到匹配路径（尝试了 {len(sorted_candidates)} 个候选）"
+                    f"在 catalog 中未找到匹配路径（{rejection_summary}）"
                 )
                 if is_required:
                     errors.append(err_msg)
@@ -360,6 +464,38 @@ class ManifestBuilder:
     # 内部：pattern 匹配
     # ------------------------------------------------------------------ #
 
+    def _match_pattern_all(
+        self,
+        block_name: str,
+        pattern: str,
+        path_index: dict[str, dict[str, Any]],
+        catalog_id: str,
+    ) -> list[dict[str, Any]]:
+        """
+        返回 path_index 中与 pattern 匹配的所有 catalog entry，按叶节点优先、路径长度升序排列。
+
+        pattern 是相对于 block 根节点的路径（如 "Output\\\\REB_DUTY"）。
+        支持 glob 通配符（* 匹配单段，** 匹配多段）。
+        无匹配时返回空列表。
+        """
+        block_root = f"\\DATA\\BLOCKS\\{block_name.upper()}"
+        full_pattern = f"{block_root}\\{pattern.upper()}"
+
+        # 精确匹配优先（单结果，直接返回）
+        if full_pattern in path_index:
+            return [path_index[full_pattern]]
+
+        # glob 匹配（段感知，* 不跨 \）
+        matches: list[dict[str, Any]] = [
+            entry
+            for abs_path_upper, entry in path_index.items()
+            if _glob_match_path(abs_path_upper, full_pattern)
+        ]
+
+        # 叶节点优先，再按路径长度升序（最短路径 = 最直接）
+        matches.sort(key=lambda e: (not e.get("is_leaf", True), len(e["abs_path"])))
+        return matches
+
     def _match_pattern(
         self,
         block_name: str,
@@ -368,32 +504,13 @@ class ManifestBuilder:
         catalog_id: str,
     ) -> dict[str, Any] | None:
         """
-        在 path_index 中查找与 pattern 匹配的 catalog entry。
+        在 path_index 中查找与 pattern 匹配的最优 catalog entry。
 
-        pattern 是相对于 block 根节点的路径（如 "Output\\REB_DUTY"）。
-        支持 glob 通配符（* 匹配单段，** 匹配多段）。
-        返回优先级最高的匹配 entry，无匹配时返回 None。
+        返回排序后的第一个匹配项；无匹配时返回 None。
+        调用方若需对所有匹配项逐个校验，请使用 _match_pattern_all()。
         """
-        block_root = f"\\DATA\\BLOCKS\\{block_name.upper()}"
-        # 构造完整 abs_path 模式（大写，用于匹配 path_index 的 key）
-        full_pattern = f"{block_root}\\{pattern.upper()}"
-
-        # 精确匹配优先
-        if full_pattern in path_index:
-            return path_index[full_pattern]
-
-        # glob 匹配（fnmatch，* 不跨 \）
-        matches: list[dict[str, Any]] = []
-        for abs_path_upper, entry in path_index.items():
-            if fnmatch.fnmatch(abs_path_upper, full_pattern):
-                matches.append(entry)
-
-        if not matches:
-            return None
-
-        # 多个匹配时，优先选叶节点，再按路径长度升序（最短路径 = 最直接）
-        matches.sort(key=lambda e: (not e.get("is_leaf", True), len(e["abs_path"])))
-        return matches[0]
+        results = self._match_pattern_all(block_name, pattern, path_index, catalog_id)
+        return results[0] if results else None
 
     # ------------------------------------------------------------------ #
     # 内部：validators
@@ -423,11 +540,16 @@ class ManifestBuilder:
 
         # unit_dimension 校验
         if udim_rule and udim_rule != "any":
-            unit_str = (entry.get("unit_string") or "").lower()
+            unit_str = (entry.get("unit_string") or "").lower().strip()
             keywords = _UNIT_DIMENSION_KEYWORDS.get(udim_rule, [])
             if udim_rule == "dimensionless":
-                # 无单位或空单位均可
-                pass
+                # 空单位或常见无量纲标记通过；非空且有物理单位时拒绝
+                _DIMENSIONLESS_OK = {"", "-", "none", "dimensionless", "1", "fraction", "%"}
+                if unit_str and unit_str not in _DIMENSIONLESS_OK:
+                    return (
+                        f"unit_string='{unit_str}' 不是无量纲"
+                        f"（期望空或 {sorted(_DIMENSIONLESS_OK - {''})}）"
+                    )
             elif keywords:
                 if not any(kw in unit_str for kw in keywords if kw):
                     # 单位为空时不强制拒绝（Aspen 部分节点 UnitString 为空但值有效）
@@ -441,5 +563,22 @@ class ManifestBuilder:
                         "节点 '%s' unit_string 为空，跳过 unit_dimension 校验（%s）",
                         entry.get("abs_path", ""), udim_rule,
                     )
+
+        # sample_value_nonzero 校验：排除 sample_value=0 或 None 的节点（如 DIAM 未做 sizing）
+        if validators.get("sample_value_nonzero", False):
+            sv = entry.get("sample_value")
+            if sv is None or sv == "" or sv == "null":
+                return (
+                    f"sample_value 为 None/空，节点可能未初始化"
+                    f"（sample_value_nonzero=true，abs_path={entry.get('abs_path', '')}）"
+                )
+            try:
+                if float(sv) == 0.0:
+                    return (
+                        f"sample_value=0，节点未做 sizing 或无有效值"
+                        f"（sample_value_nonzero=true，abs_path={entry.get('abs_path', '')}）"
+                    )
+            except (ValueError, TypeError):
+                pass  # 非数值 sample_value 不拒绝
 
         return ""

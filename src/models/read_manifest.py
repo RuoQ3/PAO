@@ -51,6 +51,8 @@ class ReadManifest:
     is_valid: bool = True
     error: str = ""                   # manifest 级别的错误（如 required 字段缺失）
     created_at: str = ""
+    rules_hash: str = ""              # 构建时 semantic rules 文件内容的 SHA256
+    builder_version: str = ""         # ManifestBuilder 版本号
 
     def get_items_for_block(self, block_name: str) -> list[ReadManifestItem]:
         """返回指定 block 的所有 manifest items。"""

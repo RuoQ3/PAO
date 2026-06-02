@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -49,6 +50,11 @@ from ..models.process_case import (
 )
 from ..models.simulation_result import SimulationResult
 from ..models.stream import ComponentFlow, StreamResult, stream_result_from_runner
+from ..utils.logger import (
+    log_process_case_diagnostics,
+    log_run_config_summary,
+    log_simulation_result,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -197,6 +203,9 @@ def run_case(
     """
     runner   = SimulationRunner(driver)
     exporter = TreeExporter(driver)
+    case_id  = str(uuid.uuid4())
+
+    log_run_config_summary(_log, config)
 
     # 1. 运行仿真
     sim_result = runner.run_case(
@@ -211,6 +220,14 @@ def run_case(
 
     if not sim_result.success and sim_result.error:
         _log.warning("仿真失败 [iter=%d, status=%s]：%s", iteration, sim_result.status.value, sim_result.error)
+        log_simulation_result(
+            _log,
+            sim_result,
+            iteration=iteration,
+            case_id=case_id,
+            design_vars=design_vars,
+            level=logging.WARNING,
+        )
 
     # 2 & 3. 提取 block/stream 数据（仅在仿真收敛时）
     blocks:  dict[str, BlockResult]  = {}
@@ -222,10 +239,28 @@ def run_case(
     if sim_result.success:
         if config.extraction_mode == "manifest":
             # manifest runtime 模式：直接路径读取，不递归 Elements
-            semantic_blocks, manifest_notes, extraction_fatal = _extract_by_manifest(
-                exporter, sim_result, config, iteration, run_id
+            semantic_blocks, manifest_notes, extraction_fatal, fallback_to_full = _extract_by_manifest(
+                exporter, driver, sim_result, config, iteration, case_id
             )
             notes_parts.extend(manifest_notes)
+            if fallback_to_full:
+                # manifest 不可用，真正执行 full 提取
+                block_result  = _extract_blocks(exporter, sim_result, design_vars, config, run_id)
+                stream_result = _extract_streams(exporter, sim_result, config, run_id)
+                blocks  = block_result.data   # type: ignore[assignment]
+                streams = stream_result.data  # type: ignore[assignment]
+                if block_result.failed_nodes:
+                    parts = [f"  {k}: {v}" for k, v in block_result.failed_nodes.items()]
+                    notes_parts.append("Block 节点提取失败：\n" + "\n".join(parts))
+                if stream_result.failed_nodes:
+                    parts = [f"  {k}: {v}" for k, v in stream_result.failed_nodes.items()]
+                    notes_parts.append("Stream 节点提取失败：\n" + "\n".join(parts))
+                if block_result.fatal_error:
+                    notes_parts.append(f"Block 整批提取失败：{block_result.fatal_error}")
+                    extraction_fatal = True
+                if stream_result.fatal_error:
+                    notes_parts.append(f"Stream 整批提取失败：{stream_result.fatal_error}")
+                    extraction_fatal = True
         else:
             # full/debug 模式：递归 TreeExporter（原有逻辑）
             block_result  = _extract_blocks(exporter, sim_result, design_vars, config, run_id)
@@ -302,10 +337,13 @@ def run_case(
         tags=tags,
         run_id=run_id,
         semantic_blocks=semantic_blocks,
+        case_id=case_id,
     )
 
     if notes_parts:
         case.notes = "\n\n".join(notes_parts)
+
+    log_process_case_diagnostics(_log, case, phase="run_case", include_sim_result=False)
 
     return case
 
@@ -316,21 +354,22 @@ def run_case(
 
 def _extract_by_manifest(
     exporter: TreeExporter,
+    driver: AspenDriver,
     sim_result: SimulationResult,
     config: RunCaseConfig,
     iteration: int,
-    run_id: str | None,
-) -> tuple[dict[str, SemanticBlock], list[str], bool]:
+    case_id: str,
+) -> tuple[dict[str, SemanticBlock], list[str], bool, bool]:
     """
     manifest runtime 模式：从 NodeDB 加载 manifest，直接路径读取节点值，
     构建 SemanticBlock 字典。
 
     Returns
     -------
-    (semantic_blocks, notes_parts, extraction_fatal)
+    (semantic_blocks, notes_parts, extraction_fatal, fallback_to_full)
+    fallback_to_full=True 表示调用方应转入 full 提取模式。
     """
     notes: list[str] = []
-    fatal = False
 
     # 延迟导入，避免循环依赖
     try:
@@ -342,14 +381,14 @@ def _extract_by_manifest(
         msg = f"manifest runtime 模式依赖导入失败：{exc}"
         _log.error(msg)
         notes.append(msg)
-        return {}, notes, True
+        return {}, notes, True, False
 
     db_path = config.catalog_db_path
     if not db_path:
         msg = "extraction_mode='manifest' 但未配置 catalog_db_path，降级为 full 模式"
         _log.warning(msg)
         notes.append(msg)
-        return {}, notes, False
+        return {}, notes, False, True
 
     try:
         node_db = NodeDB(db_path)
@@ -357,13 +396,13 @@ def _extract_by_manifest(
         msg = f"打开 NodeDB 失败（{db_path}）：{exc}"
         _log.error(msg)
         notes.append(msg)
-        return {}, notes, config.strict_manifest
+        return {}, notes, config.strict_manifest, not config.strict_manifest
 
     try:
         manifest = _resolve_manifest(
             node_db=node_db,
             config=config,
-            driver=exporter._driver,
+            driver=driver,
             sim_result=sim_result,
         )
     except Exception as exc:
@@ -371,14 +410,14 @@ def _extract_by_manifest(
         _log.error(msg)
         notes.append(msg)
         node_db.close()
-        return {}, notes, config.strict_manifest
+        return {}, notes, config.strict_manifest, not config.strict_manifest
 
     if manifest is None:
         msg = "未找到有效 manifest，降级为 full 模式"
         _log.warning(msg)
         notes.append(msg)
         node_db.close()
-        return {}, notes, False
+        return {}, notes, False, True
 
     if not manifest.is_valid:
         msg = f"manifest '{manifest.manifest_id}' 无效：{manifest.error}"
@@ -386,7 +425,7 @@ def _extract_by_manifest(
         notes.append(msg)
         if config.strict_manifest:
             node_db.close()
-            return {}, notes, True
+            return {}, notes, True, False
 
     # 按 manifest 直接路径读取
     try:
@@ -401,15 +440,15 @@ def _extract_by_manifest(
         _log.error(msg)
         notes.append(msg)
         node_db.close()
-        return {}, notes, config.strict_manifest
+        return {}, notes, config.strict_manifest, not config.strict_manifest
 
-    # 将读取结果写入 NodeDB node_values
-    if config.write_node_values and run_id:
+    # 将读取结果写入 NodeDB node_values（使用 case_id 保证与 SimulationDB 一致）
+    if config.write_node_values:
         try:
             from ..aspen_driver.exporter import TreeValueRecord as _TVR
             for source_name, records in raw_by_source.items():
                 node_db.save_node_values(
-                    case_id=run_id,
+                    case_id=case_id,
                     source=f"manifest:{source_name}",
                     records=records,
                 )
@@ -420,7 +459,7 @@ def _extract_by_manifest(
     semantic_blocks = _build_semantic_blocks(manifest, raw_by_source)
 
     node_db.close()
-    return semantic_blocks, notes, False
+    return semantic_blocks, notes, False, False
 
 
 def _resolve_manifest(
@@ -435,7 +474,9 @@ def _resolve_manifest(
     返回 ReadManifest 实例，或 None（无法解析时）。
     """
     from ..aspen_driver.catalog import CatalogScanner, _compute_file_hash
-    from ..aspen_driver.manifest import ManifestBuilder
+    from ..aspen_driver.manifest import (
+        ManifestBuilder, compute_rules_hash, MANIFEST_BUILDER_VERSION,
+    )
 
     mid = config.manifest_id
 
@@ -464,14 +505,32 @@ def _resolve_manifest(
     else:
         catalog_id = catalog_meta["catalog_id"]
 
-    # 查找最新 manifest
-    manifest_meta = node_db.get_latest_manifest(catalog_id)
+    # 计算当前规则 hash，用于缓存校验
+    current_rules_hash = compute_rules_hash(config.semantic_rules_dir)
+
+    if not current_rules_hash and config.strict_manifest:
+        raise ValueError(
+            f"semantic_rules_dir='{config.semantic_rules_dir}' 未产生有效 rules_hash"
+            "（目录不存在、为空或规则读取失败），strict_manifest=True 时不允许使用空 hash 查找 manifest。"
+        )
+
+    # 查找最新 manifest（带 rules_hash 和 builder_version 校验）
+    manifest_meta = node_db.get_latest_manifest(
+        catalog_id,
+        rules_hash=current_rules_hash,
+        builder_version=MANIFEST_BUILDER_VERSION,
+    )
     if manifest_meta is None:
         if not config.build_manifest_if_missing:
             _log.warning("未找到 manifest，build_manifest_if_missing=False，跳过")
             return None
         # 构建 manifest
-        _log.info("未找到 manifest，开始自动构建（catalog_id=%s）", catalog_id)
+        _log.info(
+            "未找到匹配 rules_hash=%s builder_version=%s 的 manifest，开始自动构建（catalog_id=%s）",
+            current_rules_hash[:8] if current_rules_hash else "N/A",
+            MANIFEST_BUILDER_VERSION,
+            catalog_id,
+        )
         builder = ManifestBuilder(node_db, rules_dir=config.semantic_rules_dir)
         # 从 objective_fns 名称推断 objective_names
         obj_names = [getattr(fn, "__name__", "") for fn in (config.objective_fns or [])]
@@ -520,6 +579,8 @@ def _load_manifest_from_db(node_db: Any, manifest_id: str) -> Any:
         is_valid=meta["is_valid"],
         error=meta["error"],
         created_at=meta["created_at"],
+        rules_hash=meta.get("rules_hash", ""),
+        builder_version=meta.get("builder_version", ""),
     )
 
 

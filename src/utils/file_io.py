@@ -171,20 +171,30 @@ def _build_run_config(cfg: dict) -> Any:
 # 设计变量解析（单目标和多目标共用）
 # ---------------------------------------------------------------------------
 
-def _parse_design_variables(cfg: dict) -> tuple[dict, dict]:
+def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set]:
     """
-    从 YAML 解析设计变量，返回 (param_bounds, fixed_vars)。
+    从 YAML 解析设计变量，返回 (param_bounds, fixed_vars, integer_var_paths)。
 
-    type=continuous → param_bounds；type=integer/其他 → fixed_vars（固定为 initial_value）。
+    type=continuous → param_bounds（连续搜索）
+    type=integer    → param_bounds（整数搜索，round/clamp 在 repair 阶段处理）
+    其他 type       → fixed_vars（固定为 initial_value）
     """
     param_bounds: dict[str, tuple[float, float]] = {}
     fixed_vars:   dict[str, Any] = {}
+    integer_var_paths: set[str] = set()
 
     for dv in cfg.get("design_variables", []):
         path    = dv["aspen_path"]
         dv_type = dv.get("type", "continuous")
         if dv_type == "continuous":
             param_bounds[path] = (float(dv["lower_bound"]), float(dv["upper_bound"]))
+        elif dv_type == "integer":
+            param_bounds[path] = (float(dv["lower_bound"]), float(dv["upper_bound"]))
+            integer_var_paths.add(path)
+            _log.debug(
+                "设计变量 '%s'（type=integer）纳入 BO 搜索空间 [%s, %s]，将在 repair 阶段 round/clamp。",
+                dv.get("name", path), dv["lower_bound"], dv["upper_bound"],
+            )
         else:
             fixed_vars[path] = dv.get("initial_value", dv.get("lower_bound"))
             _log.debug(
@@ -192,7 +202,7 @@ def _parse_design_variables(cfg: dict) -> tuple[dict, dict]:
                 dv.get("name", path), dv_type, fixed_vars[path],
             )
 
-    return param_bounds, fixed_vars
+    return param_bounds, fixed_vars, integer_var_paths
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +223,11 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     from ..workflows.optimize_case import OptimizeCaseConfig
 
     opt = cfg.get("optimizer", {})
-    param_bounds, fixed_vars = _parse_design_variables(cfg)
+    param_bounds, fixed_vars, integer_paths = _parse_design_variables(cfg)
 
     if not param_bounds:
         raise ValueError(
-            "配置中没有 type=continuous 的设计变量，无法构建贝叶斯优化配置。"
+            "配置中没有 type=continuous 或 type=integer 的设计变量，无法构建贝叶斯优化配置。"
         )
 
     objs = cfg.get("objectives", []) or []
@@ -236,20 +246,24 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         _log.warning("acquisition_function '%s' 不合法，回退到 EI。", acq_raw)
         acq_raw = "EI"
 
+    surrogate_model = _parse_surrogate_model(opt)
+
     n_initial    = int(opt.get("n_initial_points", 10))
     n_bo         = int(opt.get("n_iterations", 30))
     n_iterations = n_initial + n_bo
 
     return OptimizeCaseConfig(
-        param_bounds   = param_bounds,
-        fixed_vars     = fixed_vars,
-        run_config     = run_cfg,
-        n_initial      = n_initial,
-        n_iterations   = n_iterations,
-        objective_name = primary["name"],
-        minimize       = bool(primary.get("minimize", True)),
-        acquisition    = acq_raw,  # type: ignore[arg-type]
-        random_seed    = opt.get("random_seed"),
+        param_bounds    = param_bounds,
+        fixed_vars      = fixed_vars,
+        run_config      = run_cfg,
+        n_initial       = n_initial,
+        n_iterations    = n_iterations,
+        objective_name  = primary["name"],
+        minimize        = bool(primary.get("minimize", True)),
+        acquisition     = acq_raw,  # type: ignore[arg-type]
+        surrogate_model = surrogate_model,  # type: ignore[arg-type]
+        random_seed     = opt.get("random_seed"),
+        integer_var_paths = integer_paths,
     )
 
 
@@ -258,11 +272,11 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     from ..workflows.optimize_pareto_case import ParetoOptimizeCaseConfig
 
     opt = cfg.get("optimizer", {})
-    param_bounds, fixed_vars = _parse_design_variables(cfg)
+    param_bounds, fixed_vars, integer_var_paths = _parse_design_variables(cfg)
 
     if not param_bounds:
         raise ValueError(
-            "配置中没有 type=continuous 的设计变量，无法构建多目标优化配置。"
+            "配置中没有 type=continuous 或 type=integer 的设计变量，无法构建多目标优化配置。"
         )
 
     objs = cfg.get("objectives", []) or []
@@ -281,6 +295,8 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     if acq_raw not in ("EI", "UCB", "PI"):
         _log.warning("acquisition_function '%s' 不合法，回退到 EI。", acq_raw)
         acq_raw = "EI"
+
+    surrogate_model = _parse_surrogate_model(opt)
 
     n_initial    = int(opt.get("n_initial_points", 10))
     n_bo         = int(opt.get("n_iterations", 30))
@@ -316,9 +332,34 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
                 )
 
     _log.info(
-        "已加载多目标配置：%d 个目标（%s），n_initial=%d，n_iterations=%d，scalarization=%s。",
-        len(objective_names), objective_names, n_initial, n_iterations, scalarization,
+        "已加载多目标配置：%d 个目标（%s），%d 个连续变量，%d 个 integer 变量，"
+        "n_initial=%d，n_iterations=%d，scalarization=%s。",
+        len(objective_names), objective_names,
+        len(param_bounds) - len(integer_var_paths), len(integer_var_paths),
+        n_initial, n_iterations, scalarization,
     )
+
+    # 解析 var_dependencies（变量依赖约束，如 FEED_STAGE < NSTAGE）
+    var_deps_raw = cfg.get("var_dependencies") or {}
+    var_dependencies: dict[str, dict[str, str]] = {}
+    for var_path, dep_rules in var_deps_raw.items():
+        if isinstance(dep_rules, dict):
+            var_dependencies[str(var_path)] = {str(k): str(v) for k, v in dep_rules.items()}
+
+    # 解析 feasibility_search（Phase 0 可行性搜索）
+    fs_raw = cfg.get("feasibility_search") or {}
+    feasibility_search = None
+    if fs_raw.get("enabled", False):
+        from ..workflows.optimize_pareto_case import FeasibilitySearchConfig
+        feasibility_search = FeasibilitySearchConfig(
+            enabled=True,
+            n_trials=int(fs_raw.get("n_trials", 20)),
+            stop_after_feasible=int(fs_raw.get("stop_after_feasible", 3)),
+        )
+        _log.info(
+            "Phase 0 可行性搜索已启用：n_trials=%d，stop_after_feasible=%d。",
+            feasibility_search.n_trials, feasibility_search.stop_after_feasible,
+        )
 
     return ParetoOptimizeCaseConfig(
         param_bounds    = param_bounds,
@@ -330,12 +371,16 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         n_initial_min   = n_initial_min,
         scalarization   = scalarization,  # type: ignore[arg-type]
         acquisition     = acq_raw,        # type: ignore[arg-type]
+        surrogate_model = surrogate_model,  # type: ignore[arg-type]
         xi              = xi,
         kappa           = kappa,
         reference_point = reference_point,
         hv_margin       = hv_margin,
         tags            = tags,
         random_seed     = opt.get("random_seed"),
+        integer_var_paths  = integer_var_paths,
+        var_dependencies   = var_dependencies,
+        feasibility_search = feasibility_search,
     )
 
 
@@ -429,6 +474,7 @@ def _make_tac_fn(obj_cfg: dict) -> Any:
         "name", "type", "minimize", "unit",
         "annualization_factor", "operating_hours", "skip_missing", "allow_partial_objective",
         "utility_cost", "equipment_params", "output_key_map", "block_design_params",
+        "fallback_design",
     }
     for key in obj_cfg:
         if key not in _KNOWN_KEYS:
@@ -453,13 +499,39 @@ def _make_tac_fn(obj_cfg: dict) -> Any:
                     str(k): float(v) for k, v in params.items()
                 }
 
+    # fallback_design：语义更清晰的替代写法，支持 diameter/nstage 键名，
+    # 并提供 source 和 conservative_factor 标注。
+    # 与 block_design_params 合并，fallback_design 优先。
+    fallback_source = "block_design_params"
+    fallback_conservative_factor = 1.0
+    fd_raw = obj_cfg.get("fallback_design")
+    if fd_raw and isinstance(fd_raw, dict):
+        fallback_source = str(fd_raw.get("source", "yaml_fallback"))
+        fallback_conservative_factor = float(fd_raw.get("conservative_factor", 1.0))
+        # column_diameter: {block_name: value_m}
+        col_diam = fd_raw.get("column_diameter") or {}
+        for blk_name, diam_val in col_diam.items():
+            blk_key = str(blk_name)
+            if blk_key not in block_design_params:
+                block_design_params[blk_key] = {}
+            block_design_params[blk_key]["diam"] = float(diam_val)
+        # nstage: {block_name: value}（可选）
+        nstage_map = fd_raw.get("nstage") or {}
+        for blk_name, n_val in nstage_map.items():
+            blk_key = str(blk_name)
+            if blk_key not in block_design_params:
+                block_design_params[blk_key] = {}
+            block_design_params[blk_key]["nstage"] = float(n_val)
+
     tac_cfg = TACConfig(
-        annualization_factor    = float(obj_cfg.get("annualization_factor", 0.1)),
-        operating_hours         = float(obj_cfg.get("operating_hours", 8000.0)),
-        skip_missing            = bool(obj_cfg.get("skip_missing", False)),
-        allow_partial_objective = bool(obj_cfg.get("allow_partial_objective", False)),
-        output_key_map          = key_map,
-        block_design_params     = block_design_params,
+        annualization_factor         = float(obj_cfg.get("annualization_factor", 0.1)),
+        operating_hours              = float(obj_cfg.get("operating_hours", 8000.0)),
+        skip_missing                 = bool(obj_cfg.get("skip_missing", False)),
+        allow_partial_objective      = bool(obj_cfg.get("allow_partial_objective", False)),
+        output_key_map               = key_map,
+        block_design_params          = block_design_params,
+        fallback_source              = fallback_source,
+        fallback_conservative_factor = fallback_conservative_factor,
         utility_cost = UtilityCost(
             steam_price         = float(uc_raw.get("steam_price", 14.19)),
             cooling_water_price = float(uc_raw.get("cooling_water_price", 0.354)),
@@ -624,3 +696,28 @@ def _make_constraint_fn(con_cfg: dict) -> Any:
 
     constraint_fn.__name__ = name
     return constraint_fn
+
+
+# ---------------------------------------------------------------------------
+# 代理模型解析
+# ---------------------------------------------------------------------------
+
+_VALID_SURROGATE_UPPER = {"GP", "RF", "ET", "GBRT", "RANDOM"}
+
+
+def _parse_surrogate_model(opt: dict) -> str:
+    """
+    从 optimizer 节解析 surrogate_model 字段。
+
+    大小写不敏感；RANDOM → "random"；其余保持大写。
+    非法值直接抛 ValueError，不静默回退。
+    未配置时默认 "GP"。
+    """
+    raw = opt.get("surrogate_model", "GP")
+    upper = str(raw).upper()
+    if upper not in _VALID_SURROGATE_UPPER:
+        raise ValueError(
+            f"surrogate_model {raw!r} 不合法，"
+            f"支持值：GP / RF / ET / GBRT / RANDOM（大小写不敏感）。"
+        )
+    return "random" if upper == "RANDOM" else upper

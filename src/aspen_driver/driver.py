@@ -86,6 +86,38 @@ class AspenDriver:
             try:
                 self._app = win32com.client.gencache.EnsureDispatch(self._prog_id)
                 gencache_ok = True
+            except AttributeError as gc_exc:
+                # win32com gen_py 缓存损坏（CLSIDToPackageMap 缺失等），清除后重试。
+                # 常见于 pywin32 升级后或缓存文件被部分删除的情况。
+                _log.warning(
+                    "EnsureDispatch('%s') 遇到缓存损坏错误（%s），尝试清除 gen_py 缓存后重试。",
+                    self._prog_id, gc_exc,
+                )
+                try:
+                    import shutil, os, tempfile
+                    gen_py_dir = os.path.join(tempfile.gettempdir(), "gen_py")
+                    if os.path.isdir(gen_py_dir):
+                        shutil.rmtree(gen_py_dir)
+                        _log.info("已清除 gen_py 缓存目录：%s", gen_py_dir)
+                    # 重置 gencache 内部状态
+                    win32com.client.gencache.is_readonly = False
+                    self._app = win32com.client.gencache.EnsureDispatch(self._prog_id)
+                    gencache_ok = True
+                    _log.info("清除缓存后 EnsureDispatch 成功。")
+                except Exception as retry_exc:
+                    gc_exc = retry_exc
+                    if self._require_type_library:
+                        self._release_com()
+                        raise AspenTypeLibraryError(
+                            f"EnsureDispatch 失败，无法加载 Aspen type library：{gc_exc}。"
+                            "若不需要节点元数据（info()），可设置 require_type_library=False。"
+                        ) from gc_exc
+                    _log.warning(
+                        "清除缓存后 EnsureDispatch 仍失败（%s），回退到 Dispatch。"
+                        "hap_constants 将不可用，AspenNode.info() 调用时会抛出错误。",
+                        gc_exc,
+                    )
+                    self._app = win32com.client.Dispatch(self._prog_id)
             except Exception as gc_exc:
                 if self._require_type_library:
                     self._release_com()
@@ -218,12 +250,16 @@ class AspenDriver:
         self._require_connection()
         engine = self._app.Engine
 
+        _log.debug("driver.run: 调用 Run2(True) 前，IsRunning=%s", self._engine_is_running(engine))
         try:
             engine.Run2(True)
         except Exception as exc:
             raise AspenRunError(f"无法启动仿真：{exc}") from exc
 
+        _log.debug("driver.run: Run2(True) 返回，IsRunning=%s", self._engine_is_running(engine))
+
         deadline = time.monotonic() + timeout
+        poll_count = 0
         while self._engine_is_running(engine):
             pythoncom.PumpWaitingMessages()
             if time.monotonic() >= deadline:
@@ -233,6 +269,18 @@ class AspenDriver:
                     pass
                 raise AspenRunTimeoutError(timeout)
             time.sleep(self._POLL_INTERVAL)
+            poll_count += 1
+
+        _log.debug("driver.run: 引擎停止，poll_count=%d（0=Run2返回时已停止）", poll_count)
+
+        # 引擎停止后读取状态信息，帮助诊断 NO_RESULTS 原因
+        for attr in ("StatusMessage", "ErrorMessage", "Status", "ErrorCode"):
+            try:
+                val = getattr(engine, attr, None)
+                if val is not None and str(val).strip():
+                    _log.warning("driver.run: engine.%s = %r", attr, val)
+            except Exception:
+                pass
 
     def stop(self) -> None:
         """强制停止正在运行的仿真。"""

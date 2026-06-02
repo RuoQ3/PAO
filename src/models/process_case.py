@@ -434,6 +434,7 @@ def process_case_from_sim_result(
     tags: list[str] | None = None,
     run_id: str | None = None,
     semantic_blocks: dict[str, SemanticBlock] | None = None,
+    case_id: str | None = None,
 ) -> ProcessCase:
     """
     从 SimulationResult 构建 ProcessCase。
@@ -475,6 +476,7 @@ def process_case_from_sim_result(
             status = CaseStatus.OBJECTIVE_ERROR
 
     return ProcessCase(
+        case_id=case_id if case_id is not None else str(uuid.uuid4()),
         iteration=iteration,
         status=status,
         design_vars=design_vars,

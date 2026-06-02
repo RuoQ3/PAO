@@ -158,6 +158,7 @@ class SimulationRunner:
 
         # 3. Reinit
         if reinit:
+            _log.debug("runner.run_case: 调用 reinit()")
             try:
                 self._driver.reinit()
             except AspenRunError as exc:
@@ -169,6 +170,17 @@ class SimulationRunner:
                     input_verifications=verifications,
                     error=f"Reinit 失败：{exc}",
                 )
+            _log.debug("runner.run_case: reinit() 完成")
+
+        # 诊断：reinit 后读回前几个输入确认写入有效
+        if _log.isEnabledFor(logging.DEBUG):
+            sample_paths = list(inputs.keys())[:4]
+            for p in sample_paths:
+                try:
+                    v = self._driver.get_value(p)
+                    _log.debug("runner.run_case: reinit后读回 %s = %r", p, v)
+                except Exception as exc:
+                    _log.debug("runner.run_case: reinit后读回失败 %s: %s", p, exc)
 
         # 4. Run
         t0 = time.monotonic()

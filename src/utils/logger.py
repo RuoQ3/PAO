@@ -283,6 +283,340 @@ def get_logger(name: str) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
+# Aspen / workflow diagnostics
+# ---------------------------------------------------------------------------
+
+def _enum_value(value: Any) -> Any:
+    """Return Enum.value when present; otherwise return the original value."""
+    return getattr(value, "value", value)
+
+
+def _short_value(value: Any, max_len: int = 80) -> str:
+    text = repr(value)
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def format_aspen_path(path: Any, tail: int = 5) -> str:
+    """
+    Shorten an Aspen tree path for logs while preserving the useful suffix.
+
+    Example:
+        \\Data\\Blocks\\T1\\Input\\TEMP -> Blocks/T1/Input/TEMP
+    """
+    if path is None:
+        return "<none>"
+    text = str(path).replace("/", "\\")
+    parts = [p for p in text.split("\\") if p]
+    if len(parts) > tail:
+        parts = parts[-tail:]
+    return "/".join(parts) if parts else text
+
+
+def format_mapping_compact(
+    mapping: Any,
+    *,
+    max_items: int = 8,
+    path_tail: int = 5,
+    value_max_len: int = 60,
+) -> str:
+    """Format a dict-like object as a compact one-line summary."""
+    if not mapping:
+        return "<empty>"
+    try:
+        items = list(mapping.items())
+    except AttributeError:
+        return _short_value(mapping, value_max_len)
+
+    shown = items[:max_items]
+    parts = [
+        f"{format_aspen_path(k, tail=path_tail)}={_short_value(v, value_max_len)}"
+        for k, v in shown
+    ]
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        parts.append(f"... +{remaining} more")
+    return "; ".join(parts)
+
+
+def _format_block_status(status: Any) -> str:
+    name = getattr(status, "name", "<unknown>")
+    record_type = getattr(status, "record_type", "")
+    comp_status = getattr(status, "comp_status", None)
+    flags = getattr(status, "status_flags", None) or []
+    flags_text = "|".join(str(f) for f in flags) if flags else "<none>"
+    type_text = f"({record_type})" if record_type else ""
+    return f"{name}{type_text}: comp_status={comp_status}, flags={flags_text}"
+
+
+def _log_sequence(
+    logger: logging.Logger,
+    level: int,
+    title: str,
+    values: list[str],
+    *,
+    max_items: int,
+) -> None:
+    if not values:
+        logger.log(level, "  %s: <empty>", title)
+        return
+    shown = values[:max_items]
+    suffix = f" ... +{len(values) - len(shown)} more" if len(values) > len(shown) else ""
+    logger.log(level, "  %s: %s%s", title, "; ".join(shown), suffix)
+
+
+def log_simulation_result(
+    logger: logging.Logger,
+    sim_result: Any,
+    *,
+    iteration: int | None = None,
+    case_id: str | None = None,
+    design_vars: Any = None,
+    level: int | None = None,
+    max_items: int = 12,
+    max_block_statuses: int = 30,
+    max_failed_outputs: int = 20,
+) -> None:
+    """
+    Log structured diagnostics for SimulationResult.
+
+    This helper intentionally uses duck typing so logger.py does not depend on
+    Aspen driver/model imports. It is meant for failure triage: write status,
+    input verification, block/stream status flags, and output read failures in
+    one place.
+    """
+    success = bool(getattr(sim_result, "success", False))
+    if level is None:
+        level = logging.DEBUG if success else logging.WARNING
+    if not logger.isEnabledFor(level):
+        return
+
+    status = _enum_value(getattr(sim_result, "status", "<unknown>"))
+    run_time = getattr(sim_result, "run_time", 0.0) or 0.0
+    source = getattr(sim_result, "source_filepath", None)
+    mutation = getattr(sim_result, "mutation_snapshot", None)
+
+    ctx: list[str] = []
+    if iteration is not None:
+        ctx.append(f"iter={iteration}")
+    if case_id:
+        ctx.append(f"case_id={case_id}")
+    ctx_text = f" [{', '.join(ctx)}]" if ctx else ""
+
+    logger.log(
+        level,
+        "Aspen 仿真诊断%s: status=%s, success=%s, run_time=%.3fs (Engine.Run2 only), "
+        "source=%s, mutation_snapshot=%s",
+        ctx_text,
+        status,
+        success,
+        float(run_time),
+        source,
+        mutation,
+    )
+
+    error = getattr(sim_result, "error", None)
+    if error:
+        logger.log(level, "  error: %s", error)
+
+    warnings = list(getattr(sim_result, "warnings", None) or [])
+    if warnings:
+        _log_sequence(
+            logger,
+            level,
+            "warnings",
+            [str(w) for w in warnings],
+            max_items=max_items,
+        )
+
+    requested_inputs = getattr(sim_result, "requested_inputs", None) or {}
+    actual_inputs = getattr(sim_result, "actual_inputs", None) or {}
+    logger.log(
+        level,
+        "  inputs: requested=%d, actual=%d, design_vars=%d",
+        len(requested_inputs) if hasattr(requested_inputs, "__len__") else -1,
+        len(actual_inputs) if hasattr(actual_inputs, "__len__") else -1,
+        len(design_vars) if hasattr(design_vars, "__len__") else 0,
+    )
+    if requested_inputs:
+        logger.log(level, "  requested sample: %s", format_mapping_compact(requested_inputs, max_items=max_items))
+    if design_vars is not None and design_vars is not requested_inputs:
+        logger.log(level, "  design_vars sample: %s", format_mapping_compact(design_vars, max_items=max_items))
+
+    verifications = list(getattr(sim_result, "input_verifications", None) or [])
+    mismatches = [v for v in verifications if not bool(getattr(v, "match", False))]
+    if verifications:
+        logger.log(level, "  input_verification: total=%d, mismatch=%d", len(verifications), len(mismatches))
+    if mismatches:
+        details = [
+            (
+                f"{format_aspen_path(getattr(v, 'path', ''))}: "
+                f"requested={_short_value(getattr(v, 'requested', None))}, "
+                f"actual={_short_value(getattr(v, 'actual', None))}, "
+                f"note={getattr(v, 'note', '')}"
+            )
+            for v in mismatches
+        ]
+        _log_sequence(logger, level, "input mismatches", details, max_items=max_items)
+
+    outputs = getattr(sim_result, "outputs", None) or {}
+    failed_outputs = getattr(sim_result, "failed_outputs", None) or {}
+    logger.log(
+        level,
+        "  outputs: success=%d, failed=%d",
+        len(outputs) if hasattr(outputs, "__len__") else -1,
+        len(failed_outputs) if hasattr(failed_outputs, "__len__") else -1,
+    )
+    if failed_outputs:
+        failed = [
+            f"{format_aspen_path(path)}: {err}"
+            for path, err in list(failed_outputs.items())
+        ]
+        _log_sequence(logger, level, "failed_outputs", failed, max_items=max_failed_outputs)
+
+    block_statuses = list(getattr(sim_result, "block_statuses", None) or [])
+    if block_statuses:
+        flag_counts: dict[str, int] = {}
+        for bs in block_statuses:
+            for flag in getattr(bs, "status_flags", None) or ["<none>"]:
+                flag_counts[str(flag)] = flag_counts.get(str(flag), 0) + 1
+        logger.log(
+            level,
+            "  block_statuses: total=%d, flags=%s",
+            len(block_statuses),
+            format_mapping_compact(flag_counts, max_items=max_items),
+        )
+        _log_sequence(
+            logger,
+            level,
+            "block_status details",
+            [_format_block_status(bs) for bs in block_statuses],
+            max_items=max_block_statuses,
+        )
+    else:
+        logger.log(level, "  block_statuses: <empty>")
+
+
+def log_process_case_diagnostics(
+    logger: logging.Logger,
+    case: Any,
+    *,
+    phase: str | None = None,
+    level: int = logging.DEBUG,
+    include_sim_result: bool = False,
+    max_items: int = 12,
+) -> None:
+    """Log a compact workflow-level ProcessCase diagnostic summary."""
+    if not logger.isEnabledFor(level):
+        return
+
+    status = _enum_value(getattr(case, "status", "<unknown>"))
+    case_id = getattr(case, "case_id", None)
+    iteration = getattr(case, "iteration", None)
+    prefix = f"ProcessCase 诊断"
+    if phase:
+        prefix += f" [{phase}]"
+
+    logger.log(
+        level,
+        "%s: case_id=%s, iter=%s, status=%s, success=%s, simulation_valid=%s, "
+        "feasible=%s, run_time=%.3fs",
+        prefix,
+        case_id,
+        iteration,
+        status,
+        getattr(case, "success", None),
+        getattr(case, "simulation_valid", None),
+        getattr(case, "feasible", None),
+        float(getattr(case, "run_time", 0.0) or 0.0),
+    )
+
+    objectives = list(getattr(case, "objectives", None) or [])
+    constraints = list(getattr(case, "constraints", None) or [])
+    blocks = getattr(case, "blocks", None) or {}
+    streams = getattr(case, "streams", None) or {}
+    semantic_blocks = getattr(case, "semantic_blocks", None) or {}
+    logger.log(
+        level,
+        "  payload: blocks=%d, streams=%d, semantic_blocks=%d, objectives=%d, constraints=%d",
+        len(blocks),
+        len(streams),
+        len(semantic_blocks),
+        len(objectives),
+        len(constraints),
+    )
+
+    if objectives:
+        parts = [
+            f"{getattr(o, 'name', '<unknown>')}={getattr(o, 'value', None)!r} "
+            f"available={getattr(o, 'available', None)} error={getattr(o, 'error', None)!r}"
+            for o in objectives
+        ]
+        _log_sequence(logger, level, "objectives", parts, max_items=max_items)
+    if constraints:
+        parts = [
+            f"{getattr(c, 'name', '<unknown>')}={getattr(c, 'value', None)!r} "
+            f"satisfied={getattr(c, 'satisfied', None)} error={getattr(c, 'error', None)!r}"
+            for c in constraints
+        ]
+        _log_sequence(logger, level, "constraints", parts, max_items=max_items)
+
+    notes = getattr(case, "notes", "")
+    if notes:
+        logger.log(level, "  notes: %s", str(notes).replace("\n", " ")[:500])
+
+    if include_sim_result and getattr(case, "sim_result", None) is not None:
+        log_simulation_result(
+            logger,
+            getattr(case, "sim_result"),
+            iteration=iteration,
+            case_id=case_id,
+            design_vars=getattr(case, "design_vars", None),
+            level=level,
+            max_items=max_items,
+        )
+
+
+def log_run_config_summary(
+    logger: logging.Logger,
+    config: Any,
+    *,
+    level: int = logging.DEBUG,
+    max_items: int = 12,
+) -> None:
+    """Log the run/extraction configuration that controls one run_case call."""
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
+        "run_case 配置: timeout=%s, reinit=%s, verify_inputs=%s, extraction_mode=%s, "
+        "strict_extraction=%s, strict_manifest=%s, output_paths=%d, check_status_paths=%s",
+        getattr(config, "timeout", None),
+        getattr(config, "reinit", None),
+        getattr(config, "verify_inputs", None),
+        getattr(config, "extraction_mode", None),
+        getattr(config, "strict_extraction", None),
+        getattr(config, "strict_manifest", None),
+        len(getattr(config, "output_paths", None) or []),
+        (
+            "auto"
+            if getattr(config, "check_status_paths", None) is None
+            else len(getattr(config, "check_status_paths", None) or [])
+        ),
+    )
+    output_paths = getattr(config, "output_paths", None) or []
+    if output_paths:
+        _log_sequence(
+            logger,
+            level,
+            "output_paths",
+            [format_aspen_path(p) for p in output_paths],
+            max_items=max_items,
+        )
+
+
+# ---------------------------------------------------------------------------
 # PerformanceTimer
 # ---------------------------------------------------------------------------
 

@@ -40,7 +40,7 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..models.block import BlockResult, BlockType
+from ..models.block import BlockConvergenceStatus, BlockResult, BlockType
 from ..models.node_catalog import SemanticBlock
 from ..models.process_case import ObjectiveValue, ProcessCase
 from .units import normalize_area, normalize_duty, normalize_length, normalize_power, normalize_volume
@@ -155,6 +155,11 @@ class TACConfig:
     equipment_params: EquipmentCostParams = field(default_factory=EquipmentCostParams)
     output_key_map: dict[str, dict[str, str]] = field(default_factory=dict)
     block_design_params: dict[str, dict[str, float]] = field(default_factory=dict)
+    # fallback_source / fallback_conservative_factor：
+    # 当 diam 来自 block_design_params 时，乘以此系数（保守估算），
+    # 并在 EquipmentCost.notes 中标记来源，避免后续经济分析误以为是 Aspen sizing 结果。
+    fallback_source: str = "block_design_params"
+    fallback_conservative_factor: float = 1.0
     skip_missing: bool = False
     # skip_missing=True 时，partial TAC（有设备被跳过）默认仍返回 ObjectiveValue(error=...)，
     # 防止低估成本的工况被优化器当成更优解。
@@ -293,6 +298,46 @@ def _get_semantic_val(
     return sf.value, sf.unit, None
 
 
+def _fmt_semantic_err(
+    semantic_block: SemanticBlock | None,
+    field_name: str,
+    ferr: str,
+) -> str:
+    """格式化 semantic 字段缺失的详细诊断信息，包含 block/path/value/unit/required/error。"""
+    if semantic_block is None:
+        return f"semantic_field={field_name!r} error={ferr!r}"
+    sf = semantic_block.get(field_name)
+    if sf is None:
+        return (
+            f"block={semantic_block.block_name!r} semantic_field={field_name!r} "
+            f"path=<未找到> value=None unit='' required=? error={ferr!r}"
+        )
+    return (
+        f"block={semantic_block.block_name!r} semantic_field={field_name!r} "
+        f"path={sf.abs_path!r} value={sf.value!r} unit={sf.unit!r} "
+        f"required={sf.required} error={sf.error or ferr!r}"
+    )
+
+
+def _make_synthetic_block(sb: SemanticBlock) -> BlockResult:
+    """
+    从 SemanticBlock 创建最小化 BlockResult，供 manifest 模式下的成本计算使用。
+
+    outputs 为空列表——所有字段均通过 semantic_block 参数读取，
+    不依赖 block.outputs fallback。
+    """
+    try:
+        btype = BlockType(sb.block_type.upper())
+    except ValueError:
+        btype = BlockType.UNKNOWN
+    return BlockResult(
+        name=sb.block_name,
+        block_type=btype,
+        convergence=BlockConvergenceStatus.SUCCESS,
+        outputs=[],
+    )
+
+
 # ---------------------------------------------------------------------------
 # 各设备类型成本计算
 # ---------------------------------------------------------------------------
@@ -336,26 +381,41 @@ def _calc_column_cost(
     # --- 塔径 ---
     diam_raw, diam_unit, diam_ferr = _get_semantic_val(semantic_block, "column_diameter")
     if diam_raw is None and diam_ferr and semantic_block is not None:
-        notes_parts.append(f"[semantic] column_diameter: {diam_ferr}，尝试 block.outputs fallback")
+        notes_parts.append(
+            _fmt_semantic_err(semantic_block, "column_diameter", diam_ferr)
+            + "，尝试 block.outputs fallback"
+        )
     if diam_raw is None:
         diam_raw, diam_unit, diam_ferr = _get_val(block, "diam", key_map)
 
     diam: float | None = None
     if diam_raw is None:
         if design_params and "diam" in design_params:
-            diam = float(design_params["diam"])
+            raw_diam = float(design_params["diam"])
+            factor = config.fallback_conservative_factor
+            diam = raw_diam * factor
+            factor_note = f" × conservative_factor={factor}" if factor != 1.0 else ""
             notes_parts.append(
-                f"DIAM 不可用（{diam_ferr}），使用设计参数 diam={diam:.3f} m"
+                f"DIAM 不可用（{diam_ferr}），使用 fallback diam={raw_diam:.3f} m"
+                f"{factor_note} → {diam:.3f} m"
+                f"（source={config.fallback_source}，非 Aspen sizing 结果）"
             )
         else:
-            notes_parts.append(diam_ferr or "缺少塔径（diam），无法计算 CAPEX")
+            notes_parts.append(
+                _fmt_semantic_err(semantic_block, "column_diameter", diam_ferr or "缺少塔径（diam），无法计算 CAPEX")
+            )
     else:
         diam_norm, diam_err = normalize_length(diam_raw, diam_unit)
         if diam_norm is None:
             if design_params and "diam" in design_params:
-                diam = float(design_params["diam"])
+                raw_diam = float(design_params["diam"])
+                factor = config.fallback_conservative_factor
+                diam = raw_diam * factor
+                factor_note = f" × conservative_factor={factor}" if factor != 1.0 else ""
                 notes_parts.append(
-                    f"塔径单位归一化失败（{diam_err}），使用设计参数 diam={diam:.3f} m"
+                    f"塔径单位归一化失败（{diam_err}），使用 fallback diam={raw_diam:.3f} m"
+                    f"{factor_note} → {diam:.3f} m"
+                    f"（source={config.fallback_source}，非 Aspen sizing 结果）"
                 )
             else:
                 notes_parts.append(f"塔径单位归一化失败：{diam_err}")
@@ -365,7 +425,10 @@ def _calc_column_cost(
     # --- 板数 ---
     nstage_raw, _, nstage_ferr = _get_semantic_val(semantic_block, "nstage")
     if nstage_raw is None and nstage_ferr and semantic_block is not None:
-        notes_parts.append(f"[semantic] nstage: {nstage_ferr}，尝试 block.outputs fallback")
+        notes_parts.append(
+            _fmt_semantic_err(semantic_block, "nstage", nstage_ferr)
+            + "，尝试 block.outputs fallback"
+        )
     if nstage_raw is None:
         nstage_raw, _, nstage_ferr = _get_val(block, "nstage", key_map)
 
@@ -408,14 +471,20 @@ def _calc_column_cost(
     # --- 再沸器负荷 ---
     reb_raw, reb_unit, reb_ferr = _get_semantic_val(semantic_block, "reboiler_duty")
     if reb_raw is None and reb_ferr and semantic_block is not None:
-        notes_parts.append(f"[semantic] reboiler_duty: {reb_ferr}，尝试 block.outputs fallback")
+        notes_parts.append(
+            _fmt_semantic_err(semantic_block, "reboiler_duty", reb_ferr)
+            + "，尝试 block.outputs fallback"
+        )
     if reb_raw is None:
         reb_raw, reb_unit, reb_ferr = _get_val(block, "reb_duty", key_map)
 
     # --- 冷凝器负荷 ---
     cond_raw, cond_unit, cond_ferr = _get_semantic_val(semantic_block, "condenser_duty")
     if cond_raw is None and cond_ferr and semantic_block is not None:
-        notes_parts.append(f"[semantic] condenser_duty: {cond_ferr}，尝试 block.outputs fallback")
+        notes_parts.append(
+            _fmt_semantic_err(semantic_block, "condenser_duty", cond_ferr)
+            + "，尝试 block.outputs fallback"
+        )
     if cond_raw is None:
         cond_raw, cond_unit, cond_ferr = _get_val(block, "cond_duty", key_map)
 
@@ -727,7 +796,17 @@ def calculate_tac(case: ProcessCase, config: TACConfig) -> TACResult:
     if use_semantic:
         global_notes.append("使用 semantic_blocks（manifest runtime 模式）读取设备参数")
 
-    for block_name, block in case.blocks.items():
+    # manifest 模式下 case.blocks={} 但 semantic_blocks 非空：以 semantic_blocks 为主循环
+    if not case.blocks and case.semantic_blocks:
+        block_iter: dict[str, BlockResult] = {
+            name: _make_synthetic_block(sb)
+            for name, sb in case.semantic_blocks.items()
+        }
+        global_notes.append("manifest 模式：以 semantic_blocks 为主循环（blocks={}）")
+    else:
+        block_iter = case.blocks
+
+    for block_name, block in block_iter.items():
         if not block.converged:
             skipped_blocks.append(block_name)
             global_notes.append(

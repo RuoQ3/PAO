@@ -163,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             opt_cfg.scalarization,
             opt_cfg.acquisition,
         )
+        log.info("Surrogate model: %s", opt_cfg.surrogate_model)
     else:
         log.info(
             "优化目标：%s（%s），初始 DOE=%d，总迭代=%d，采集函数=%s",
@@ -172,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             opt_cfg.n_iterations,
             opt_cfg.acquisition,
         )
+        log.info("Surrogate model: %s", opt_cfg.surrogate_model)
     log.info("结果数据库：%s", db_path)
 
     if args.dry_run:

@@ -59,7 +59,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from ..models.block import BlockResult
+from ..models.block import BlockConvergenceStatus, BlockResult
+from ..models.node_catalog import SemanticBlock
 from ..models.process_case import ObjectiveValue, ProcessCase
 from ..models.stream import StreamResult
 from .units import coerce_finite_float, normalize_duty, normalize_mass_flow, normalize_power
@@ -231,6 +232,41 @@ class EmissionsResult:
 # 内部辅助函数
 # ---------------------------------------------------------------------------
 
+def _get_semantic_val(
+    semantic_block: SemanticBlock | None,
+    field_name: str,
+) -> tuple[Any, str, str | None]:
+    """从 SemanticBlock 读取语义字段，返回 (raw_value, unit, fetch_error)。"""
+    if semantic_block is None:
+        return None, "", "无 semantic_block（非 manifest 模式）"
+    sf = semantic_block.get(field_name)
+    if sf is None:
+        return None, "", f"字段 '{field_name}' 不在 semantic_block 中"
+    if not sf.available:
+        return None, sf.unit, (sf.error or f"字段 '{field_name}' 不可用（value=None）")
+    return sf.value, sf.unit, None
+
+
+def _make_synthetic_block(sb: SemanticBlock) -> BlockResult:
+    """
+    从 SemanticBlock 创建最小化 BlockResult，供 manifest 模式下的排放计算使用。
+
+    outputs 为空列表——所有字段均通过 semantic_block 参数读取。
+    """
+    from ..models.block import BlockType
+    try:
+        btype = BlockType(sb.block_type.upper())
+    except ValueError:
+        from ..models.block import BlockType as _BT
+        btype = _BT.UNKNOWN
+    return BlockResult(
+        name=sb.block_name,
+        block_type=btype,
+        convergence=BlockConvergenceStatus.SUCCESS,
+        outputs=[],
+    )
+
+
 def _get_val(
     block: BlockResult,
     semantic_key: str,
@@ -274,12 +310,18 @@ def _kg_hr_to_tonne_yr(kg_hr: float, operating_hours: float) -> float:
 # Scope 2：各设备类型排放计算
 # ---------------------------------------------------------------------------
 
-def _calc_column_scope2(block: BlockResult, config: EmissionsConfig) -> EquipmentEmissions:
+def _calc_column_scope2(
+    block: BlockResult,
+    config: EmissionsConfig,
+    semantic_block: SemanticBlock | None = None,
+) -> EquipmentEmissions:
     """
     精馏塔 Scope 2 排放。
 
     再沸器负荷 → 蒸汽消耗 → CO₂（steam_factor）。
     冷凝器负荷 → 冷却水消耗 → CO₂（cooling_water_factor）。
+
+    读取优先级：semantic_block（manifest 模式）→ block.outputs（full 模式）。
 
     reb_duty 缺失/单位错误：scope2=None（蒸汽排放是主要贡献，不可忽略）。
     cond_duty 缺失/单位错误：
@@ -290,8 +332,14 @@ def _calc_column_scope2(block: BlockResult, config: EmissionsConfig) -> Equipmen
     key_map   = _resolve_key_map(btype_val, config.output_key_map)
     ef        = config.emission_factors
 
-    reb_raw, reb_unit, reb_ferr   = _get_val(block, "reb_duty",  key_map)
-    cond_raw, cond_unit, cond_ferr = _get_val(block, "cond_duty", key_map)
+    # 优先从 semantic_block 读取，fallback 到 block.outputs
+    reb_raw, reb_unit, reb_ferr = _get_semantic_val(semantic_block, "reboiler_duty")
+    if reb_raw is None:
+        reb_raw, reb_unit, reb_ferr = _get_val(block, "reb_duty", key_map)
+
+    cond_raw, cond_unit, cond_ferr = _get_semantic_val(semantic_block, "condenser_duty")
+    if cond_raw is None:
+        cond_raw, cond_unit, cond_ferr = _get_val(block, "cond_duty", key_map)
 
     notes_parts: list[str] = []
     co2_kg_hr: float = 0.0
@@ -482,7 +530,11 @@ def _calc_reactor_scope2(block: BlockResult, config: EmissionsConfig) -> Equipme
     )
 
 
-def _calc_equipment_scope2(block: BlockResult, config: EmissionsConfig) -> EquipmentEmissions:
+def _calc_equipment_scope2(
+    block: BlockResult,
+    config: EmissionsConfig,
+    semantic_block: SemanticBlock | None = None,
+) -> EquipmentEmissions:
     """
     根据 block_type 分发到对应 Scope 2 计算函数。
 
@@ -512,7 +564,7 @@ def _calc_equipment_scope2(block: BlockResult, config: EmissionsConfig) -> Equip
             effective_config = replace(config, output_key_map=merged_key_map)
 
     if resolved in _COLUMN_TYPES:
-        return _calc_column_scope2(block, effective_config)
+        return _calc_column_scope2(block, effective_config, semantic_block)
     if resolved in _HEATX_TYPES:
         return _calc_heatx_scope2(block, effective_config)
     if resolved in _PUMP_TYPES:
@@ -636,13 +688,26 @@ def calculate_emissions(case: ProcessCase, config: EmissionsConfig) -> Emissions
     skipped_streams: list[str] = []
     global_notes: list[str] = []
 
+    use_semantic = bool(case.semantic_blocks)
+
+    # manifest 模式下 case.blocks={} 但 semantic_blocks 非空：以 semantic_blocks 为主循环
+    if not case.blocks and case.semantic_blocks:
+        block_iter: dict[str, BlockResult] = {
+            name: _make_synthetic_block(sb)
+            for name, sb in case.semantic_blocks.items()
+        }
+        global_notes.append("manifest 模式：以 semantic_blocks 为主循环（blocks={}）")
+    else:
+        block_iter = case.blocks
+
     # Scope 2
-    for block_name, block in case.blocks.items():
+    for block_name, block in block_iter.items():
         if not block.converged:
             skipped_blocks.append(block_name)
             global_notes.append(f"Block '{block_name}'({block.block_type.value}) 未收敛，跳过 Scope 2")
             continue
-        ee = _calc_equipment_scope2(block, config)
+        semantic_block = case.semantic_blocks.get(block_name) if use_semantic else None
+        ee = _calc_equipment_scope2(block, config, semantic_block)
         equipment_emissions.append(ee)
         if ee.scope2_annual is None:
             skipped_blocks.append(block_name)

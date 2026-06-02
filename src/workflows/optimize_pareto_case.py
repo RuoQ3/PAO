@@ -45,6 +45,7 @@ import logging
 import math
 import random as _random
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -53,6 +54,8 @@ from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
 from ..optimization.pareto import ParetoResult, compute_pareto
+from ..optimization.surrogate import SurrogateConfig, make_surrogate_optimizer
+from .common import repair_design_vars
 from .run_case import RunCaseConfig, run_case
 
 _log = logging.getLogger(__name__)
@@ -63,12 +66,32 @@ try:
 except ImportError:
     _HAS_NUMPY = False
 
-try:
-    from skopt import Optimizer as _SkoptOptimizer
-    from skopt.space import Real as _Real
-    _HAS_SKOPT = True
-except ImportError:
-    _HAS_SKOPT = False
+
+# ---------------------------------------------------------------------------
+# Feasibility search 配置
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FeasibilitySearchConfig:
+    """
+    Phase 0 可行性搜索配置。
+
+    Attributes
+    ----------
+    enabled:
+        是否启用 Phase 0，默认 True。
+    n_trials:
+        Phase 0 最多运行的工况数，默认 20。
+    stop_after_feasible:
+        找到此数量的可行点后提前停止，默认 3。
+        设为 0 表示不提前停止，跑完全部 n_trials。
+    tags:
+        Phase 0 工况的额外标签，默认 ["feasibility_search"]。
+    """
+    enabled: bool = True
+    n_trials: int = 20
+    stop_after_feasible: int = 3
+    tags: list[str] = field(default_factory=lambda: ["feasibility_search"])
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +170,16 @@ class ParetoOptimizeCaseConfig:
     on_case_complete: Callable[[ProcessCase, int, int], None] | None = None
     db_path: Path | str | None = None
     random_seed: int | None = None
+    surrogate_model: Literal["GP", "RF", "ET", "GBRT", "random"] = "GP"
     warm_start_cases: list[ProcessCase] = field(default_factory=list)
+    # integer 变量路径集合（BO 提出连续值后 round/clamp）
+    integer_var_paths: set[str] = field(default_factory=set)
+    # 变量依赖约束 {var_path: {"lt": other_path}} — 如 FEED_STAGE < NSTAGE
+    var_dependencies: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Phase 0 可行性搜索配置（None 表示不启用）
+    feasibility_search: FeasibilitySearchConfig | None = None
+    # 每次优化运行的唯一 session_id，默认自动生成
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +237,8 @@ class ParetoOptimizeResult:
     elapsed: float
     hv_history: list[float | None]
     hv_reference_point: list[float] | None = None
+    session_id: str = ""
+    n_phase0: int = 0
 
     @property
     def first_front(self):
@@ -222,11 +256,13 @@ class ParetoOptimizeResult:
 
     def to_summary(self) -> dict[str, Any]:
         return {
+            "session_id": self.session_id,
             "n_total": self.n_total,
             "n_success": self.n_success,
             "n_sim_failed": self.n_sim_failed,
             "n_objective_error": self.n_objective_error,
             "n_initial": self.n_initial,
+            "n_phase0": self.n_phase0,
             "success_rate": self.success_rate,
             "objective_names": self.objective_names,
             "hypervolume": self.hypervolume,
@@ -274,9 +310,16 @@ def optimize_pareto_case(
     n_total = config.n_iterations
 
     _log.info(
-        "多目标贝叶斯优化开始：%d 个设计变量，%d 次初始 DOE，%d 次总迭代，目标=%s，标量化=%s。",
-        len(paths), config.n_initial, n_total,
-        config.objective_names, config.scalarization,
+        "多目标贝叶斯优化开始：session_id=%s，%d 个设计变量（其中 %d 个 integer），"
+        "%d 次初始 DOE，%d 次总迭代，目标=%s，标量化=%s。",
+        config.session_id, len(paths), len(config.integer_var_paths),
+        config.n_initial, n_total, config.objective_names, config.scalarization,
+    )
+    _log.info(
+        "Surrogate model: %s, acquisition=%s, n_initial_min=%d",
+        config.surrogate_model,
+        config.acquisition,
+        config.n_initial_min,
     )
 
     db = None
@@ -292,6 +335,18 @@ def optimize_pareto_case(
     driver_dead = False
 
     # ------------------------------------------------------------------
+    # Phase 0：可行性搜索（可选）
+    # ------------------------------------------------------------------
+    phase0_cases, driver_dead = _feasibility_search(
+        driver, config, paths, bounds, db, start_iteration
+    )
+    cases.extend(phase0_cases)
+    for _ in phase0_cases:
+        _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
+        hv_history.append(hv)
+    phase0_offset = len(phase0_cases)
+
+    # ------------------------------------------------------------------
     # Phase 1：初始 DOE（拉丁超立方采样）
     # ------------------------------------------------------------------
     initial_points = _lhs_sample(bounds, config.n_initial, config.random_seed)
@@ -300,23 +355,35 @@ def optimize_pareto_case(
         if driver_dead:
             break
 
-        design_vars = {**config.fixed_vars, **dict(zip(paths, point))}
-        iteration = start_iteration + idx
+        design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
+        design_vars, repair_notes = repair_design_vars(
+            design_vars_raw,
+            config.integer_var_paths,
+            config.param_bounds,
+            config.var_dependencies,
+        )
+        if repair_notes:
+            _log.debug("Phase 1 repair [%d/%d]: %s", idx + 1, config.n_initial, repair_notes)
+
+        iteration = start_iteration + phase0_offset + idx
         tags = list(config.tags) + ["initial_doe", "pareto_opt"]
 
         _log.info(
             "初始 DOE [%d/%d]：%s",
             idx + 1, config.n_initial,
-            {k.split("\\")[-1]: round(v, 4) for k, v in dict(zip(paths, point)).items()},
+            {_short_var_name(k): round(v, 4) for k, v in design_vars.items()
+             if k in config.param_bounds},
         )
 
         try:
+            run_id = str(uuid.uuid4())
             case = run_case(
                 driver=driver,
                 design_vars=design_vars,
                 config=config.run_config,
                 iteration=iteration,
                 tags=tags,
+                run_id=run_id,
             )
         except AspenConnectionError as exc:
             _log.error("初始 DOE [%d/%d]：driver 连接断开，终止优化。原因：%s",
@@ -328,7 +395,7 @@ def optimize_pareto_case(
                 notes=f"driver 连接断开，优化终止：{exc}",
             )
             cases.append(case)
-            _save_case(db, case)
+            _save_case(db, case, config.session_id)
             _fire_callback(config.on_case_complete, case, idx, n_total)
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
             hv_history.append(hv)
@@ -343,7 +410,7 @@ def optimize_pareto_case(
             )
 
         cases.append(case)
-        _save_case(db, case)
+        _save_case(db, case, config.session_id)
         _fire_callback(config.on_case_complete, case, idx, n_total)
         _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
         hv_history.append(hv)
@@ -360,7 +427,7 @@ def optimize_pareto_case(
     n_bo = n_total - config.n_initial
 
     if not driver_dead and n_bo > 0:
-        optimizer = _MultiObjectiveBayesianOptimizer(bounds, config)
+        optimizer = _MultiObjectiveBayesianOptimizer(bounds, config, paths)
 
         for c in cases:
             x = [c.design_vars.get(p) for p in paths]
@@ -388,8 +455,8 @@ def optimize_pareto_case(
         if n_success_so_far < config.n_initial_min:
             _log.warning(
                 "初始 DOE 成功样本数 %d < n_initial_min=%d，"
-                "贝叶斯优化循环将以随机采样替代高斯过程。",
-                n_success_so_far, config.n_initial_min,
+                "贝叶斯优化循环将以随机采样替代代理模型 %s。",
+                n_success_so_far, config.n_initial_min, config.surrogate_model,
             )
 
         for bo_idx in range(n_bo):
@@ -397,25 +464,36 @@ def optimize_pareto_case(
                 break
 
             idx = config.n_initial + bo_idx
-            iteration = start_iteration + idx
+            iteration = start_iteration + phase0_offset + idx
             tags = list(config.tags) + ["bayesian_opt", "pareto_opt"]
 
             next_x = optimizer.ask()
-            design_vars = {**config.fixed_vars, **dict(zip(paths, next_x))}
+            design_vars_raw = {**config.fixed_vars, **dict(zip(paths, next_x))}
+            design_vars, repair_notes = repair_design_vars(
+                design_vars_raw,
+                config.integer_var_paths,
+                config.param_bounds,
+                config.var_dependencies,
+            )
+            if repair_notes:
+                _log.debug("Phase 2 repair [%d/%d]: %s", idx + 1, n_total, repair_notes)
 
             _log.info(
                 "贝叶斯优化 [%d/%d]：%s",
                 idx + 1, n_total,
-                {k.split("\\")[-1]: round(v, 4) for k, v in dict(zip(paths, next_x)).items()},
+                {_short_var_name(k): round(v, 4) for k, v in design_vars.items()
+                 if k in config.param_bounds},
             )
 
             try:
+                run_id = str(uuid.uuid4())
                 case = run_case(
                     driver=driver,
                     design_vars=design_vars,
                     config=config.run_config,
                     iteration=iteration,
                     tags=tags,
+                    run_id=run_id,
                 )
             except AspenConnectionError as exc:
                 _log.error("贝叶斯优化 [%d/%d]：driver 连接断开，终止优化。原因：%s",
@@ -427,7 +505,7 @@ def optimize_pareto_case(
                     notes=f"driver 连接断开，优化终止：{exc}",
                 )
                 cases.append(case)
-                _save_case(db, case)
+                _save_case(db, case, config.session_id)
                 _fire_callback(config.on_case_complete, case, idx, n_total)
                 _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
                 hv_history.append(hv)
@@ -442,11 +520,15 @@ def optimize_pareto_case(
                 )
 
             cases.append(case)
-            _save_case(db, case)
+            _save_case(db, case, config.session_id)
             _fire_callback(config.on_case_complete, case, idx, n_total)
 
             y_vec = _extract_all_objectives(case, config)
-            optimizer.tell(next_x, y_vec, is_success=y_vec is not None)
+            # 用修复后的实际运行点告知代理模型，保证 surrogate 学习正确的输入-输出关系。
+            # next_x 是 BO 推荐的连续值，经 repair 后可能被 round/clamp，
+            # 实际跑 Aspen 的是 design_vars，必须以此为准。
+            x_eval = [design_vars.get(p, next_x[i]) for i, p in enumerate(paths)]
+            optimizer.tell(x_eval, y_vec, is_success=y_vec is not None)
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
             hv_history.append(hv)
 
@@ -500,6 +582,9 @@ def optimize_pareto_case(
                 elapsed,
             )
 
+        if n_success == 0:
+            _log_infeasible_diagnosis(cases)
+
         return ParetoOptimizeResult(
             cases=cases,
             pareto_result=pareto_result,
@@ -514,6 +599,8 @@ def optimize_pareto_case(
             elapsed=elapsed,
             hv_history=hv_history,
             hv_reference_point=_fixed_ref_point,
+            session_id=config.session_id,
+            n_phase0=phase0_offset,
         )
     finally:
         if db is not None:
@@ -559,6 +646,13 @@ def _validate_config(config: ParetoOptimizeCaseConfig) -> None:
             f"acquisition 必须为 'EI'、'UCB' 或 'PI'，收到：{config.acquisition!r}。"
         )
 
+    _VALID_SURROGATE = {"GP", "RF", "ET", "GBRT", "random"}
+    if config.surrogate_model not in _VALID_SURROGATE:
+        raise ValueError(
+            f"surrogate_model={config.surrogate_model!r} 不合法，"
+            f"支持值：{sorted(_VALID_SURROGATE)}。"
+        )
+
     if config.hv_margin < 0:
         raise ValueError(f"hv_margin 必须 >= 0，收到：{config.hv_margin}。")
 
@@ -588,10 +682,155 @@ def _validate_config(config: ParetoOptimizeCaseConfig) -> None:
             f"fixed_vars 与 param_bounds 存在路径冲突（大小写不敏感）：{detail}。"
         )
 
+    for path in config.integer_var_paths:
+        if path not in config.param_bounds:
+            raise ValueError(
+                f"integer_var_paths 中的路径 '{path}' 不在 param_bounds 中，"
+                "请确认路径拼写正确。"
+            )
+        lo, hi = config.param_bounds[path]
+        if lo != int(lo) or hi != int(hi):
+            raise ValueError(
+                f"integer 变量 '{path}' 的边界 ({lo}, {hi}) 必须为整数值，"
+                "请将 YAML 中的 lower_bound / upper_bound 改为整数（如 10, 50）。"
+            )
+
 
 # ---------------------------------------------------------------------------
 # 拉丁超立方采样（与 optimize_case.py 保持一致）
 # ---------------------------------------------------------------------------
+# 辅助函数
+# ---------------------------------------------------------------------------
+
+def _short_var_name(path: str) -> str:
+    """
+    从 Aspen 路径生成简短显示名，避免多变量名称覆盖。
+
+    对于 Aspen 路径 \\Data\\Blocks\\T1\\Input\\BASIS_RR，
+    返回 T1\\BASIS_RR（block 名 + 参数名）。
+    对于其他路径，取最后两段。
+    """
+    parts = path.replace("/", "\\").split("\\")
+    parts = [p for p in parts if p]  # 去除空段
+    if len(parts) >= 2:
+        # 尝试找到 Blocks 或 Streams 后的 block/stream 名
+        for i, p in enumerate(parts):
+            if p.upper() in ("BLOCKS", "STREAMS") and i + 1 < len(parts):
+                block_name = parts[i + 1]
+                last = parts[-1]
+                return f"{block_name}\\{last}" if block_name != last else last
+        return "\\".join(parts[-2:])
+    return parts[-1] if parts else path
+
+
+# ---------------------------------------------------------------------------
+# Phase 0：可行性搜索
+# ---------------------------------------------------------------------------
+
+def _feasibility_search(
+    driver: AspenDriver,
+    config: "ParetoOptimizeCaseConfig",
+    paths: list[str],
+    bounds: list[tuple[float, float]],
+    db: Any,
+    start_iteration: int,
+) -> tuple[list[ProcessCase], bool]:
+    """
+    Phase 0：可行性搜索。
+
+    用 LHS 采样 n_trials 个点，找到 stop_after_feasible 个可行点后提前停止。
+    返回 (all_cases, driver_dead)。
+    """
+    fs_cfg = config.feasibility_search
+    if fs_cfg is None or not fs_cfg.enabled:
+        return [], False
+
+    n_trials   = fs_cfg.n_trials
+    stop_after = fs_cfg.stop_after_feasible
+    tags = list(config.tags) + list(fs_cfg.tags) + ["pareto_opt"]
+
+    _log.info(
+        "Phase 0 可行性搜索：最多 %d 次，找到 %d 个可行点后停止。",
+        n_trials, stop_after,
+    )
+
+    points = _lhs_sample(bounds, n_trials, config.random_seed)
+    cases: list[ProcessCase] = []
+    n_feasible = 0
+    driver_dead = False
+
+    for idx, point in enumerate(points):
+        if driver_dead:
+            break
+        if stop_after > 0 and n_feasible >= stop_after:
+            _log.info("Phase 0：已找到 %d 个可行点，提前停止。", n_feasible)
+            break
+
+        design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
+        design_vars, repair_notes = repair_design_vars(
+            design_vars_raw,
+            config.integer_var_paths,
+            config.param_bounds,
+            config.var_dependencies,
+        )
+        if repair_notes:
+            _log.debug("Phase 0 repair [%d/%d]: %s", idx + 1, n_trials, repair_notes)
+
+        iteration = start_iteration + idx
+        _log.info(
+            "Phase 0 [%d/%d]：%s",
+            idx + 1, n_trials,
+            {_short_var_name(k): round(v, 4) for k, v in design_vars.items()
+             if k in config.param_bounds},
+        )
+
+        try:
+            run_id = str(uuid.uuid4())
+            case = run_case(
+                driver=driver,
+                design_vars=design_vars,
+                config=config.run_config,
+                iteration=iteration,
+                tags=tags,
+                run_id=run_id,
+            )
+        except AspenConnectionError as exc:
+            _log.error("Phase 0 [%d/%d]：driver 连接断开。原因：%s", idx + 1, n_trials, exc)
+            driver_dead = True
+            case = ProcessCase(
+                iteration=iteration, status=CaseStatus.SIM_FAILED,
+                design_vars=design_vars, tags=tags,
+                notes=f"driver 连接断开：{exc}",
+            )
+            cases.append(case)
+            _save_case(db, case, config.session_id)
+            break
+        except Exception as exc:
+            _log.warning("Phase 0 [%d/%d]：run_case() 意外异常：%s", idx + 1, n_trials, exc)
+            case = ProcessCase(
+                iteration=iteration, status=CaseStatus.SIM_FAILED,
+                design_vars=design_vars, tags=tags,
+                notes=f"run_case() 意外异常：{exc}",
+            )
+
+        cases.append(case)
+        _save_case(db, case, config.session_id)
+
+        if case.feasible is True:
+            n_feasible += 1
+            _log.info("  → 可行点 #%d（status=%s）", n_feasible, case.status.value)
+        else:
+            _log.info(
+                "  → 不可行（status=%s, feasible=%s）",
+                case.status.value, case.feasible,
+            )
+
+    _log.info(
+        "Phase 0 完成：运行 %d 次，找到 %d 个可行点。",
+        len(cases), n_feasible,
+    )
+    return cases, driver_dead
+
 
 def _lhs_sample(
     bounds: list[tuple[float, float]],
@@ -639,6 +878,7 @@ class _MultiObjectiveBayesianOptimizer:
         self,
         bounds: list[tuple[float, float]],
         config: ParetoOptimizeCaseConfig,
+        paths: list[str],
     ) -> None:
         self._bounds = bounds
         self._n_obj = len(config.objective_names)
@@ -647,17 +887,17 @@ class _MultiObjectiveBayesianOptimizer:
         self._acquisition = config.acquisition
         self._xi = config.xi
         self._kappa = config.kappa
+        self._surrogate_model = config.surrogate_model
         self._rng = _random.Random(config.random_seed)
+        # 将 integer_var_paths（Aspen 路径集合）转换为 bounds 的下标集合，
+        # 供 make_surrogate_optimizer 构建混合整数搜索空间。
+        self._integer_indices: set[int] = {
+            i for i, p in enumerate(paths) if p in config.integer_var_paths
+        }
         # 成功观测：(x, y_vec_min_direction)
         self._observations: list[tuple[list[float], list[float]]] = []
-        # 失败观测：只存 x，penalty 在 ask() 时用当前权重动态计算，保证与成功样本同一权重体系
+        # 失败观测：只存 x，penalty 在 ask() 时用当前权重动态计算
         self._failed_xs: list[list[float]] = []
-
-        if not _HAS_SKOPT:
-            _log.warning(
-                "scikit-optimize 未安装，多目标贝叶斯优化将退化为随机采样。"
-                "安装方法：pip install scikit-optimize"
-            )
 
     def tell(
         self,
@@ -681,7 +921,7 @@ class _MultiObjectiveBayesianOptimizer:
 
     def ask(self) -> list[float]:
         """推荐下一个候选点。成功观测不足 n_initial_min 时返回随机点。"""
-        if not _HAS_SKOPT or len(self._observations) < self._n_initial_min:
+        if len(self._observations) < self._n_initial_min:
             return [lo + self._rng.random() * (hi - lo) for lo, hi in self._bounds]
 
         weights = _dirichlet_sample(self._n_obj, self._rng)
@@ -690,9 +930,6 @@ class _MultiObjectiveBayesianOptimizer:
             for _, y_vec in self._observations
         ]
 
-        # 失败样本的惩罚值：严格大于当前最差成功标量化值，引导 GP 远离不收敛区域。
-        # worst_scalar + max(|worst_scalar| * 0.1, 1.0) 保证即使 worst_scalar=0 时
-        # penalty 也为 1.0，不会与成功样本混淆。
         if scalarized:
             worst_scalar = max(scalarized)
             penalty = worst_scalar + max(abs(worst_scalar) * 0.1, 1.0)
@@ -700,28 +937,22 @@ class _MultiObjectiveBayesianOptimizer:
             penalty = 1e10
 
         try:
-            acq_kwargs: dict[str, Any] = {}
-            if self._acquisition in ("EI", "PI"):
-                acq_kwargs["xi"] = self._xi
-            else:
-                acq_kwargs["kappa"] = self._kappa
-
-            opt = _SkoptOptimizer(
-                dimensions=[_Real(lo, hi) for lo, hi in self._bounds],
-                base_estimator="GP",
-                acq_func=self._acquisition,
-                acq_func_kwargs=acq_kwargs,
-                random_state=self._rng.randint(0, 2 ** 31),
-                n_initial_points=0,
+            surrogate_cfg = SurrogateConfig(
+                model=self._surrogate_model,
+                acquisition=self._acquisition,
+                xi=self._xi,
+                kappa=self._kappa,
+                n_initial_min=0,
+                random_seed=self._rng.randint(0, 2 ** 31),
             )
+            opt = make_surrogate_optimizer(self._bounds, surrogate_cfg, self._integer_indices)
             for (x, _), s in zip(self._observations, scalarized):
-                opt.tell(x, s)
-            # 失败样本以当前权重下的惩罚值告知 GP，引导其远离不收敛区域
+                opt.tell(x, s, is_success=True)
             for x in self._failed_xs:
-                opt.tell(x, penalty)
+                opt.tell(x, penalty, is_success=False)
             return opt.ask()
         except Exception as exc:
-            _log.warning("skopt 多目标优化失败，回退到随机采样：%s", exc)
+            _log.warning("代理模型多目标优化失败，回退到随机采样：%s", exc)
             return [lo + self._rng.random() * (hi - lo) for lo, hi in self._bounds]
 
 
@@ -862,11 +1093,62 @@ def _compute_hv_fixed(
         return fixed_ref, None
 
 
-def _save_case(db: Any, case: ProcessCase) -> None:
+def _log_infeasible_diagnosis(
+    cases: list[ProcessCase],
+    n_show: int = 5,
+) -> None:
+    """
+    当 n_success=0 时，按约束违反程度排序输出最接近可行的工况。
+
+    输出每个工况的：约束名/实际值/差距、设计变量值。
+    仅处理 status=INFEASIBLE 且约束全部可用的工况。
+    """
+    infeasible = [
+        c for c in cases
+        if c.status == CaseStatus.INFEASIBLE and c.constraints_available
+    ]
+    if not infeasible:
+        obj_err = [c for c in cases if c.status.value == "objective_error"]
+        if obj_err:
+            _log.info(
+                "infeasible 诊断：无 INFEASIBLE 工况，但有 %d 个 OBJECTIVE_ERROR 工况。"
+                "请检查 TAC/EMISSIONS 目标函数错误信息（见上方日志）。",
+                len(obj_err),
+            )
+        return
+
+    def total_violation(c: ProcessCase) -> float:
+        return sum(max(0.0, cv.value) for cv in c.constraints if cv.value is not None)
+
+    infeasible.sort(key=total_violation)
+    _log.info(
+        "=== infeasible 诊断：最接近可行的 %d/%d 个工况（按约束违反量升序）===",
+        min(n_show, len(infeasible)), len(infeasible),
+    )
+    for rank, c in enumerate(infeasible[:n_show], 1):
+        viol = total_violation(c)
+        con_parts = []
+        for cv in c.constraints:
+            if cv.value is None:
+                con_parts.append(f"{cv.name}=None")
+            else:
+                status_str = "✓" if cv.satisfied else f"违反+{cv.value:.4f}"
+                con_parts.append(f"{cv.name}={status_str}")
+        dv_short = {_short_var_name(k): round(v, 4) for k, v in c.design_vars.items()}
+        _log.info(
+            "  #%d iter=%d 总违反=%.4f | %s | vars=%s",
+            rank, c.iteration, viol, " | ".join(con_parts), dv_short,
+        )
+
+
+def _save_case(db: Any, case: ProcessCase, session_id: str = "") -> None:
     if db is None:
         return
     try:
-        db.save_case(case.to_dict())
+        d = case.to_dict()
+        if session_id:
+            d["session_id"] = session_id
+        db.save_case(d)
     except Exception as exc:
         _log.warning("工况 '%s' 保存到数据库失败（已忽略）：%s", case.case_id, exc)
 

@@ -83,6 +83,8 @@ from typing import Any, Callable, Literal
 from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
+from ..optimization.surrogate import SurrogateConfig, make_surrogate_optimizer
+from .common import repair_design_vars
 from .run_case import RunCaseConfig, run_case
 
 _log = logging.getLogger(__name__)
@@ -92,13 +94,6 @@ try:
     _HAS_NUMPY = True
 except ImportError:
     _HAS_NUMPY = False
-
-try:
-    from skopt import Optimizer as _SkoptOptimizer
-    from skopt.space import Real as _Real
-    _HAS_SKOPT = True
-except ImportError:
-    _HAS_SKOPT = False
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +156,13 @@ class OptimizeCaseConfig:
     xi: float = 0.01
     kappa: float = 1.96
     n_initial_min: int = 3
+    surrogate_model: Literal["GP", "RF", "ET", "GBRT", "random"] = "GP"
     tags: list[str] = field(default_factory=list)
     on_case_complete: Callable[[ProcessCase, int, int], None] | None = None
     db_path: Path | str | None = None
     random_seed: int | None = None
+    # type=integer 的设计变量路径集合；BO 提出连续值后 round/clamp 到整数
+    integer_var_paths: set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +311,10 @@ def optimize_case(
 
     paths = list(config.param_bounds.keys())
     bounds = [config.param_bounds[p] for p in paths]
+    # integer 变量在 bounds 中的下标集合，传给代理模型构建混合整数搜索空间
+    integer_indices: set[int] = {
+        i for i, p in enumerate(paths) if p in config.integer_var_paths
+    }
     n_total = config.n_iterations
 
     _log.info(
@@ -339,7 +341,12 @@ def optimize_case(
         if driver_dead:
             break
 
-        design_vars = {**config.fixed_vars, **dict(zip(paths, point))}
+        design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
+        design_vars, repair_notes = repair_design_vars(
+            design_vars_raw, config.integer_var_paths, config.param_bounds, {},
+        )
+        if repair_notes:
+            _log.debug("初始 DOE [%d/%d] repair: %s", idx + 1, config.n_initial, repair_notes)
         iteration = start_iteration + idx
         tags = list(config.tags) + ["initial_doe", "optimize"]
 
@@ -399,7 +406,18 @@ def optimize_case(
     n_bo = n_total - config.n_initial
 
     if not driver_dead and n_bo > 0:
-        optimizer = _BayesianOptimizer(bounds, config)
+        optimizer = make_surrogate_optimizer(
+            bounds,
+            SurrogateConfig(
+                model=config.surrogate_model,
+                acquisition=config.acquisition,
+                xi=config.xi,
+                kappa=config.kappa,
+                n_initial_min=config.n_initial_min,
+                random_seed=config.random_seed,
+            ),
+            integer_indices,
+        )
 
         # 用初始 DOE 的观测初始化优化器（成功样本用真实 y，失败样本用惩罚值）
         for c in cases:
@@ -428,7 +446,12 @@ def optimize_case(
             tags = list(config.tags) + ["bayesian_opt", "optimize"]
 
             next_x = optimizer.ask()
-            design_vars = {**config.fixed_vars, **dict(zip(paths, next_x))}
+            design_vars_raw = {**config.fixed_vars, **dict(zip(paths, next_x))}
+            design_vars, repair_notes = repair_design_vars(
+                design_vars_raw, config.integer_var_paths, config.param_bounds, {},
+            )
+            if repair_notes:
+                _log.debug("贝叶斯优化 [%d/%d] repair: %s", idx + 1, n_total, repair_notes)
 
             _log.info(
                 "贝叶斯优化 [%d/%d]：%s",
@@ -477,8 +500,10 @@ def optimize_case(
             _fire_callback(config.on_case_complete, case, idx, n_total)
 
             y = _extract_y(case, config)
+            # 用修复后的实际运行点 tell，保证代理模型学习正确的输入-输出关系
+            x_eval = [design_vars.get(p, next_x[i]) for i, p in enumerate(paths)]
             optimizer.tell(
-                next_x,
+                x_eval,
                 y if y is not None else _penalty_value(cases, config),
                 is_success=y is not None,
             )
@@ -561,6 +586,13 @@ def _validate_config(config: OptimizeCaseConfig) -> None:
             f"acquisition 必须为 'EI'、'UCB' 或 'PI'，收到：{config.acquisition!r}。"
         )
 
+    _VALID_SURROGATE = {"GP", "RF", "ET", "GBRT", "random"}
+    if config.surrogate_model not in _VALID_SURROGATE:
+        raise ValueError(
+            f"surrogate_model={config.surrogate_model!r} 不合法，"
+            f"支持值：{sorted(_VALID_SURROGATE)}。"
+        )
+
     param_upper = {p.upper() for p in config.param_bounds}
     fixed_upper = {p.upper(): p for p in config.fixed_vars}
     conflicts = [
@@ -573,6 +605,19 @@ def _validate_config(config: OptimizeCaseConfig) -> None:
             f"fixed_vars 与 param_bounds 存在路径冲突（大小写不敏感）：{detail}。"
             "请从 fixed_vars 中移除冲突路径。"
         )
+
+    for path in config.integer_var_paths:
+        if path not in config.param_bounds:
+            raise ValueError(
+                f"integer_var_paths 中的路径 '{path}' 不在 param_bounds 中，"
+                "请确认路径拼写正确。"
+            )
+        lo, hi = config.param_bounds[path]
+        if lo != int(lo) or hi != int(hi):
+            raise ValueError(
+                f"integer 变量 '{path}' 的边界 ({lo}, {hi}) 必须为整数值，"
+                "请将 YAML 中的 lower_bound / upper_bound 改为整数（如 10, 50）。"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -614,74 +659,6 @@ def _lhs_sample(
     for i in range(n):
         result.append([cols[j][i] for j in range(d)])
     return result
-
-
-# ---------------------------------------------------------------------------
-# 贝叶斯优化器封装
-# ---------------------------------------------------------------------------
-
-class _BayesianOptimizer:
-    """
-    贝叶斯优化器封装，支持 skopt 高斯过程和随机采样回退。
-
-    skopt 不可用，或成功观测数 < n_initial_min 时，ask() 返回随机点。
-    skopt 可用且观测充足时，ask() 通过采集函数推荐下一个候选点。
-    """
-
-    def __init__(
-        self,
-        bounds: list[tuple[float, float]],
-        config: OptimizeCaseConfig,
-    ) -> None:
-        self._bounds = bounds
-        self._n_initial_min = config.n_initial_min
-        self._rng = _random.Random(config.random_seed)
-        self._n_success = 0
-        self._skopt: Any = None
-
-        if _HAS_SKOPT:
-            acq_func_kwargs: dict[str, Any] = {}
-            if config.acquisition in ("EI", "PI"):
-                acq_func_kwargs["xi"] = config.xi
-            elif config.acquisition == "UCB":
-                acq_func_kwargs["kappa"] = config.kappa
-
-            try:
-                self._skopt = _SkoptOptimizer(
-                    dimensions=[_Real(lo, hi) for lo, hi in bounds],
-                    base_estimator="GP",
-                    acq_func=config.acquisition,
-                    acq_func_kwargs=acq_func_kwargs,
-                    random_state=config.random_seed,
-                    n_initial_points=0,
-                )
-            except Exception as exc:
-                _log.warning("skopt Optimizer 初始化失败，回退到随机采样：%s", exc)
-                self._skopt = None
-        else:
-            _log.warning(
-                "scikit-optimize 未安装，贝叶斯优化将退化为随机采样。"
-                "安装方法：pip install scikit-optimize"
-            )
-
-    def tell(self, x: list[float], y: float, *, is_success: bool) -> None:
-        """向优化器提交一次观测。is_success=True 时计入成功样本数。"""
-        if is_success:
-            self._n_success += 1
-        if self._skopt is not None:
-            try:
-                self._skopt.tell(x, y)
-            except Exception as exc:
-                _log.warning("skopt.tell() 失败（已忽略）：%s", exc)
-
-    def ask(self) -> list[float]:
-        """推荐下一个候选点。成功观测不足 n_initial_min 时返回随机点。"""
-        if self._skopt is not None and self._n_success >= self._n_initial_min:
-            try:
-                return self._skopt.ask()
-            except Exception as exc:
-                _log.warning("skopt.ask() 失败，回退到随机采样：%s", exc)
-        return [lo + self._rng.random() * (hi - lo) for lo, hi in self._bounds]
 
 
 # ---------------------------------------------------------------------------

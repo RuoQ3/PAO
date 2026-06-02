@@ -60,23 +60,24 @@ fields:
 
   column_diameter:
     required_for: [TAC]
-    required: true
+    required: false          # TAC 层有 fallback_design 兜底，manifest 不强制要求
     candidates:
       - pattern: "Output\\DIAM_STAGE"
         priority: 100
-      - pattern: "Output\\DIAM"
-        priority: 95
       - pattern: "Output\\CA_DIAM*"
-        priority: 80
+        priority: 90          # Column Internals 计算的实际塔径，unit=meter，sample_value>0
+      - pattern: "Output\\DIAM"
+        priority: 50          # 通常 unit="" sample_value=0（未做 sizing），降低优先级
       - pattern: "Output\\DIAM*"
-        priority: 70
+        priority: 40
     validators:
       value_type: numeric
       unit_dimension: length
+      sample_value_nonzero: true   # 排除 sample_value=0 或 None 的节点
 
   nstage:
     required_for: [TAC]
-    required: true
+    required: false          # TAC 层有 block_design_params fallback，manifest 不强制要求
     candidates:
       - pattern: "Input\\NSTAGE"
         priority: 100

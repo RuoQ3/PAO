@@ -212,14 +212,16 @@ def normalize_area(value: Any, unit: str) -> tuple[float | None, str | None]:
 # ---------------------------------------------------------------------------
 
 _LENGTH_TO_M: dict[str, float] = {
-    "M":    1.0,
-    "CM":   1e-2,
-    "MM":   1e-3,
-    "KM":   1e3,
-    "FT":   0.3048,
-    "IN":   0.0254,
-    "INCH": 0.0254,
-    "YD":   0.9144,
+    "M":      1.0,
+    "METER":  1.0,
+    "METERS": 1.0,
+    "CM":     1e-2,
+    "MM":     1e-3,
+    "KM":     1e3,
+    "FT":     0.3048,
+    "IN":     0.0254,
+    "INCH":   0.0254,
+    "YD":     0.9144,
 }
 
 

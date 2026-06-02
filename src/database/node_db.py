@@ -148,11 +148,12 @@ CREATE INDEX IF NOT EXISTS idx_nc_catalog_id   ON node_catalog (catalog_id);
 CREATE INDEX IF NOT EXISTS idx_nc_block_name   ON node_catalog (catalog_id, block_name);
 CREATE INDEX IF NOT EXISTS idx_nc_block_type   ON node_catalog (catalog_id, block_type);
 
--- read manifest 元数据
 CREATE TABLE IF NOT EXISTS read_manifests (
     manifest_id      TEXT    PRIMARY KEY,
     catalog_id       TEXT    NOT NULL,
     objective_names  TEXT    NOT NULL DEFAULT '[]',
+    rules_hash       TEXT    NOT NULL DEFAULT '',
+    builder_version  TEXT    NOT NULL DEFAULT '',
     is_valid         INTEGER NOT NULL DEFAULT 1,
     error            TEXT    NOT NULL DEFAULT '',
     created_at       TEXT    NOT NULL
@@ -201,6 +202,7 @@ class NodeDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_DDL)
         self._conn.commit()
+        self._migrate_schema()
 
     # ------------------------------------------------------------------ #
     # 上下文管理器
@@ -218,6 +220,34 @@ class NodeDB:
             self._conn.close()
         except Exception:
             pass
+
+    def _migrate_schema(self) -> None:
+        """非破坏性 schema 迁移：只添加缺失列，不删除或重建表。
+
+        仅在 read_manifests 表已存在但缺少 rules_hash / builder_version 列时
+        执行 ALTER TABLE ADD COLUMN，保证旧数据库升级后 manifest 缓存不丢失。
+        """
+        exists = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='read_manifests'"
+        ).fetchone()
+        if exists is None:
+            return
+
+        existing_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(read_manifests)").fetchall()
+        }
+        with self._conn:
+            if "rules_hash" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE read_manifests ADD COLUMN rules_hash TEXT NOT NULL DEFAULT ''"
+                )
+                _log.info("schema 迁移：read_manifests 添加 rules_hash 列")
+            if "builder_version" not in existing_cols:
+                self._conn.execute(
+                    "ALTER TABLE read_manifests ADD COLUMN builder_version TEXT NOT NULL DEFAULT ''"
+                )
+                _log.info("schema 迁移：read_manifests 添加 builder_version 列")
 
     # ------------------------------------------------------------------ #
     # 写入：节点值
@@ -883,12 +913,16 @@ class NodeDB:
             self._conn.execute(
                 """
                 INSERT INTO read_manifests
-                    (manifest_id, catalog_id, objective_names, is_valid, error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (manifest_id, catalog_id, objective_names,
+                     rules_hash, builder_version,
+                     is_valid, error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     manifest.manifest_id, manifest.catalog_id,
                     json.dumps(manifest.objective_names),
+                    getattr(manifest, "rules_hash", ""),
+                    getattr(manifest, "builder_version", ""),
                     int(manifest.is_valid), manifest.error, now,
                 ),
             )
@@ -926,21 +960,31 @@ class NodeDB:
         d["is_valid"] = bool(d["is_valid"])
         return d
 
-    def get_latest_manifest(self, catalog_id: str) -> dict[str, Any] | None:
+    def get_latest_manifest(
+        self,
+        catalog_id: str,
+        *,
+        rules_hash: str = "",
+        builder_version: str = "",
+    ) -> dict[str, Any] | None:
         """
         返回指定 catalog_id 的最新 manifest 元数据（按 created_at 降序）。
 
+        若指定 rules_hash 或 builder_version，则只返回完全匹配的 manifest；
+        不匹配时返回 None，触发重建。
+
         用于 run_case 中 manifest_id="auto" 时自动查找。
         """
-        row = self._conn.execute(
-            """
-            SELECT * FROM read_manifests
-            WHERE catalog_id = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (catalog_id,),
-        ).fetchone()
+        sql = "SELECT * FROM read_manifests WHERE catalog_id = ?"
+        params: list[Any] = [catalog_id]
+        if rules_hash:
+            sql += " AND rules_hash = ?"
+            params.append(rules_hash)
+        if builder_version:
+            sql += " AND builder_version = ?"
+            params.append(builder_version)
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        row = self._conn.execute(sql, params).fetchone()
         if row is None:
             return None
         d = dict(row)
