@@ -105,3 +105,67 @@ def repair_design_vars(
             )
 
     return repaired, notes
+
+
+def apply_derived_vars(
+    design_vars: dict[str, Any],
+    derived_specs: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Expand virtual derived variables into real Aspen input variables.
+
+    A derived spec maps a virtual optimizer variable, usually a continuous
+    fraction, to a real Aspen tree node. The virtual variable is removed from
+    the returned dict so callers can pass the result directly to run_case().
+    """
+    if not derived_specs:
+        return dict(design_vars), []
+
+    expanded = dict(design_vars)
+    notes: list[str] = []
+
+    for spec in derived_specs:
+        frac_path = str(spec["frac_path"])
+        target_path = str(spec["target_path"])
+        depends_on = str(spec["depends_on"])
+        frac_lo = int(spec.get("frac_lo", 1))
+
+        if frac_path not in expanded:
+            continue
+
+        raw_frac = expanded.pop(frac_path)
+        if raw_frac is None:
+            raise ValueError(f"derived variable '{frac_path}' is None")
+        if depends_on not in expanded or expanded[depends_on] is None:
+            raise ValueError(
+                f"derived variable '{frac_path}' requires dependency "
+                f"'{depends_on}' in design_vars"
+            )
+
+        frac = float(raw_frac)
+        nstage = int(round(float(expanded[depends_on])))
+        upper = nstage - 1
+        if upper < frac_lo:
+            raise ValueError(
+                f"derived variable '{frac_path}' has invalid bounds: "
+                f"frac_lo={frac_lo}, dependency {depends_on}={nstage}"
+            )
+
+        mapped = int(round(frac_lo + frac * (nstage - frac_lo - 1)))
+        clamped = max(frac_lo, min(upper, mapped))
+        expanded[target_path] = clamped
+
+        note = (
+            f"derived {_short_name(frac_path)}={frac:.6g} + "
+            f"{_short_name(depends_on)}={nstage} -> "
+            f"{_short_name(target_path)}={clamped}"
+        )
+        if clamped != mapped:
+            note += f" (clamped from {mapped})"
+        notes.append(note)
+
+    return expanded, notes
+
+
+def _short_name(path: str) -> str:
+    return path.rsplit("\\", 1)[-1]

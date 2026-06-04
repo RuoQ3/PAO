@@ -84,6 +84,33 @@ class SemanticField:
     required: bool           # 是否为 required 字段（来自 manifest item）
     rule_id: str             # 匹配的规则 ID，用于诊断
 
+    def to_dict(self) -> dict:
+        return {
+            "field_name":  self.field_name,
+            "abs_path":    self.abs_path,
+            "value":       self.value,
+            "unit":        self.unit,
+            "value_type":  self.value_type,
+            "available":   self.available,
+            "error":       self.error,
+            "required":    self.required,
+            "rule_id":     self.rule_id,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SemanticField":
+        return cls(
+            field_name = d.get("field_name", ""),
+            abs_path   = d.get("abs_path",   ""),
+            value      = d.get("value"),
+            unit       = d.get("unit",       ""),
+            value_type = int(d.get("value_type", 0)),
+            available  = bool(d.get("available", False)),
+            error      = d.get("error",      ""),
+            required   = bool(d.get("required", False)),
+            rule_id    = d.get("rule_id",    ""),
+        )
+
 
 @dataclass
 class SemanticBlock:
@@ -113,3 +140,28 @@ class SemanticBlock:
         """返回字段单位；字段不存在时返回 ""。"""
         f = self.fields.get(field_name)
         return f.unit if f is not None else ""
+
+    def to_dict(self) -> dict:
+        return {
+            "block_name":        self.block_name,
+            "block_type":        self.block_type,
+            "is_complete":       self.is_complete,
+            "missing_required":  self.missing_required,
+            "manifest_id":       self.manifest_id,
+            "fields":            {k: v.to_dict() for k, v in self.fields.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SemanticBlock":
+        fields = {
+            k: SemanticField.from_dict(v)
+            for k, v in (d.get("fields") or {}).items()
+        }
+        return cls(
+            block_name       = d.get("block_name",       ""),
+            block_type       = d.get("block_type",       ""),
+            fields           = fields,
+            is_complete      = bool(d.get("is_complete", False)),
+            missing_required = list(d.get("missing_required", [])),
+            manifest_id      = d.get("manifest_id",      ""),
+        )

@@ -84,7 +84,7 @@ from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
 from ..optimization.surrogate import SurrogateConfig, make_surrogate_optimizer
-from .common import repair_design_vars
+from .common import apply_derived_vars, repair_design_vars
 from .run_case import RunCaseConfig, run_case
 
 _log = logging.getLogger(__name__)
@@ -163,6 +163,7 @@ class OptimizeCaseConfig:
     random_seed: int | None = None
     # type=integer 的设计变量路径集合；BO 提出连续值后 round/clamp 到整数
     integer_var_paths: set[str] = field(default_factory=set)
+    derived_var_specs: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +330,7 @@ def optimize_case(
         db = SimulationDB(config.db_path)
 
     cases: list[ProcessCase] = []
+    case_xs: list[list[float]] = []
     t0 = time.monotonic()
     driver_dead = False
 
@@ -342,11 +344,17 @@ def optimize_case(
             break
 
         design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
-        design_vars, repair_notes = repair_design_vars(
+        design_vars_repaired, repair_notes = repair_design_vars(
             design_vars_raw, config.integer_var_paths, config.param_bounds, {},
         )
+        design_vars, derived_notes = apply_derived_vars(
+            design_vars_repaired, config.derived_var_specs,
+        )
+        x_eval = [design_vars_repaired.get(p, point[i]) for i, p in enumerate(paths)]
         if repair_notes:
             _log.debug("初始 DOE [%d/%d] repair: %s", idx + 1, config.n_initial, repair_notes)
+        if derived_notes:
+            _log.debug("initial DOE [%d/%d] derived: %s", idx + 1, config.n_initial, derived_notes)
         iteration = start_iteration + idx
         tags = list(config.tags) + ["initial_doe", "optimize"]
 
@@ -376,6 +384,7 @@ def optimize_case(
                 notes=f"driver 连接断开，优化终止：{exc}",
             )
             cases.append(case)
+            case_xs.append(x_eval)
             _save_case(db, case)
             _fire_callback(config.on_case_complete, case, idx, n_total)
             _log.info("  → status=%s, success=%s, run_time=%.1fs",
@@ -393,6 +402,7 @@ def optimize_case(
             )
 
         cases.append(case)
+        case_xs.append(x_eval)
         _save_case(db, case)
         _fire_callback(config.on_case_complete, case, idx, n_total)
         _log.info(
@@ -420,8 +430,7 @@ def optimize_case(
         )
 
         # 用初始 DOE 的观测初始化优化器（成功样本用真实 y，失败样本用惩罚值）
-        for c in cases:
-            x = [c.design_vars.get(p) for p in paths]
+        for c, x in zip(cases, case_xs):
             y = _extract_y(c, config)
             optimizer.tell(
                 x,
@@ -447,11 +456,18 @@ def optimize_case(
 
             next_x = optimizer.ask()
             design_vars_raw = {**config.fixed_vars, **dict(zip(paths, next_x))}
-            design_vars, repair_notes = repair_design_vars(
+            design_vars_repaired, repair_notes = repair_design_vars(
                 design_vars_raw, config.integer_var_paths, config.param_bounds, {},
             )
+            design_vars, derived_notes = apply_derived_vars(
+                design_vars_repaired, config.derived_var_specs,
+            )
+            x_eval = [design_vars_repaired.get(p, next_x[i]) for i, p in enumerate(paths)]
             if repair_notes:
                 _log.debug("贝叶斯优化 [%d/%d] repair: %s", idx + 1, n_total, repair_notes)
+
+            if derived_notes:
+                _log.debug("bayesian opt [%d/%d] derived: %s", idx + 1, n_total, derived_notes)
 
             _log.info(
                 "贝叶斯优化 [%d/%d]：%s",
@@ -479,6 +495,7 @@ def optimize_case(
                     notes=f"driver 连接断开，优化终止：{exc}",
                 )
                 cases.append(case)
+                case_xs.append(x_eval)
                 _save_case(db, case)
                 _fire_callback(config.on_case_complete, case, idx, n_total)
                 _log.info("  → status=%s, success=%s, run_time=%.1fs",
@@ -496,12 +513,12 @@ def optimize_case(
                 )
 
             cases.append(case)
+            case_xs.append(x_eval)
             _save_case(db, case)
             _fire_callback(config.on_case_complete, case, idx, n_total)
 
             y = _extract_y(case, config)
             # 用修复后的实际运行点 tell，保证代理模型学习正确的输入-输出关系
-            x_eval = [design_vars.get(p, next_x[i]) for i, p in enumerate(paths)]
             optimizer.tell(
                 x_eval,
                 y if y is not None else _penalty_value(cases, config),
@@ -617,6 +634,34 @@ def _validate_config(config: OptimizeCaseConfig) -> None:
             raise ValueError(
                 f"integer 变量 '{path}' 的边界 ({lo}, {hi}) 必须为整数值，"
                 "请将 YAML 中的 lower_bound / upper_bound 改为整数（如 10, 50）。"
+            )
+
+    for spec in config.derived_var_specs:
+        frac_path = str(spec.get("frac_path", ""))
+        target_path = str(spec.get("target_path", ""))
+        depends_on = str(spec.get("depends_on", ""))
+        if frac_path not in config.param_bounds:
+            raise ValueError(f"derived frac_path '{frac_path}' is not in param_bounds.")
+        if target_path in config.param_bounds:
+            raise ValueError(
+                f"derived target_path '{target_path}' must not also be optimized."
+            )
+        if depends_on not in config.param_bounds and depends_on not in config.fixed_vars:
+            raise ValueError(
+                f"derived depends_on '{depends_on}' must be optimized or fixed."
+            )
+        frac_lo = int(spec.get("frac_lo", 1))
+        lo, hi = config.param_bounds[frac_path]
+        if lo < 0.0 or hi > 1.0 or lo >= hi:
+            raise ValueError(
+                f"derived frac bounds for '{frac_path}' must satisfy 0 <= lo < hi <= 1."
+            )
+        dep_bounds = config.param_bounds.get(depends_on)
+        dep_min = dep_bounds[0] if dep_bounds is not None else float(config.fixed_vars[depends_on])
+        if dep_min <= frac_lo:
+            raise ValueError(
+                f"derived frac_lo={frac_lo} must be smaller than minimum dependency "
+                f"value {dep_min} for '{depends_on}'."
             )
 
 

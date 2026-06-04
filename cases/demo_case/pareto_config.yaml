@@ -2,8 +2,8 @@
 # 对应 Aspen 仿真文件：二级氢氰化工段.bkp
 #
 # 运行方式：
-#   python -m src.main cases/demo_case/pareto_tac_emissions_config.yaml
-#   python -m src.main cases/demo_case/pareto_tac_emissions_config.yaml --dry-run
+#   python -m src.main cases/demo_case/pareto_config.yaml
+#   python -m src.main cases/demo_case/pareto_config.yaml --dry-run
 #
 # 优化目标：
 #   ADN_FLOW   最大化 ADN 产品质量流量（kg/hr）—— 代表产量/吞吐量
@@ -28,6 +28,7 @@ simulator:
   filepath: cases/demo_case/二级氢氰化工段.bkp
   visible: false
   suppress_dialogs: true
+  require_type_library: true   # 强制加载 HAP 类型库，确保 block 状态检查可用
   timeout: 300
   reinit: true
   verify_inputs: true
@@ -126,8 +127,8 @@ extraction:
 # ---------------------------------------------------------------------------
 optimizer:
   type: pareto_bayesian
-  n_initial_points: 10
-  n_iterations: 30                  # 总仿真次数 = 10 + 30 = 40
+  n_initial_points: 20
+  n_iterations: 60                  # 总仿真次数 = 20 + 60 = 80
   scalarization: chebyshev          # 对非凸 Pareto 前沿覆盖更均匀
   acquisition_function: EI
   random_seed: 42

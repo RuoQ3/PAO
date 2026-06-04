@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .errors import AspenNodeError, AspenRunError, AspenRunTimeoutError
@@ -263,6 +264,14 @@ class SimulationRunner:
 
         overall_status, status_error, status_warnings = self._aggregate_status(check_result.statuses)
         all_warnings = input_warnings + status_warnings
+        if not overall_status.is_convergent:
+            history_diagnostics = _read_history_diagnostics(_source_filepath)
+        else:
+            history_diagnostics = []
+        if history_diagnostics:
+            all_warnings.extend(history_diagnostics)
+            history_text = "Aspen history diagnostics: " + " | ".join(history_diagnostics)
+            status_error = f"{status_error}\n{history_text}" if status_error else history_text
 
         # 输入不一致时，将 SUCCESS 降级为 WARNINGS
         if input_warnings and overall_status == RunStatus.SUCCESS:
@@ -586,6 +595,62 @@ def _values_match(requested: Any, actual: Any, rtol: float) -> tuple[bool, str]:
     except (TypeError, ValueError):
         match = requested == actual
         return match, ("" if match else f"值不相等：{requested!r} != {actual!r}")
+
+
+def _read_history_diagnostics(source_filepath: Any, max_items: int = 20) -> list[str]:
+    """
+    Extract high-signal Aspen input translation diagnostics from the latest .his.
+
+    Aspen can return quickly from Engine.Run2(True) with all blocks marked
+    NO_RESULTS when the input translator fails before flowsheet analysis starts.
+    HAP_COMPSTATUS only exposes the generic NO_RESULTS flag; the actionable
+    reason is usually in the generated history file beside the case.
+    """
+    if source_filepath is None:
+        return []
+
+    try:
+        case_dir = Path(source_filepath).resolve().parent
+        history_files = list(case_dir.glob("*.his"))
+        if not history_files:
+            return []
+        latest = max(history_files, key=lambda p: p.stat().st_mtime)
+        lines = latest.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break a run
+        return [f"Aspen history diagnostics unavailable: {exc}"]
+
+    triggers = (
+        "ERROR IN THE",
+        "SEVERE ERROR",
+        "PROGRAM CANNOT BE EXECUTED",
+        "DUE TO PREVIOUS SEVERE",
+        "TRAY-SIZE",
+        "TRAYTYPE",
+        "PARAGRAPH IGNORED",
+        "NO BLOCK PARAGRAPH",
+        "INPUT TRANSLATION",
+    )
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    for idx, line in enumerate(lines):
+        upper = line.upper()
+        if not any(token in upper for token in triggers):
+            continue
+        for offset in range(0, 4):
+            if idx + offset >= len(lines):
+                break
+            text = lines[idx + offset].strip()
+            if not text:
+                continue
+            item = f"{latest.name}: {text}"
+            if item not in seen:
+                selected.append(item)
+                seen.add(item)
+            if len(selected) >= max_items:
+                return selected
+
+    return selected
 
 
 def _parse_comp_status(comp_status: int, hap: dict[str, int]) -> list[str]:

@@ -204,6 +204,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _print_single_summary(log, result, db_path)
 
+    # 自动生成可视化报告（仅多目标 Pareto 优化）
+    if is_pareto:
+        try:
+            from src.reporting.plot_pareto import generate_pareto_report
+            generate_pareto_report(db_path, out_dir=db_path.parent)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("可视化报告生成失败（不影响结果）：%s", exc)
+
     return 0
 
 

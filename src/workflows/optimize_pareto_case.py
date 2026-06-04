@@ -55,7 +55,7 @@ from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
 from ..optimization.pareto import ParetoResult, compute_pareto
 from ..optimization.surrogate import SurrogateConfig, make_surrogate_optimizer
-from .common import repair_design_vars
+from .common import apply_derived_vars, repair_design_vars
 from .run_case import RunCaseConfig, run_case
 
 _log = logging.getLogger(__name__)
@@ -174,6 +174,7 @@ class ParetoOptimizeCaseConfig:
     warm_start_cases: list[ProcessCase] = field(default_factory=list)
     # integer 变量路径集合（BO 提出连续值后 round/clamp）
     integer_var_paths: set[str] = field(default_factory=set)
+    derived_var_specs: list[dict[str, Any]] = field(default_factory=list)
     # 变量依赖约束 {var_path: {"lt": other_path}} — 如 FEED_STAGE < NSTAGE
     var_dependencies: dict[str, dict[str, str]] = field(default_factory=dict)
     # Phase 0 可行性搜索配置（None 表示不启用）
@@ -328,6 +329,7 @@ def optimize_pareto_case(
         db = SimulationDB(config.db_path)
 
     cases: list[ProcessCase] = []
+    case_xs: list[list[float]] = []
     hv_history: list[float | None] = []
     # 固定参考点：首批有效 DOE 样本确定后锁定，保证 hv_history 可比较
     _fixed_ref_point: list[float] | None = None
@@ -337,10 +339,11 @@ def optimize_pareto_case(
     # ------------------------------------------------------------------
     # Phase 0：可行性搜索（可选）
     # ------------------------------------------------------------------
-    phase0_cases, driver_dead = _feasibility_search(
+    phase0_cases, driver_dead, phase0_xs = _feasibility_search(
         driver, config, paths, bounds, db, start_iteration
     )
     cases.extend(phase0_cases)
+    case_xs.extend(phase0_xs)
     for _ in phase0_cases:
         _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
         hv_history.append(hv)
@@ -356,14 +359,20 @@ def optimize_pareto_case(
             break
 
         design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
-        design_vars, repair_notes = repair_design_vars(
+        design_vars_repaired, repair_notes = repair_design_vars(
             design_vars_raw,
             config.integer_var_paths,
             config.param_bounds,
             config.var_dependencies,
         )
+        design_vars, derived_notes = apply_derived_vars(
+            design_vars_repaired, config.derived_var_specs,
+        )
+        x_eval = [design_vars_repaired.get(p, point[i]) for i, p in enumerate(paths)]
         if repair_notes:
             _log.debug("Phase 1 repair [%d/%d]: %s", idx + 1, config.n_initial, repair_notes)
+        if derived_notes:
+            _log.debug("Phase 1 derived [%d/%d]: %s", idx + 1, config.n_initial, derived_notes)
 
         iteration = start_iteration + phase0_offset + idx
         tags = list(config.tags) + ["initial_doe", "pareto_opt"]
@@ -371,7 +380,7 @@ def optimize_pareto_case(
         _log.info(
             "初始 DOE [%d/%d]：%s",
             idx + 1, config.n_initial,
-            {_short_var_name(k): round(v, 4) for k, v in design_vars.items()
+            {_short_var_name(k): round(v, 4) for k, v in design_vars_repaired.items()
              if k in config.param_bounds},
         )
 
@@ -395,6 +404,7 @@ def optimize_pareto_case(
                 notes=f"driver 连接断开，优化终止：{exc}",
             )
             cases.append(case)
+            case_xs.append(x_eval)
             _save_case(db, case, config.session_id)
             _fire_callback(config.on_case_complete, case, idx, n_total)
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
@@ -410,6 +420,7 @@ def optimize_pareto_case(
             )
 
         cases.append(case)
+        case_xs.append(x_eval)
         _save_case(db, case, config.session_id)
         _fire_callback(config.on_case_complete, case, idx, n_total)
         _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
@@ -429,8 +440,7 @@ def optimize_pareto_case(
     if not driver_dead and n_bo > 0:
         optimizer = _MultiObjectiveBayesianOptimizer(bounds, config, paths)
 
-        for c in cases:
-            x = [c.design_vars.get(p) for p in paths]
+        for c, x in zip(cases, case_xs):
             y_vec = _extract_all_objectives(c, config)
             optimizer.tell(x, y_vec, is_success=y_vec is not None)
 
@@ -469,19 +479,25 @@ def optimize_pareto_case(
 
             next_x = optimizer.ask()
             design_vars_raw = {**config.fixed_vars, **dict(zip(paths, next_x))}
-            design_vars, repair_notes = repair_design_vars(
+            design_vars_repaired, repair_notes = repair_design_vars(
                 design_vars_raw,
                 config.integer_var_paths,
                 config.param_bounds,
                 config.var_dependencies,
             )
+            design_vars, derived_notes = apply_derived_vars(
+                design_vars_repaired, config.derived_var_specs,
+            )
+            x_eval = [design_vars_repaired.get(p, next_x[i]) for i, p in enumerate(paths)]
             if repair_notes:
                 _log.debug("Phase 2 repair [%d/%d]: %s", idx + 1, n_total, repair_notes)
+            if derived_notes:
+                _log.debug("Phase 2 derived [%d/%d]: %s", idx + 1, n_total, derived_notes)
 
             _log.info(
                 "贝叶斯优化 [%d/%d]：%s",
                 idx + 1, n_total,
-                {_short_var_name(k): round(v, 4) for k, v in design_vars.items()
+                {_short_var_name(k): round(v, 4) for k, v in design_vars_repaired.items()
                  if k in config.param_bounds},
             )
 
@@ -505,6 +521,7 @@ def optimize_pareto_case(
                     notes=f"driver 连接断开，优化终止：{exc}",
                 )
                 cases.append(case)
+                case_xs.append(x_eval)
                 _save_case(db, case, config.session_id)
                 _fire_callback(config.on_case_complete, case, idx, n_total)
                 _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
@@ -520,6 +537,7 @@ def optimize_pareto_case(
                 )
 
             cases.append(case)
+            case_xs.append(x_eval)
             _save_case(db, case, config.session_id)
             _fire_callback(config.on_case_complete, case, idx, n_total)
 
@@ -527,7 +545,6 @@ def optimize_pareto_case(
             # 用修复后的实际运行点告知代理模型，保证 surrogate 学习正确的输入-输出关系。
             # next_x 是 BO 推荐的连续值，经 repair 后可能被 round/clamp，
             # 实际跑 Aspen 的是 design_vars，必须以此为准。
-            x_eval = [design_vars.get(p, next_x[i]) for i, p in enumerate(paths)]
             optimizer.tell(x_eval, y_vec, is_success=y_vec is not None)
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
             hv_history.append(hv)
@@ -695,6 +712,34 @@ def _validate_config(config: ParetoOptimizeCaseConfig) -> None:
                 "请将 YAML 中的 lower_bound / upper_bound 改为整数（如 10, 50）。"
             )
 
+    for spec in config.derived_var_specs:
+        frac_path = str(spec.get("frac_path", ""))
+        target_path = str(spec.get("target_path", ""))
+        depends_on = str(spec.get("depends_on", ""))
+        if frac_path not in config.param_bounds:
+            raise ValueError(f"derived frac_path '{frac_path}' is not in param_bounds.")
+        if target_path in config.param_bounds:
+            raise ValueError(
+                f"derived target_path '{target_path}' must not also be optimized."
+            )
+        if depends_on not in config.param_bounds and depends_on not in config.fixed_vars:
+            raise ValueError(
+                f"derived depends_on '{depends_on}' must be optimized or fixed."
+            )
+        frac_lo = int(spec.get("frac_lo", 1))
+        lo, hi = config.param_bounds[frac_path]
+        if lo < 0.0 or hi > 1.0 or lo >= hi:
+            raise ValueError(
+                f"derived frac bounds for '{frac_path}' must satisfy 0 <= lo < hi <= 1."
+            )
+        dep_bounds = config.param_bounds.get(depends_on)
+        dep_min = dep_bounds[0] if dep_bounds is not None else float(config.fixed_vars[depends_on])
+        if dep_min <= frac_lo:
+            raise ValueError(
+                f"derived frac_lo={frac_lo} must be smaller than minimum dependency "
+                f"value {dep_min} for '{depends_on}'."
+            )
+
 
 # ---------------------------------------------------------------------------
 # 拉丁超立方采样（与 optimize_case.py 保持一致）
@@ -734,7 +779,7 @@ def _feasibility_search(
     bounds: list[tuple[float, float]],
     db: Any,
     start_iteration: int,
-) -> tuple[list[ProcessCase], bool]:
+) -> tuple[list[ProcessCase], bool, list[list[float]]]:
     """
     Phase 0：可行性搜索。
 
@@ -743,7 +788,7 @@ def _feasibility_search(
     """
     fs_cfg = config.feasibility_search
     if fs_cfg is None or not fs_cfg.enabled:
-        return [], False
+        return [], False, []
 
     n_trials   = fs_cfg.n_trials
     stop_after = fs_cfg.stop_after_feasible
@@ -756,6 +801,7 @@ def _feasibility_search(
 
     points = _lhs_sample(bounds, n_trials, config.random_seed)
     cases: list[ProcessCase] = []
+    case_xs: list[list[float]] = []
     n_feasible = 0
     driver_dead = False
 
@@ -767,20 +813,26 @@ def _feasibility_search(
             break
 
         design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
-        design_vars, repair_notes = repair_design_vars(
+        design_vars_repaired, repair_notes = repair_design_vars(
             design_vars_raw,
             config.integer_var_paths,
             config.param_bounds,
             config.var_dependencies,
         )
+        design_vars, derived_notes = apply_derived_vars(
+            design_vars_repaired, config.derived_var_specs,
+        )
+        x_eval = [design_vars_repaired.get(p, point[i]) for i, p in enumerate(paths)]
         if repair_notes:
             _log.debug("Phase 0 repair [%d/%d]: %s", idx + 1, n_trials, repair_notes)
+        if derived_notes:
+            _log.debug("Phase 0 derived [%d/%d]: %s", idx + 1, n_trials, derived_notes)
 
         iteration = start_iteration + idx
         _log.info(
             "Phase 0 [%d/%d]：%s",
             idx + 1, n_trials,
-            {_short_var_name(k): round(v, 4) for k, v in design_vars.items()
+            {_short_var_name(k): round(v, 4) for k, v in design_vars_repaired.items()
              if k in config.param_bounds},
         )
 
@@ -803,6 +855,7 @@ def _feasibility_search(
                 notes=f"driver 连接断开：{exc}",
             )
             cases.append(case)
+            case_xs.append(x_eval)
             _save_case(db, case, config.session_id)
             break
         except Exception as exc:
@@ -814,6 +867,7 @@ def _feasibility_search(
             )
 
         cases.append(case)
+        case_xs.append(x_eval)
         _save_case(db, case, config.session_id)
 
         if case.feasible is True:
@@ -829,7 +883,7 @@ def _feasibility_search(
         "Phase 0 完成：运行 %d 次，找到 %d 个可行点。",
         len(cases), n_feasible,
     )
-    return cases, driver_dead
+    return cases, driver_dead, case_xs
 
 
 def _lhs_sample(

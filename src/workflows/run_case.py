@@ -827,19 +827,19 @@ def _parse_stream_records(records: list[TreeValueRecord]) -> dict[str, Any]:
     """
     将 TreeValueRecord 列表解析为 stream_result_from_runner 的关键字参数。
 
-    rel_path 约定（output_subtree="Output\\STR_MAIN", max_depth=3，路径分隔符统一为 /）：
-      TEMP/MIXED            → temp / temp_unit
-      PRES/MIXED            → pres / pres_unit
-      VFRAC/MIXED           → vfrac
-      MOLEFLMX/MIXED        → total_mole_flow / total_mole_flow_unit
-      MASSFLMX/MIXED        → total_mass_flow / total_mass_flow_unit
-      MOLEFLOW/MIXED/{comp} → ComponentFlow.mole_flow
-      MASSFLOW/MIXED/{comp} → ComponentFlow.mass_flow
-      MOLEFRAC/MIXED/{comp} → ComponentFlow.mole_frac
-      MASSFRAC/MIXED/{comp} → ComponentFlow.mass_frac
+    rel_path 约定（路径分隔符统一为 /）：
+      TEMP/MIXED 或 TEMP            → temp / temp_unit
+      PRES/MIXED 或 PRES            → pres / pres_unit
+      VFRAC/MIXED 或 VFRAC          → vfrac
+      MOLEFLMX/MIXED                → total_mole_flow / total_mole_flow_unit
+      MASSFLMX/MIXED                → total_mass_flow / total_mass_flow_unit
+      MOLEFLOW/MIXED/{comp}         → ComponentFlow.mole_flow
+      MASSFLOW/MIXED/{comp}         → ComponentFlow.mass_flow
+      MOLEFRAC/MIXED/{comp}         → ComponentFlow.mole_frac
+      MASSFRAC/MIXED/{comp}         → ComponentFlow.mass_frac
 
-    注意：STR_MAIN 子树中 TEMP/PRES/VFRAC 均带 /MIXED 后缀，
-    与直接从 Output 提取时的路径格式不同。
+    STR_MAIN 子树中 TEMP/PRES/VFRAC 带 /MIXED 后缀；直接从 Output 提取时
+    可能只有顶层名称（无 /MIXED）。两种格式均兼容，/MIXED 优先。
 
     失败节点（error is not None）已由调用方收集，此处仅处理成功记录。
     """
@@ -849,13 +849,21 @@ def _parse_stream_records(records: list[TreeValueRecord]) -> dict[str, Any]:
         if r.error is None
     }
 
-    def _val(key: str) -> Any:
-        r = rec_map.get(key)
-        return r.value if r else None
+    def _val(*keys: str) -> Any:
+        """按优先级依次查找，返回第一个命中的值；全部缺失时返回 None。"""
+        for key in keys:
+            r = rec_map.get(key)
+            if r is not None:
+                return r.value
+        return None
 
-    def _unit(key: str) -> str:
-        r = rec_map.get(key)
-        return r.unit if r else ""
+    def _unit(*keys: str) -> str:
+        """按优先级依次查找，返回第一个命中的单位；全部缺失时返回空串。"""
+        for key in keys:
+            r = rec_map.get(key)
+            if r is not None:
+                return r.unit
+        return ""
 
     comp_data: dict[str, ComponentFlow] = {}
     for rel_path, rec in rec_map.items():
@@ -876,11 +884,12 @@ def _parse_stream_records(records: list[TreeValueRecord]) -> dict[str, Any]:
             cf.mass_frac = rec.value
 
     return {
-        "temp":                  _val("TEMP/MIXED"),
-        "temp_unit":             _unit("TEMP/MIXED"),
-        "pres":                  _val("PRES/MIXED"),
-        "pres_unit":             _unit("PRES/MIXED"),
-        "vfrac":                 _val("VFRAC/MIXED"),
+        # /MIXED 优先；回退到无后缀形式（直接从 Output 提取的路径）
+        "temp":                  _val("TEMP/MIXED",    "TEMP"),
+        "temp_unit":             _unit("TEMP/MIXED",   "TEMP"),
+        "pres":                  _val("PRES/MIXED",    "PRES"),
+        "pres_unit":             _unit("PRES/MIXED",   "PRES"),
+        "vfrac":                 _val("VFRAC/MIXED",   "VFRAC"),
         "total_mole_flow":       _val("MOLEFLMX/MIXED"),
         "total_mole_flow_unit":  _unit("MOLEFLMX/MIXED"),
         "total_mass_flow":       _val("MASSFLMX/MIXED"),

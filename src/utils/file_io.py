@@ -98,8 +98,9 @@ def _parse_driver_kwargs(cfg: dict) -> dict[str, Any]:
     """从 simulator 节提取 AspenDriver 构造参数。"""
     sim = cfg.get("simulator", {})
     return {
-        "visible":          bool(sim.get("visible", False)),
-        "suppress_dialogs": bool(sim.get("suppress_dialogs", True)),
+        "visible":              bool(sim.get("visible", False)),
+        "suppress_dialogs":     bool(sim.get("suppress_dialogs", True)),
+        "require_type_library": bool(sim.get("require_type_library", False)),
     }
 
 def _parse_sim_filepath(cfg: dict, yaml_path: Path) -> Path:
@@ -171,7 +172,7 @@ def _build_run_config(cfg: dict) -> Any:
 # 设计变量解析（单目标和多目标共用）
 # ---------------------------------------------------------------------------
 
-def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set]:
+def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set, list[dict[str, Any]]]:
     """
     从 YAML 解析设计变量，返回 (param_bounds, fixed_vars, integer_var_paths)。
 
@@ -182,8 +183,29 @@ def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set]:
     param_bounds: dict[str, tuple[float, float]] = {}
     fixed_vars:   dict[str, Any] = {}
     integer_var_paths: set[str] = set()
+    derived_var_specs: list[dict[str, Any]] = []
 
     for dv in cfg.get("design_variables", []):
+        dv_type = dv.get("type", "continuous")
+        if dv_type == "derived":
+            frac_path = str(dv["name"])
+            target_path = str(dv["target_path"])
+            depends_on = str(dv["depends_on"])
+            lo_frac = float(dv["lo_frac"])
+            hi_frac = float(dv["hi_frac"])
+            param_bounds[frac_path] = (lo_frac, hi_frac)
+            derived_var_specs.append({
+                "frac_path": frac_path,
+                "target_path": target_path,
+                "depends_on": depends_on,
+                "frac_lo": int(dv.get("frac_lo", dv.get("lower_bound", 1))),
+            })
+            _log.debug(
+                "derived design variable '%s': frac [%s, %s] -> %s depends_on=%s",
+                frac_path, lo_frac, hi_frac, target_path, depends_on,
+            )
+            continue
+
         path    = dv["aspen_path"]
         dv_type = dv.get("type", "continuous")
         if dv_type == "continuous":
@@ -202,7 +224,7 @@ def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set]:
                 dv.get("name", path), dv_type, fixed_vars[path],
             )
 
-    return param_bounds, fixed_vars, integer_var_paths
+    return param_bounds, fixed_vars, integer_var_paths, derived_var_specs
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +245,7 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     from ..workflows.optimize_case import OptimizeCaseConfig
 
     opt = cfg.get("optimizer", {})
-    param_bounds, fixed_vars, integer_paths = _parse_design_variables(cfg)
+    param_bounds, fixed_vars, integer_paths, derived_var_specs = _parse_design_variables(cfg)
 
     if not param_bounds:
         raise ValueError(
@@ -264,6 +286,7 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         surrogate_model = surrogate_model,  # type: ignore[arg-type]
         random_seed     = opt.get("random_seed"),
         integer_var_paths = integer_paths,
+        derived_var_specs = derived_var_specs,
     )
 
 
@@ -272,7 +295,7 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     from ..workflows.optimize_pareto_case import ParetoOptimizeCaseConfig
 
     opt = cfg.get("optimizer", {})
-    param_bounds, fixed_vars, integer_var_paths = _parse_design_variables(cfg)
+    param_bounds, fixed_vars, integer_var_paths, derived_var_specs = _parse_design_variables(cfg)
 
     if not param_bounds:
         raise ValueError(
@@ -335,11 +358,17 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         "已加载多目标配置：%d 个目标（%s），%d 个连续变量，%d 个 integer 变量，"
         "n_initial=%d，n_iterations=%d，scalarization=%s。",
         len(objective_names), objective_names,
-        len(param_bounds) - len(integer_var_paths), len(integer_var_paths),
+        len(param_bounds) - len(integer_var_paths) - len(derived_var_specs), len(integer_var_paths),
         n_initial, n_iterations, scalarization,
     )
 
     # 解析 var_dependencies（变量依赖约束，如 FEED_STAGE < NSTAGE）
+    for spec in derived_var_specs:
+        _log.info(
+            "derived var: %s -> %s (depends_on=%s, frac_lo=%s)",
+            spec["frac_path"], spec["target_path"], spec["depends_on"], spec["frac_lo"],
+        )
+
     var_deps_raw = cfg.get("var_dependencies") or {}
     var_dependencies: dict[str, dict[str, str]] = {}
     for var_path, dep_rules in var_deps_raw.items():
@@ -379,6 +408,7 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         tags            = tags,
         random_seed     = opt.get("random_seed"),
         integer_var_paths  = integer_var_paths,
+        derived_var_specs  = derived_var_specs,
         var_dependencies   = var_dependencies,
         feasibility_search = feasibility_search,
     )

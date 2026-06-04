@@ -26,13 +26,13 @@
 #   D2 中 NPA 摩尔分率 >= 0.999  （Aspen 内部组分名 NPA，MATLAB 注释称 BUAC/乙酸丁酯）
 #   D3 中 WATER 摩尔分率 >= 0.999
 #
-# 设计变量策略（选项 A：NSTAGE + FEED_STAGE 全部放开，var_dependencies 保障合法性）：
-#   连续变量（6 个）：各塔回流比（RR）、各塔操作压力（P）
-#   整数变量（8 个）：NSTAGE × 3 + FEED_STAGE × 5（skopt.Integer 搜索）
+# 设计变量策略：NSTAGE + 主进料板比例 derived 映射，S1/S2 保留整数约束：
+#   连续搜索变量（9 个）：各塔回流比（RR）、各塔操作压力（P）、主进料板 frac × 3
+#   整数变量（5 个）：NSTAGE × 3 + S1/S2 FEED_STAGE × 2（skopt.Integer 搜索）
 #   固定变量（2 个）：萃取剂流量（SOL × 2）
-#   总搜索维度：14 维（6 连续 + 8 整数）
-#   var_dependencies：5 条 lt 约束保证 FEED_STAGE < NSTAGE，防止 Aspen 写入越界；
-#   repair_design_vars() 在每次仿真前自动修复违约点。
+#   总搜索维度：14 维（9 连续/derived + 5 整数）
+#   derived：F1/F2/F3 用 frac → FEED_STAGE 映射，避免贴底板/越界采样；
+#   var_dependencies：S1/S2 两条 lt 约束保证 FEED_STAGE < NSTAGE。
 #
 # 注意：本工艺为真空操作系统，各塔操作压力均在 0.06~0.18 atm 范围内。
 #   初始值和搜索范围均基于 .bkp 文件中的原始收敛解：
@@ -48,6 +48,7 @@ simulator:
   filepath: cases/demo_case_2/2epsd.bkp
   visible: false
   suppress_dialogs: true
+  require_type_library: true   # 强制加载 HAP 类型库，确保 block 状态检查可用
   timeout: 300
   reinit: true
   verify_inputs: true
@@ -56,11 +57,11 @@ simulator:
 # ---------------------------------------------------------------------------
 # 设计变量
 # ---------------------------------------------------------------------------
-# 连续变量（参与贝叶斯优化）：6 个
-# 整数变量（参与贝叶斯优化，skopt.Integer）：8 个（NSTAGE × 3 + FEED_STAGE × 5）
+# 连续变量（参与贝叶斯优化）：9 个（6 个常规连续变量 + 3 个 derived frac）
+# 整数变量（参与贝叶斯优化，skopt.Integer）：5 个（NSTAGE × 3 + S1/S2 FEED_STAGE × 2）
 # 固定变量（不参与优化）：2 个（SOL × 2）
-# 总搜索维度：14 维（6 连续 + 8 整数）
-# var_dependencies 保证 FEED_STAGE < NSTAGE，防止 Aspen 写入越界
+# 总搜索维度：14 维（9 连续/derived + 5 整数）
+# F1/F2/F3 使用 derived frac 映射；S1/S2 使用 var_dependencies 保证 FEED_STAGE < NSTAGE
 design_variables:
 
   # ── T1 塔 ──────────────────────────────────────────────────────────────
@@ -82,13 +83,14 @@ design_variables:
     initial_value: 50
     unit: "-"
 
-  - name: T1_FEED_F1
-    description: T1 主进料 F1 进料板位置（原始值=28；受 T1_NSTAGE 约束，上界取 NSTAGE-1=69）
-    aspen_path: \Data\Blocks\T1\Input\FEED_STAGE\F1
-    type: integer
-    lower_bound: 5
-    upper_bound: 69
-    initial_value: 28
+  - name: T1_FEED_F1_FRAC
+    description: T1 主进料 F1 比例进料板位置，运行前映射为 FEED_STAGE\F1
+    type: derived
+    lo_frac: 0.35
+    hi_frac: 0.85
+    target_path: \Data\Blocks\T1\Input\FEED_STAGE\F1
+    depends_on: \Data\Blocks\T1\Input\NSTAGE
+    frac_lo: 5
     unit: "-"
 
   - name: T1_FEED_S1
@@ -128,13 +130,14 @@ design_variables:
     initial_value: 118
     unit: "-"
 
-  - name: T2_FEED_F2
-    description: T2 主进料 F2 进料板位置（原始值=108；受 T2_NSTAGE 约束，上界取 NSTAGE-1=149）
-    aspen_path: \Data\Blocks\T2\Input\FEED_STAGE\F2
-    type: integer
-    lower_bound: 10
-    upper_bound: 149
-    initial_value: 108
+  - name: T2_FEED_F2_FRAC
+    description: T2 主进料 F2 比例进料板位置，运行前映射为 FEED_STAGE\F2
+    type: derived
+    lo_frac: 0.65
+    hi_frac: 0.92
+    target_path: \Data\Blocks\T2\Input\FEED_STAGE\F2
+    depends_on: \Data\Blocks\T2\Input\NSTAGE
+    frac_lo: 10
     unit: "-"
 
   - name: T2_FEED_S2
@@ -174,13 +177,14 @@ design_variables:
     initial_value: 14
     unit: "-"
 
-  - name: T3_FEED_F3
-    description: T3 主进料 F3 进料板位置（原始值=6；受 T3_NSTAGE 约束，上界取 NSTAGE-1=21）
-    aspen_path: \Data\Blocks\T3\Input\FEED_STAGE\F3
-    type: integer
-    lower_bound: 3
-    upper_bound: 21
-    initial_value: 6
+  - name: T3_FEED_F3_FRAC
+    description: T3 主进料 F3 比例进料板位置，运行前映射为 FEED_STAGE\F3
+    type: derived
+    lo_frac: 0.25
+    hi_frac: 0.80
+    target_path: \Data\Blocks\T3\Input\FEED_STAGE\F3
+    depends_on: \Data\Blocks\T3\Input\NSTAGE
+    frac_lo: 3
     unit: "-"
 
   - name: T3_PRES
@@ -365,20 +369,14 @@ optimizer:
 
 # ---------------------------------------------------------------------------
 # 变量依赖约束
-# FEED_STAGE 均为整数优化变量，必须满足 < 对应塔的 NSTAGE，
-# repair_design_vars() 会在每次仿真前自动修复违约点。
+# S1/S2 为整数优化变量，必须满足 < 对应塔的 NSTAGE。
+# F1/F2/F3 已由 derived frac 映射保证合法，不再放入 var_dependencies。
 # ---------------------------------------------------------------------------
 var_dependencies:
-  \Data\Blocks\T1\Input\FEED_STAGE\F1:
-    lt: \Data\Blocks\T1\Input\NSTAGE
   \Data\Blocks\T1\Input\FEED_STAGE\S1:
     lt: \Data\Blocks\T1\Input\NSTAGE
-  \Data\Blocks\T2\Input\FEED_STAGE\F2:
-    lt: \Data\Blocks\T2\Input\NSTAGE
   \Data\Blocks\T2\Input\FEED_STAGE\S2:
     lt: \Data\Blocks\T2\Input\NSTAGE
-  \Data\Blocks\T3\Input\FEED_STAGE\F3:
-    lt: \Data\Blocks\T3\Input\NSTAGE
 
 # ---------------------------------------------------------------------------
 # Phase 0 可行性搜索（在 Phase 1 DOE 之前先找可行点）

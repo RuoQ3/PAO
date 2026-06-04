@@ -49,12 +49,7 @@ _DDL = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
--- 硬迁移：重建 cases 表（新增 session_id 列）
-DROP TABLE IF EXISTS tags;
-DROP TABLE IF EXISTS objectives;
-DROP TABLE IF EXISTS cases;
-
-CREATE TABLE cases (
+CREATE TABLE IF NOT EXISTS cases (
     case_id               TEXT    PRIMARY KEY,
     session_id            TEXT    NOT NULL DEFAULT '',
     iteration             INTEGER NOT NULL,
@@ -76,6 +71,7 @@ CREATE TABLE cases (
     sim_result            TEXT,
     blocks                TEXT    NOT NULL DEFAULT '{}',
     streams               TEXT    NOT NULL DEFAULT '{}',
+    semantic_blocks       TEXT    NOT NULL DEFAULT '{}',
     created_at            TEXT    NOT NULL
 );
 
@@ -109,6 +105,13 @@ CREATE INDEX IF NOT EXISTS idx_tags_tag     ON tags (tag);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_case_tag ON tags (case_id, tag);
 """
 
+# 列迁移：已有数据库缺少新列时自动补齐，不清空数据。
+# 每条 (表名, 列名, DDL 片段) 在 __init__ 里通过 PRAGMA table_info 检查后按需执行。
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("cases", "session_id",      "ALTER TABLE cases ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"),
+    ("cases", "semantic_blocks", "ALTER TABLE cases ADD COLUMN semantic_blocks TEXT NOT NULL DEFAULT '{}'"),
+]
+
 # query_cases / query_by_objective 返回的摘要列（不含 blocks/streams/sim_result）
 _SUMMARY_COLS = (
     "case_id", "session_id", "iteration", "status",
@@ -136,7 +139,20 @@ class SimulationDB:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_DDL)
+        self._apply_migrations()
         self._conn.commit()
+
+    def _apply_migrations(self) -> None:
+        """
+        幂等列迁移：检查 _MIGRATIONS 中每列是否存在，不存在则 ALTER TABLE 补列。
+        用于将旧版数据库升级到当前 schema，不清空任何数据。
+        """
+        for table, column, alter_sql in _MIGRATIONS:
+            cur = self._conn.execute(f"PRAGMA table_info({table})")
+            existing = {row["name"] for row in cur.fetchall()}
+            if column not in existing:
+                self._conn.execute(alter_sql)
+                _log.info("数据库迁移：%s.%s 列已补齐。", table, column)
 
     # ------------------------------------------------------------------ #
     # 上下文管理器
@@ -201,12 +217,12 @@ class SimulationDB:
         case_id = d["case_id"]
         simulation_valid = bool(d.get("simulation_valid", False))
 
-        # 仿真未收敛时，blocks/streams 快照不可信，拒绝写入非空数据
+        # 仿真未收敛时，blocks/streams/semantic_blocks 快照不可信，拒绝写入非空数据
         if not simulation_valid:
-            if d.get("blocks") or d.get("streams"):
+            if d.get("blocks") or d.get("streams") or d.get("semantic_blocks"):
                 raise ValueError(
-                    f"case '{case_id}'：simulation_valid=False 但 blocks/streams 非空，"
-                    "拒绝写入不可信的仿真快照。请在上游将失败工况的 blocks/streams 清空后再入库。"
+                    f"case '{case_id}'：simulation_valid=False 但 blocks/streams/semantic_blocks 非空，"
+                    "拒绝写入不可信的仿真快照。请在上游将失败工况的 blocks/streams/semantic_blocks 清空后再入库。"
                 )
 
         feasible = d.get("feasible")
@@ -220,9 +236,9 @@ class SimulationDB:
                 has_constraints, objectives_available, constraints_available,
                 run_time, source_filepath, run_id, notes,
                 design_vars, objectives_json, constraints_json, tags_json,
-                sim_result, blocks, streams, created_at
+                sim_result, blocks, streams, semantic_blocks, created_at
             ) VALUES (
-                ?,?,?,?,  ?,?,?,  ?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,  ?
+                ?,?,?,?,  ?,?,?,  ?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,?,  ?
             )
             """,
             (
@@ -240,14 +256,15 @@ class SimulationDB:
                 d.get("source_filepath"),
                 d.get("run_id"),
                 d.get("notes", ""),
-                json.dumps(d.get("design_vars", {}), ensure_ascii=False, default=str),
-                json.dumps(d.get("objectives", []),  ensure_ascii=False, default=str),
-                json.dumps(d.get("constraints", []), ensure_ascii=False, default=str),
-                json.dumps(d.get("tags", []),        ensure_ascii=False),
-                json.dumps(d.get("sim_result"),      ensure_ascii=False, default=str)
+                json.dumps(d.get("design_vars", {}),      ensure_ascii=False, default=str),
+                json.dumps(d.get("objectives", []),        ensure_ascii=False, default=str),
+                json.dumps(d.get("constraints", []),       ensure_ascii=False, default=str),
+                json.dumps(d.get("tags", []),              ensure_ascii=False),
+                json.dumps(d.get("sim_result"),            ensure_ascii=False, default=str)
                     if d.get("sim_result") is not None else None,
-                json.dumps(d.get("blocks", {}),      ensure_ascii=False, default=str),
-                json.dumps(d.get("streams", {}),     ensure_ascii=False, default=str),
+                json.dumps(d.get("blocks", {}),            ensure_ascii=False, default=str),
+                json.dumps(d.get("streams", {}),           ensure_ascii=False, default=str),
+                json.dumps(d.get("semantic_blocks", {}),   ensure_ascii=False, default=str),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -512,7 +529,8 @@ class SimulationDB:
         d["objectives"]    = self._decode_json(d.pop("objectives_json"),   [])
         d["constraints"]   = self._decode_json(d.pop("constraints_json"),  [])
         d["tags"]          = self._decode_json(d.pop("tags_json"),         [])
-        d["sim_result"]    = self._decode_json(d.get("sim_result"),        None)
-        d["blocks"]        = self._decode_json(d.get("blocks"),            {})
-        d["streams"]       = self._decode_json(d.get("streams"),           {})
+        d["sim_result"]        = self._decode_json(d.get("sim_result"),        None)
+        d["blocks"]            = self._decode_json(d.get("blocks"),            {})
+        d["streams"]           = self._decode_json(d.get("streams"),           {})
+        d["semantic_blocks"]   = self._decode_json(d.get("semantic_blocks"),   {})
         return d

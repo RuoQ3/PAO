@@ -391,6 +391,9 @@ class ProcessCase:
             "sim_result": sim_dict,
             "blocks": {name: b.to_dict() for name, b in self.blocks.items()},
             "streams": {name: s.to_dict() for name, s in self.streams.items()},
+            "semantic_blocks": {
+                name: sb.to_dict() for name, sb in self.semantic_blocks.items()
+            },
         }
 
     def summary(self) -> dict[str, Any]:
