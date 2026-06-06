@@ -208,7 +208,11 @@ def main(argv: list[str] | None = None) -> int:
     if is_pareto:
         try:
             from src.reporting.plot_pareto import generate_pareto_report
-            generate_pareto_report(db_path, out_dir=db_path.parent)
+            generate_pareto_report(
+                db_path,
+                out_dir=db_path.parent,
+                session_id=getattr(result, "session_id", None),
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("可视化报告生成失败（不影响结果）：%s", exc)
 

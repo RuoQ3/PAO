@@ -18,6 +18,33 @@ _log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# 工具 helper：与执行层 _parse_feasibility_filter 对齐的 enabled 解析
+# ---------------------------------------------------------------------------
+
+def _ff_enabled(ff: Any) -> bool:
+    """
+    从 feasibility_filter dict 中解析 enabled 字段，与执行层语义完全一致。
+
+    - 非 dict → False（类型错误，不展示）
+    - enabled 不存在 → False
+    - True/False → 直接使用
+    - 0/1 (int) → bool 转换
+    - "true"/"false"（大小写不敏感）→ 正确转换
+    - 其他（"yes"、1.0 等）→ False（展示层对异常值保守处理，不展示）
+    """
+    if not isinstance(ff, dict):
+        return False
+    v = ff.get("enabled", False)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return False
+
+
+# ---------------------------------------------------------------------------
 # 各配置段的格式化函数
 # ---------------------------------------------------------------------------
 
@@ -166,6 +193,16 @@ def _fmt_optimizer(opt: dict) -> str:
         lines.append(f"  随机种子     : {opt['random_seed']}")
     if opt.get("reference_point"):
         lines.append(f"  参考点       : {opt['reference_point']}")
+
+    # feasibility_filter — 只在 enabled 严格解析为 True 时展示，避免噪声
+    ff_raw = opt.get("feasibility_filter")
+    if isinstance(ff_raw, dict) and _ff_enabled(ff_raw):
+        lines.append("  ── 候选池可行性过滤（BO 阶段）──")
+        lines.append(f"  FF 模型      : {ff_raw.get('model', 'extra_trees')}")
+        lines.append(f"  FF 最少样本  : {ff_raw.get('min_samples', 10)}")
+        lines.append(f"  FF 阈值      : {ff_raw.get('threshold', 0.5)}")
+        lines.append(f"  FF 候选池大小: {ff_raw.get('candidate_pool_size', 200)}")
+
     return "\n".join(lines)
 
 
@@ -266,6 +303,82 @@ def _fmt_validation_warnings(cfg: dict) -> list[str]:
             warnings.append(
                 f"⚠ optimizer.reference_point 维度 {len(ref)} 与目标数 {len(objs)} 不匹配。"
             )
+
+    # feasibility_filter 轻量校验（不做完整解析，仅检查明显非法值）
+    ff_raw = opt.get("feasibility_filter")
+    if ff_raw is not None:
+        # 类型检查：必须是 dict
+        if not isinstance(ff_raw, dict):
+            warnings.append(
+                f"⚠ optimizer.feasibility_filter 必须是 dict，"
+                f"收到 {type(ff_raw).__name__!r}：{ff_raw!r}。"
+            )
+        else:
+            ff = ff_raw
+            # enabled 严格性检查（与执行层 _parse_feasibility_filter 对齐）
+            enabled_v = ff.get("enabled")
+            if enabled_v is not None and not isinstance(enabled_v, bool):
+                if isinstance(enabled_v, str):
+                    # "true"/"false"（大小写不敏感）合法；其他字符串报警告
+                    if enabled_v.strip().lower() not in ("true", "false"):
+                        warnings.append(
+                            f"⚠ optimizer.feasibility_filter.enabled={enabled_v!r} 无法识别，"
+                            "请使用 YAML 布尔值 true 或 false（不要加引号）。"
+                        )
+                elif isinstance(enabled_v, int):
+                    # 0/1 合法；其他 int 执行层会报错
+                    if enabled_v not in (0, 1):
+                        warnings.append(
+                            f"⚠ optimizer.feasibility_filter.enabled={enabled_v!r} 不合法，"
+                            "只接受 0/1 的整数等价值，推荐直接使用 true / false。"
+                        )
+                else:
+                    warnings.append(
+                        f"⚠ optimizer.feasibility_filter.enabled={enabled_v!r}"
+                        f"（{type(enabled_v).__name__}）类型不合法，请使用 true 或 false。"
+                    )
+            _VALID_FF_MODELS = {"extra_trees", "random_forest", "random"}
+            ff_model = ff.get("model", "extra_trees")
+            if ff_model not in _VALID_FF_MODELS:
+                warnings.append(
+                    f"⚠ optimizer.feasibility_filter.model={ff_model!r} 不合法，"
+                    f"支持值：{sorted(_VALID_FF_MODELS)}。"
+                )
+            ff_threshold = ff.get("threshold")
+            if ff_threshold is not None:
+                try:
+                    t = float(ff_threshold)
+                    if not (0.0 <= t <= 1.0):
+                        warnings.append(
+                            f"⚠ optimizer.feasibility_filter.threshold={ff_threshold} "
+                            "必须在 [0.0, 1.0] 之间。"
+                        )
+                except (TypeError, ValueError):
+                    warnings.append(
+                        f"⚠ optimizer.feasibility_filter.threshold={ff_threshold!r} 无法转为浮点数。"
+                    )
+            ff_pool = ff.get("candidate_pool_size")
+            if ff_pool is not None:
+                try:
+                    if int(ff_pool) < 1:
+                        warnings.append(
+                            f"⚠ optimizer.feasibility_filter.candidate_pool_size={ff_pool} 必须 >= 1。"
+                        )
+                except (TypeError, ValueError):
+                    warnings.append(
+                        f"⚠ optimizer.feasibility_filter.candidate_pool_size={ff_pool!r} 无法转为整数。"
+                    )
+            ff_ms = ff.get("min_samples")
+            if ff_ms is not None:
+                try:
+                    if int(ff_ms) < 1:
+                        warnings.append(
+                            f"⚠ optimizer.feasibility_filter.min_samples={ff_ms} 必须 >= 1。"
+                        )
+                except (TypeError, ValueError):
+                    warnings.append(
+                        f"⚠ optimizer.feasibility_filter.min_samples={ff_ms!r} 无法转为整数。"
+                    )
 
     return warnings
 

@@ -54,7 +54,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 数据读取
 # ---------------------------------------------------------------------------
 
-def _detect_objectives(cur: sqlite3.Cursor) -> tuple[str, str]:
+def _detect_objectives(cur: sqlite3.Cursor, session_id: str | None = None) -> tuple[str, str]:
     """
     从 objectives 表自动检测两个目标名称。
 
@@ -62,15 +62,29 @@ def _detect_objectives(cur: sqlite3.Cursor) -> tuple[str, str]:
     1. 若存在 TAC 和 EMISSIONS，保持向后兼容。
     2. 否则取 available=1 中出现次数最多的前两个名称。
 
+    指定 session_id 时仅在该优化 session 的工况内检测，避免历史 session
+    使用不同目标组合（如旧库为 TAC/EMISSIONS、本轮为 CAPEX/OPEX）时
+    误选到全库目标。
+
     返回 (obj_x_name, obj_y_name)。
     """
-    cur.execute("""
-        SELECT name, COUNT(*) AS cnt
-        FROM objectives
-        WHERE available = 1
-        GROUP BY name
-        ORDER BY cnt DESC, name ASC
-    """)
+    if session_id is not None:
+        cur.execute("""
+            SELECT o.name, COUNT(*) AS cnt
+            FROM objectives o
+            JOIN cases c ON c.case_id = o.case_id
+            WHERE o.available = 1 AND c.session_id = ?
+            GROUP BY o.name
+            ORDER BY cnt DESC, o.name ASC
+        """, (session_id,))
+    else:
+        cur.execute("""
+            SELECT name, COUNT(*) AS cnt
+            FROM objectives
+            WHERE available = 1
+            GROUP BY name
+            ORDER BY cnt DESC, name ASC
+        """)
     names = [r[0] for r in cur.fetchall()]
 
     if not names:
@@ -87,14 +101,21 @@ def _detect_objectives(cur: sqlite3.Cursor) -> tuple[str, str]:
     return names[0], names[1]
 
 
-def load_data(db_path: Path) -> dict:
-    """从 simulation.db 读取所有绘图所需数据，返回统一结构。"""
+def load_data(db_path: Path, session_id: str | None = None) -> dict:
+    """从 simulation.db 读取所有绘图所需数据，返回统一结构。
+
+    Parameters
+    ----------
+    db_path : 数据库文件路径
+    session_id : 若指定，则仅读取该优化 session 的工况；为 None 时读取全库历史数据。
+    """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    obj_x, obj_y = _detect_objectives(cur)
+    obj_x, obj_y = _detect_objectives(cur, session_id=session_id)
     log.info("检测到目标：X=%s, Y=%s", obj_x, obj_y)
 
+    session_filter = "AND c.session_id = ?" if session_id is not None else ""
     cur.execute(f"""
         SELECT c.case_id, c.iteration, c.status, c.feasible,
                MAX(CASE WHEN o.name=? THEN o.value   END) AS obj_x,
@@ -105,17 +126,21 @@ def load_data(db_path: Path) -> dict:
                MAX(CASE WHEN o.name=? THEN o.unit    END) AS obj_y_unit
         FROM cases c
         JOIN objectives o ON c.case_id = o.case_id AND o.available = 1
+        WHERE 1=1 {session_filter}
         GROUP BY c.case_id
         HAVING obj_x IS NOT NULL AND obj_y IS NOT NULL
         ORDER BY c.iteration
-    """, (obj_x, obj_y, obj_x, obj_y, obj_x, obj_y))
+    """, (obj_x, obj_y, obj_x, obj_y, obj_x, obj_y)
+         + ((session_id,) if session_id is not None else ()))
     rows = cur.fetchall()
 
-    cur.execute("""
+    dv_filter = "AND session_id = ?" if session_id is not None else ""
+    cur.execute(f"""
         SELECT design_vars FROM cases
         WHERE status = 'success' AND feasible = 1
           AND design_vars IS NOT NULL
-    """)
+          {dv_filter}
+    """, (session_id,) if session_id is not None else ())
     dv_rows = cur.fetchall()
 
     conn.close()
@@ -456,7 +481,11 @@ def plot_design_vars(design_vars: list[dict], out_dir: Path) -> Path | None:
 # 统一入口（框架调用）
 # ---------------------------------------------------------------------------
 
-def generate_pareto_report(db_path: Path | str, out_dir: Path | str | None = None) -> None:
+def generate_pareto_report(
+    db_path: Path | str,
+    out_dir: Path | str | None = None,
+    session_id: str | None = None,
+) -> None:
     """
     从 simulation.db 自动生成 Pareto 可视化图表，保存到 out_dir。
 
@@ -464,15 +493,19 @@ def generate_pareto_report(db_path: Path | str, out_dir: Path | str | None = Non
     ----------
     db_path : 数据库文件路径
     out_dir : 输出目录；默认与数据库文件同目录
+    session_id : 若指定，则仅绘制该优化 session 的结果；为 None 时绘制全库历史数据
     """
     db_path = Path(db_path)
     out_dir = Path(out_dir) if out_dir else db_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("生成 Pareto 报告：%s → %s", db_path.name, out_dir)
+    if session_id is not None:
+        log.info("生成 Pareto 报告：%s → %s，session_id=%s", db_path.name, out_dir, session_id)
+    else:
+        log.info("生成 Pareto 报告：%s → %s，全库历史数据", db_path.name, out_dir)
 
     try:
-        data = load_data(db_path)
+        data = load_data(db_path, session_id=session_id)
     except ValueError as exc:
         log.warning("跳过报告生成：%s", exc)
         return
@@ -480,9 +513,10 @@ def generate_pareto_report(db_path: Path | str, out_dir: Path | str | None = Non
     cases       = data["cases"]
     design_vars = data["design_vars"]
     n_feasible  = sum(1 for c in cases if c["feasible"])
+    scope = f"session_id={session_id}" if session_id is not None else "全库历史"
     log.info(
-        "读取工况：共 %d 条，可行 %d，不可行 %d",
-        len(cases), n_feasible, len(cases) - n_feasible,
+        "读取工况：%s，共 %d 条，可行 %d，不可行 %d",
+        scope, len(cases), n_feasible, len(cases) - n_feasible,
     )
 
     if not cases:
@@ -512,6 +546,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PAO 优化结果可视化")
     parser.add_argument("db",    help="simulation.db 路径")
     parser.add_argument("--out", default=None, help="输出目录（默认与 db 同目录）")
+    parser.add_argument(
+        "--session-id", default=None,
+        help="仅绘制指定优化 session（默认绘制全库历史数据）",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db).resolve()
@@ -521,7 +559,7 @@ def main() -> None:
 
     # 使用标准输出打印（CLI 模式不依赖 logging 配置）
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    generate_pareto_report(db_path, args.out)
+    generate_pareto_report(db_path, args.out, session_id=args.session_id)
     print("完成。")
 
 

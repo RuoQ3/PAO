@@ -139,6 +139,23 @@ optimizer:
 
 ---
 
+## Agent Workflow MVP
+
+`src/agents/workflows.py` 提供了 **`run_demo_case_workflow`**，作为 agent 控制层的阶段 1 MVP。它编排现有底层 tools，输出结构化报告，不直接操作 Aspen COM 接口。
+
+```bash
+# 验证配置（不启动 Aspen）
+python scripts/smoke_agent_workflow.py --config cases/demo_case/pareto_config.yaml --mode validate
+
+# 完整运行（会启动 Aspen，消耗仿真时间）
+# ⚠ full 前请先执行 preflight，并推荐使用隔离目录，避免污染原始数据库
+python scripts/smoke_agent_workflow.py --config cases/demo_case/pareto_config.yaml --mode full --allow-aspen
+```
+
+完整说明（调用方式、安全限制、报告结构、当前局限）见 **[docs/agent_workflow_mvp.md](docs/agent_workflow_mvp.md)**。
+
+---
+
 ## 工作流说明
 
 ```
@@ -176,7 +193,7 @@ PAO/
 │   ├── economics/               # TAC / 排放目标计算
 │   ├── knowledge/               # 领域知识库（预留）
 │   ├── literature/              # 文献参数提取（PDF → 表格 → 方程）
-│   ├── agents/                  # LLM 智能体（规划中）
+│   ├── agents/                  # LLM 智能体控制层（阶段 1 MVP 已实现）
 │   └── utils/                   # 日志、文件 IO、单位换算
 ├── tests/                       # pytest 测试套件（75+ 测试文件）
 ├── cases/                       # 示例案例与配置文件

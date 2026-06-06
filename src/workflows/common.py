@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -167,5 +168,174 @@ def apply_derived_vars(
     return expanded, notes
 
 
+def feasibility_feature_names(
+    param_paths: list[str],
+    derived_specs: list[dict[str, Any]],
+) -> list[str]:
+    """
+    Return feature names that are present in persisted Aspen input records.
+
+    Optimizer-space derived variables use a virtual ``frac_path`` such as
+    ``T1_FEED_F1_FRAC``. ``apply_derived_vars`` removes that virtual key before
+    calling Aspen and stores the real ``target_path`` in ProcessCase.design_vars.
+    The feasibility classifier trains on ProcessCase.design_vars, so it must use
+    the real target path for derived variables.
+    """
+    derived_targets = {
+        str(spec["frac_path"]): str(spec["target_path"])
+        for spec in derived_specs
+        if "frac_path" in spec and "target_path" in spec
+    }
+    return [derived_targets.get(path, path) for path in param_paths]
+
+
 def _short_name(path: str) -> str:
     return path.rsplit("\\", 1)[-1]
+
+
+# ---------------------------------------------------------------------------
+# 早停配置
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EarlyStoppingConfig:
+    """
+    贝叶斯优化早停配置。
+
+    Attributes
+    ----------
+    enabled:
+        是否启用早停。False（默认）时完全不影响旧流程。
+    min_iterations:
+        至少完成多少次总迭代（含 DOE）后才允许触发早停，默认 0。
+    patience:
+        连续多少轮无有效改善后停止，默认 10。
+    min_delta:
+        绝对改善阈值；改善量 < min_delta 不算有效改善，默认 0.0。
+    relative_delta:
+        相对改善阈值；改善比例 < relative_delta 不算有效改善。None 表示不检查，默认 None。
+    max_duplicate_suggestions:
+        候选池连续选到重复候选多少次后触发 early stop，默认 3。
+    check_hypervolume:
+        多目标是否用 hypervolume 改善作为判断依据，默认 True。
+    check_first_front:
+        多目标是否检查 Pareto 第一前沿变化，默认 True。
+    """
+    enabled: bool = False
+    min_iterations: int = 0
+    patience: int = 10
+    min_delta: float = 0.0
+    relative_delta: float | None = None
+    max_duplicate_suggestions: int = 3
+    check_hypervolume: bool = True
+    check_first_front: bool = True
+
+    def __post_init__(self) -> None:
+        if self.patience <= 0:
+            raise ValueError(
+                f"EarlyStoppingConfig.patience={self.patience} 必须 >= 1。"
+            )
+        if self.min_iterations < 0:
+            raise ValueError(
+                f"EarlyStoppingConfig.min_iterations={self.min_iterations} 必须 >= 0。"
+            )
+        if self.min_delta < 0.0:
+            raise ValueError(
+                f"EarlyStoppingConfig.min_delta={self.min_delta} 必须 >= 0。"
+            )
+        if self.relative_delta is not None and self.relative_delta < 0.0:
+            raise ValueError(
+                f"EarlyStoppingConfig.relative_delta={self.relative_delta} 必须 >= 0。"
+            )
+        if self.max_duplicate_suggestions < 1:
+            raise ValueError(
+                f"EarlyStoppingConfig.max_duplicate_suggestions="
+                f"{self.max_duplicate_suggestions} 必须 >= 1。"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 候选去重工具
+# ---------------------------------------------------------------------------
+
+def fingerprint_design_vars(
+    design_vars: dict[str, Any],
+    ndigits: int = 8,
+) -> tuple:
+    """
+    为设计变量 dict 生成稳定的去重 fingerprint。
+
+    浮点值 round 到 ndigits 位，整数直接保留，其余 str() 转换。
+    返回按键排序的 (key, value) 元组，可用作 set / frozenset 元素。
+
+    Parameters
+    ----------
+    design_vars:
+        ProcessCase.design_vars 或 full_candidates 中的 design_vars dict。
+    ndigits:
+        浮点值的保留精度，默认 8 位，足以区分 Aspen 参数空间中的不同点，
+        同时过滤掉 repair/derive 引入的浮点噪声。
+    """
+    result: list[tuple[str, Any]] = []
+    for k in sorted(design_vars.keys()):
+        v = design_vars[k]
+        if isinstance(v, float):
+            v = round(v, ndigits)
+        elif isinstance(v, int):
+            pass  # 整数不需要 round
+        else:
+            v = str(v)
+        result.append((k, v))
+    return tuple(result)
+
+
+def build_evaluated_set(
+    cases: list[Any],  # list[ProcessCase]
+) -> set[tuple]:
+    """
+    从历史 ProcessCase 列表中构造已评估过的 fingerprint 集合。
+
+    只包含 design_vars 非空的工况（PENDING 或空 design_vars 跳过）。
+    """
+    seen: set[tuple] = set()
+    for c in cases:
+        if c.design_vars:
+            seen.add(fingerprint_design_vars(c.design_vars))
+    return seen
+
+
+def pick_first_unseen_candidate(
+    full_candidates: list[dict[str, Any]],
+    screened: list[dict[str, Any]],
+    evaluated_fps: set[tuple],
+) -> dict[str, Any] | None:
+    """
+    从 screened 候选（按可行概率降序）中找第一个未评估的候选。
+
+    若 screened 全部重复，则遍历 full_candidates 找第一个未评估的。
+    若 full_candidates 也全部重复，返回 None。
+
+    Parameters
+    ----------
+    full_candidates:
+        repair/derive 后的完整候选信息列表。
+    screened:
+        clf.screen() 返回的列表（含 __candidate_index 和 _predicted_feasible）。
+    evaluated_fps:
+        已评估过的 fingerprint 集合。
+    """
+    # 优先从 screened 中选（保留可行概率排序）
+    for entry in screened:
+        idx = int(entry.get("__candidate_index", 0))
+        cand = full_candidates[idx]
+        fp = fingerprint_design_vars(cand["design_vars"])
+        if fp not in evaluated_fps:
+            return cand
+
+    # screened 全部重复，遍历 full_candidates（按索引顺序）
+    for cand in full_candidates:
+        fp = fingerprint_design_vars(cand["design_vars"])
+        if fp not in evaluated_fps:
+            return cand
+
+    return None  # 候选池全部重复

@@ -3,11 +3,11 @@
 venv/
 env/
 
-# 测试目录（跟踪测试代码，忽略运行时产物）
-tests/
-tests/**
+# 测试运行时产物（跟踪测试源码 .py，只忽略运行时产物）
 tests/__pycache__/
 tests/.pytest_cache/
+tests/**/__pycache__/
+tests/
 
 # Python 编译缓存
 __pycache__/

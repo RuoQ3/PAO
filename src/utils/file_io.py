@@ -285,8 +285,10 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         acquisition     = acq_raw,  # type: ignore[arg-type]
         surrogate_model = surrogate_model,  # type: ignore[arg-type]
         random_seed     = opt.get("random_seed"),
-        integer_var_paths = integer_paths,
-        derived_var_specs = derived_var_specs,
+        integer_var_paths  = integer_paths,
+        derived_var_specs  = derived_var_specs,
+        feasibility_filter = _parse_feasibility_filter(opt.get("feasibility_filter")),
+        early_stopping     = _parse_early_stopping(opt.get("early_stopping")),
     )
 
 
@@ -411,6 +413,8 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         derived_var_specs  = derived_var_specs,
         var_dependencies   = var_dependencies,
         feasibility_search = feasibility_search,
+        feasibility_filter = _parse_feasibility_filter(opt.get("feasibility_filter")),
+        early_stopping     = _parse_early_stopping(opt.get("early_stopping")),
     )
 
 
@@ -751,3 +755,223 @@ def _parse_surrogate_model(opt: dict) -> str:
             f"支持值：GP / RF / ET / GBRT / RANDOM（大小写不敏感）。"
         )
     return "random" if upper == "RANDOM" else upper
+
+
+# ---------------------------------------------------------------------------
+# feasibility_filter 解析
+# ---------------------------------------------------------------------------
+
+_VALID_FF_MODELS: frozenset[str] = frozenset({"extra_trees", "random_forest", "random"})
+
+
+def _parse_feasibility_filter(raw: dict[str, Any] | None) -> Any:
+    """
+    从 optimizer.feasibility_filter 节解析 FeasibilityConfig。
+
+    如果节不存在或为空 dict，返回 FeasibilityConfig()（enabled=False）。
+    任何字段非法时严格抛 ValueError，不静默回退默认值。
+
+    支持字段
+    --------
+    enabled           : bool，严格接受 True/False/0/1/"true"/"false"（大小写不敏感），默认 False
+    model             : str，允许 extra_trees / random_forest / random，默认 extra_trees
+    min_samples       : int，>= 1，默认 10
+    threshold         : float，[0.0, 1.0]，默认 0.5
+    candidate_pool_size : int，>= 1，默认 200
+    random_seed       : int | None，默认 None
+    """
+    from ..optimization.feasibility import FeasibilityConfig
+
+    if raw is None or raw == {}:
+        return FeasibilityConfig()
+
+    # --- 类型检查：feasibility_filter 必须是 dict ---
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"optimizer.feasibility_filter 必须是 dict（映射），"
+            f"收到 {type(raw).__name__!r}：{raw!r}。"
+        )
+
+    # --- enabled（严格布尔解析）---
+    enabled_raw = raw.get("enabled", False)
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    elif isinstance(enabled_raw, int) and enabled_raw in (0, 1):
+        enabled = bool(enabled_raw)
+    elif isinstance(enabled_raw, str):
+        if enabled_raw.strip().lower() == "true":
+            enabled = True
+        elif enabled_raw.strip().lower() == "false":
+            enabled = False
+        else:
+            raise ValueError(
+                f"feasibility_filter.enabled={enabled_raw!r} 无法识别，"
+                "请使用 true / false（YAML 布尔值）。"
+            )
+    else:
+        raise ValueError(
+            f"feasibility_filter.enabled={enabled_raw!r} 类型不合法"
+            f"（{type(enabled_raw).__name__}），请使用 true 或 false。"
+        )
+
+    # --- model ---
+    model_raw = str(raw.get("model", "extra_trees"))
+    if model_raw not in _VALID_FF_MODELS:
+        raise ValueError(
+            f"feasibility_filter.model={model_raw!r} 不合法，"
+            f"支持值：{sorted(_VALID_FF_MODELS)}。"
+        )
+
+    # --- min_samples ---
+    try:
+        min_samples = int(raw.get("min_samples", 10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"feasibility_filter.min_samples 无法转为整数：{exc}"
+        ) from exc
+    if min_samples < 1:
+        raise ValueError(
+            f"feasibility_filter.min_samples={min_samples} 必须 >= 1。"
+        )
+
+    # --- threshold ---
+    try:
+        threshold = float(raw.get("threshold", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"feasibility_filter.threshold 无法转为浮点数：{exc}"
+        ) from exc
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(
+            f"feasibility_filter.threshold={threshold} 必须在 [0.0, 1.0] 之间。"
+        )
+
+    # --- candidate_pool_size ---
+    try:
+        candidate_pool_size = int(raw.get("candidate_pool_size", 200))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"feasibility_filter.candidate_pool_size 无法转为整数：{exc}"
+        ) from exc
+    if candidate_pool_size < 1:
+        raise ValueError(
+            f"feasibility_filter.candidate_pool_size={candidate_pool_size} 必须 >= 1。"
+        )
+
+    # --- random_seed ---
+    seed_raw = raw.get("random_seed")
+    if seed_raw is None:
+        random_seed = None
+    else:
+        try:
+            random_seed = int(seed_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"feasibility_filter.random_seed={seed_raw!r} 无法转为整数：{exc}"
+            ) from exc
+
+    return FeasibilityConfig(
+        enabled=enabled,
+        model=model_raw,
+        min_samples=min_samples,
+        threshold=threshold,
+        candidate_pool_size=candidate_pool_size,
+        random_seed=random_seed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# early_stopping 解析
+# ---------------------------------------------------------------------------
+
+def _parse_early_stopping(raw: dict[str, Any] | None) -> Any:
+    """
+    从 optimizer.early_stopping 节解析 EarlyStoppingConfig。
+
+    如果节不存在或为空 dict，返回 EarlyStoppingConfig()（enabled=False）。
+    任何字段非法时严格抛 ValueError，不静默回退。
+    """
+    from ..workflows.common import EarlyStoppingConfig
+
+    if raw is None or raw == {}:
+        return EarlyStoppingConfig()
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"optimizer.early_stopping 必须是 dict，收到 {type(raw).__name__!r}：{raw!r}。"
+        )
+
+    # 未知字段严格检查
+    _ALLOWED_ES_KEYS = {
+        "enabled", "min_iterations", "patience", "min_delta",
+        "relative_delta", "max_duplicate_suggestions",
+        "check_hypervolume", "check_first_front",
+    }
+    unknown = set(raw) - _ALLOWED_ES_KEYS
+    if unknown:
+        raise ValueError(
+            f"optimizer.early_stopping 包含未知字段：{sorted(unknown)}。"
+            f"允许的字段：{sorted(_ALLOWED_ES_KEYS)}。"
+        )
+
+    def _parse_bool(name: str, default: bool) -> bool:
+        v = raw.get(name, default)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int) and v in (0, 1):
+            return bool(v)
+        if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+            return v.strip().lower() == "true"
+        raise ValueError(
+            f"early_stopping.{name}={v!r} 无法识别，请使用 true 或 false。"
+        )
+
+    enabled = _parse_bool("enabled", False)
+
+    try:
+        min_iterations = int(raw.get("min_iterations", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"early_stopping.min_iterations 无法转为整数：{exc}") from exc
+
+    try:
+        patience = int(raw.get("patience", 10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"early_stopping.patience 无法转为整数：{exc}") from exc
+
+    try:
+        min_delta = float(raw.get("min_delta", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"early_stopping.min_delta 无法转为浮点数：{exc}") from exc
+
+    rd_raw = raw.get("relative_delta")
+    if rd_raw is None:
+        relative_delta = None
+    else:
+        try:
+            relative_delta = float(rd_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"early_stopping.relative_delta 无法转为浮点数：{exc}"
+            ) from exc
+
+    try:
+        max_dup = int(raw.get("max_duplicate_suggestions", 3))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"early_stopping.max_duplicate_suggestions 无法转为整数：{exc}"
+        ) from exc
+
+    check_hv = _parse_bool("check_hypervolume", True)
+    check_ff = _parse_bool("check_first_front", True)
+
+    # EarlyStoppingConfig.__post_init__ 会做严格校验
+    return EarlyStoppingConfig(
+        enabled=enabled,
+        min_iterations=min_iterations,
+        patience=patience,
+        min_delta=min_delta,
+        relative_delta=relative_delta,
+        max_duplicate_suggestions=max_dup,
+        check_hypervolume=check_hv,
+        check_first_front=check_ff,
+    )

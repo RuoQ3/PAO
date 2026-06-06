@@ -282,6 +282,56 @@ class ProcessCase:
         return self.sim_result.run_time if self.sim_result else 0.0
 
     # ------------------------------------------------------------------ #
+    # 训练用途标记（ML 分类器 / 回归代理）
+    # ------------------------------------------------------------------ #
+
+    @property
+    def valid_for_classifier(self) -> bool:
+        """
+        True 当且仅当本工况可用于训练可行性分类器。
+
+        MVP 规则：仿真至少产生了有意义的结果——包含正样本（SUCCESS/WARNINGS）
+        和负样本（SIM_FAILED/INFEASIBLE/OBJECTIVE_ERROR/CONSTRAINT_ERROR）均可入库，
+        PENDING（尚未运行）则不可用。
+        """
+        return self.status in (
+            CaseStatus.SUCCESS,
+            CaseStatus.WARNINGS,
+            CaseStatus.SIM_FAILED,
+            CaseStatus.INFEASIBLE,
+            CaseStatus.OBJECTIVE_ERROR,
+            CaseStatus.CONSTRAINT_ERROR,
+        )
+
+    @property
+    def valid_for_regression(self) -> bool:
+        """
+        True 当且仅当本工况可用于训练目标回归代理模型。
+
+        MVP 规则：等同于 self.success——仿真收敛、目标可用、约束（如有）满足。
+        """
+        return self.success
+
+    @property
+    def valid_for_final_ranking(self) -> bool:
+        """
+        True 当且仅当本工况可进入最终最优解排行榜。
+
+        MVP 规则：等同于 self.success。
+        """
+        return self.success
+
+    @property
+    def feasible_label(self) -> bool:
+        """
+        可行性分类器的二分类标签。
+
+        MVP 规则：等同于 self.success（正样本）；
+        其余状态（SIM_FAILED/INFEASIBLE/OBJECTIVE_ERROR/CONSTRAINT_ERROR）为负样本。
+        """
+        return self.success
+
+    # ------------------------------------------------------------------ #
     # 目标函数与约束访问
     # ------------------------------------------------------------------ #
 

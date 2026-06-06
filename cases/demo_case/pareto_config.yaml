@@ -132,3 +132,72 @@ optimizer:
   scalarization: chebyshev          # 对非凸 Pareto 前沿覆盖更均匀
   acquisition_function: EI
   random_seed: 42
+
+  # ML-assisted feasibility filtering（运行时生效）
+  # 作用：用历史仿真数据库中的成功/失败标签训练可行性分类器，在 BO 阶段先生成候选池，
+  #      再过滤掉预测不可行的候选点，以减少明显失败的 Aspen 调用。
+  # 注意：第一次运行或历史样本不足时，分类器会自动跳过训练，优化仍按原流程执行。
+  # 对照：若要做 baseline 对照实验，将 enabled 改为 false 后运行同一配置。
+  feasibility_filter:
+    enabled: true                 # 是否启用候选池可行性过滤；false=完全不使用分类器过滤
+    model: extra_trees            # 分类器模型：extra_trees / random_forest / random
+    min_samples: 20               # 训练分类器所需的最少历史样本数；不足时自动跳过过滤
+    threshold: 0.40               # 可行概率阈值；越高越激进，越可能错杀可行点；demo 采用偏保守值
+    candidate_pool_size: 200      # 每轮 BO 先生成的候选池大小，再从中筛选高可行概率点
+    random_seed: 42               # 分类器随机种子，保证本地重复实验可复现
+
+  # 自动早停与重复候选保护（任务 8 新增）
+  # 作用：
+  #   1. 当 Pareto front 或 hypervolume 连续多轮不再改善，自动停止优化，节省 Aspen 调用。
+  #   2. 每轮选候选前检查是否已经运行过该点（fingerprint 去重），
+  #      全部重复时跳过本轮而非强制重跑，避免污染数据库。
+  #   3. min_iterations 保证在正式判断早停前已有足够探索。
+  # 注意：
+  #   - enabled=false 时完全不影响旧流程，所有 BO 轮次照常执行。
+  #   - 早停不代表找到全局最优，只说明在当前搜索策略下继续改进概率较低。
+  #   - 候选去重在 enabled=true 和 false 时都会生效（去重是保护机制，与早停无关）。
+  early_stopping:
+    enabled: true                    # 是否启用早停判断；false=跑满 n_iterations，去重仍生效
+    min_iterations: 40               # 至少完成多少次总迭代后才允许触发早停
+                                     # 设为 n_initial_points + 20，确保 BO 至少探索 20 轮再判断
+    patience: 10                     # 连续多少轮无有效改善后停止；越大越宽松，允许更长停滞期
+    min_delta: 1.0e-6                # hypervolume 改善量必须 > min_delta 才算有效改善；
+                                     # 设置过大会导致过早停止，设置过小则收敛判断太松
+    relative_delta: null             # 相对改善阈值（相对于当前最优值的比例）；null=不启用
+                                     # 例如 1.0e-4 表示改善不足 0.01% 就算停滞
+    max_duplicate_suggestions: 3     # 候选池连续几次全部重复后触发 no_unique_candidate 早停；
+                                     # 通常是搜索空间探索完毕或 LHS 精度不足时触发
+    check_hypervolume: true          # 多目标：是否用 hypervolume 改善作为早停判据
+    check_first_front: true          # 多目标：是否检查 Pareto 第一前沿的变化作为早停判据
+                                     # 两个检查都不改善才累计 no_improvement_count
+
+# ---------------------------------------------------------------------------
+# 离线可行性评估配置（人工运行前使用；当前优化器不会自动读取）
+# ---------------------------------------------------------------------------
+# 作用：用历史 simulation.db 评估 feasibility_filter 是否可靠。
+# 典型流程：
+#   1. 从 cases/demo_case/output/simulation.db 导出 feasibility dataset
+#   2. 用下列参数运行 evaluate_feasibility_from_db(...)
+#   3. 将评估结果交给 feasibility_gate 判断是否建议开启上面的 feasibility_filter
+feasibility_evaluation:
+  test_size: 0.25                 # 历史样本中用于测试集的比例
+  random_seed: 42                 # 训练/测试划分和分类器训练随机种子
+  threshold: 0.40                 # 与 optimizer.feasibility_filter.threshold 保持一致
+  min_samples: 20                 # 评估所需最少样本数；不足则不应相信分类器
+  model: extra_trees              # 与 optimizer.feasibility_filter.model 保持一致
+
+# ---------------------------------------------------------------------------
+# 可行性过滤器质量门控（人工运行前使用；当前优化器不会自动强制执行）
+# ---------------------------------------------------------------------------
+# 作用：根据离线评估结果决定是否建议启用 feasibility_filter。
+# 核心风险是 false negative：实际可行的 Aspen 工况被分类器误判为不可行并提前丢弃。
+feasibility_gate:
+  enabled: true                   # 是否启用门控判断；false=门控不阻止使用过滤器
+  min_samples: 20                 # 门控要求的最少评估样本数
+  min_recall: 0.85                # 最低召回率；召回率低表示可行点被错杀较多
+  max_false_negative_rate: 0.10   # FN / (FN + TP) 上限；超过则不建议启用过滤器
+  max_false_negative_count: 1     # 可接受的 false negative 绝对数量上限；null=不限制
+  min_precision: null             # 可选：最低精度要求；null=不检查，因 FP 主要浪费仿真而非错杀好点
+  min_f1: null                    # 可选：最低 F1 要求；null=不检查
+  require_no_warnings: false      # true=评估结果有任何 warning 都拒绝启用
+  allow_single_class: false       # false=只有成功或只有失败样本时拒绝启用分类器

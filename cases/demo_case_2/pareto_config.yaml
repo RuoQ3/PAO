@@ -367,6 +367,79 @@ optimizer:
   n_initial_min: 5                  # 启用代理模型所需的最少成功样本数
   hv_margin: 0.1                    # 自动推断参考点时各维度扩展 10%
 
+  # ML-assisted feasibility filtering（运行时生效）
+  # 作用：用历史 Aspen 仿真数据库中的成功/失败样本训练可行性分类器。
+  #      对 14 维混合整数搜索空间，先生成较大的候选池，再过滤预测不可行的点，
+  #      以减少明显失败的仿真调用。
+  # 注意：历史样本不足时会自动跳过训练，不阻塞优化。
+  # 对照：若要做 baseline 对照实验，将 enabled 改为 false 后运行同一配置。
+  feasibility_filter:
+    enabled: true                 # 是否启用候选池可行性过滤；false=完全不使用分类器过滤
+    model: extra_trees            # 分类器模型：extra_trees / random_forest / random
+    min_samples: 40               # 训练分类器所需的最少历史样本数；高维 case 需要更多样本
+    threshold: 0.35               # 可行概率阈值；高维早期数据稀疏，先用保守阈值降低错杀风险
+    candidate_pool_size: 400      # 每轮 BO 先生成的候选池大小；高维空间使用更大候选池
+    random_seed: 42               # 分类器随机种子，保证本地重复实验可复现
+
+  # 自动早停与重复候选保护（任务 8 新增）
+  # 背景：demo_case_2 曾出现 feasibility_filter 每轮选中同一候选（索引 324）并反复调用
+  #      Aspen 的问题。本配置同时解决三个问题：
+  #   1. 候选去重：每轮 BO 运行前检查 fingerprint，重复候选直接跳过，绝不重跑 Aspen。
+  #   2. 自动早停：Pareto front / HV 连续停滞时主动停止，节省后续无效仿真。
+  #   3. 迭代 seed：每轮候选池使用不同随机数，避免固定种子导致每轮选到同一候选。
+  # 注意：
+  #   - enabled=false 时只有候选去重生效（去重是保护机制，始终开启）；不做早停判断。
+  #   - 早停不等于找到全局最优，只说明当前搜索策略下进一步改进概率较低。
+  #   - duplicate_skipped_iterations 和 no_unique_candidate_count 会记录在 to_summary() 中。
+  early_stopping:
+    enabled: true                    # 是否启用早停判断；false=跑满 n_iterations
+    min_iterations: 60               # 至少完成多少次总迭代（含 DOE）后才允许触发早停
+                                     # 14 维高维空间，设为 n_initial_points(42) + 约 38 轮 BO
+                                     # 保证代理模型已有足够拟合数据再进行停滞判断
+    patience: 12                     # 连续多少轮无有效改善后停止
+                                     # 高维空间改善较慢，patience 设大一些避免过早停止
+    min_delta: 1.0e-6                # hypervolume 改善量下限；小于此值视为停滞
+                                     # 对于 TAC/EMISSIONS 量级，此值足够区分真实改善和数值噪声
+    relative_delta: 1.0e-4           # 相对改善阈值：HV 改善比例 < 0.01% 视为停滞
+                                     # 配合 min_delta 双重判断，避免大值 HV 下绝对改善掩盖停滞
+    max_duplicate_suggestions: 3     # 候选池连续几次全部重复后触发 no_unique_candidate 早停
+                                     # 每次重试都会变换 seed，3 次仍找不到新点则确实耗尽
+    check_hypervolume: true          # 多目标：是否用 hypervolume 改善作为早停判据
+                                     # 高维混合整数空间中 HV 是最综合的进度指标
+    check_first_front: true          # 多目标：是否检查 Pareto 第一前沿变化作为辅助判据
+                                     # HV 和 front 都没有改善才累计 no_improvement_count
+
+# ---------------------------------------------------------------------------
+# 离线可行性评估配置（人工运行前使用；当前优化器不会自动读取）
+# ---------------------------------------------------------------------------
+# 作用：用历史 simulation.db 评估 feasibility_filter 是否可靠。
+# 典型流程：
+#   1. 从 cases/demo_case_2/output/simulation.db 导出 feasibility dataset
+#   2. 用下列参数运行 evaluate_feasibility_from_db(...)
+#   3. 将评估结果交给 feasibility_gate 判断是否建议开启上面的 feasibility_filter
+feasibility_evaluation:
+  test_size: 0.25                 # 历史样本中用于测试集的比例
+  random_seed: 42                 # 训练/测试划分和分类器训练随机种子
+  threshold: 0.35                 # 与 optimizer.feasibility_filter.threshold 保持一致
+  min_samples: 40                 # 评估所需最少样本数；不足则不应相信分类器
+  model: extra_trees              # 与 optimizer.feasibility_filter.model 保持一致
+
+# ---------------------------------------------------------------------------
+# 可行性过滤器质量门控（人工运行前使用；当前优化器不会自动强制执行）
+# ---------------------------------------------------------------------------
+# 作用：根据离线评估结果决定是否建议启用 feasibility_filter。
+# 核心风险是 false negative：实际可行的 Aspen 工况被分类器误判为不可行并提前丢弃。
+feasibility_gate:
+  enabled: true                   # 是否启用门控判断；false=门控不阻止使用过滤器
+  min_samples: 40                 # 门控要求的最少评估样本数；与高维过滤器训练门槛一致
+  min_recall: 0.90                # 最低召回率；高维昂贵仿真中更强调不要错杀可行点
+  max_false_negative_rate: 0.08   # FN / (FN + TP) 上限；比 demo_case 更严格
+  max_false_negative_count: 2     # 可接受的 false negative 绝对数量上限；null=不限制
+  min_precision: null             # 可选：最低精度要求；null=不检查，因 FP 主要浪费仿真而非错杀好点
+  min_f1: null                    # 可选：最低 F1 要求；null=不检查
+  require_no_warnings: false      # true=评估结果有任何 warning 都拒绝启用
+  allow_single_class: false       # false=只有成功或只有失败样本时拒绝启用分类器
+
 # ---------------------------------------------------------------------------
 # 变量依赖约束
 # S1/S2 为整数优化变量，必须满足 < 对应塔的 NSTAGE。

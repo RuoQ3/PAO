@@ -83,8 +83,17 @@ from typing import Any, Callable, Literal
 from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
+from ..optimization.feasibility import FeasibilityClassifier, FeasibilityConfig
 from ..optimization.surrogate import SurrogateConfig, make_surrogate_optimizer
-from .common import apply_derived_vars, repair_design_vars
+from .common import (
+    EarlyStoppingConfig,
+    apply_derived_vars,
+    build_evaluated_set,
+    feasibility_feature_names,
+    fingerprint_design_vars,
+    pick_first_unseen_candidate,
+    repair_design_vars,
+)
 from .run_case import RunCaseConfig, run_case
 
 _log = logging.getLogger(__name__)
@@ -164,6 +173,10 @@ class OptimizeCaseConfig:
     # type=integer 的设计变量路径集合；BO 提出连续值后 round/clamp 到整数
     integer_var_paths: set[str] = field(default_factory=set)
     derived_var_specs: list[dict[str, Any]] = field(default_factory=list)
+    # 可行性分类器配置；enabled=False（默认）时完全不影响原有流程
+    feasibility_filter: FeasibilityConfig = field(default_factory=FeasibilityConfig)
+    # 早停配置；enabled=False（默认）时完全不影响原有流程
+    early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +228,11 @@ class OptimizeResult:
     n_objective_error: int
     n_initial: int
     elapsed: float
+    early_stopped: bool = False
+    early_stop_reason: str | None = None
+    completed_iterations: int = 0
+    duplicate_skipped_iterations: int = 0
+    no_unique_candidate_count: int = 0
 
     @property
     def best_value(self) -> float | None:
@@ -277,6 +295,11 @@ class OptimizeResult:
             "minimize": self.minimize,
             "elapsed": self.elapsed,
             "param_bounds": {k: list(v) for k, v in self.param_bounds.items()},
+            "early_stopped": self.early_stopped,
+            "early_stop_reason": self.early_stop_reason,
+            "completed_iterations": self.completed_iterations,
+            "duplicate_skipped_iterations": self.duplicate_skipped_iterations,
+            "no_unique_candidate_count": self.no_unique_candidate_count,
         }
 
 
@@ -333,6 +356,10 @@ def optimize_case(
     case_xs: list[list[float]] = []
     t0 = time.monotonic()
     driver_dead = False
+    early_stopped = False
+    early_stop_reason: str | None = None
+    duplicate_skipped_iterations = 0
+    no_unique_candidate_count = 0
 
     # ------------------------------------------------------------------
     # Phase 1：初始 DOE（拉丁超立方采样）
@@ -446,23 +473,192 @@ def optimize_case(
                 n_success_so_far, config.n_initial_min,
             )
 
+        # 早停状态
+        es = config.early_stopping
+        no_improvement_count = 0
+        consecutive_dup_count = 0
+        duplicate_skipped_iterations = 0
+        no_unique_candidate_count = 0
+        # P1-2：从 DOE 结果初始化早停基线，避免 BO 第一轮差值被误判为改善
+        best_y_so_far: float | None = min(
+            (y for c in cases
+             for y in [_extract_y(c, config)] if y is not None),
+            default=None,
+        )
+
         for bo_idx in range(n_bo):
-            if driver_dead:
+            if driver_dead or early_stopped:
                 break
 
             idx = config.n_initial + bo_idx
             iteration = start_iteration + idx
             tags = list(config.tags) + ["bayesian_opt", "optimize"]
 
-            next_x = optimizer.ask()
-            design_vars_raw = {**config.fixed_vars, **dict(zip(paths, next_x))}
-            design_vars_repaired, repair_notes = repair_design_vars(
-                design_vars_raw, config.integer_var_paths, config.param_bounds, {},
+            # ----------------------------------------------------------
+            # 候选点选取（含去重保护 + 可选可行性过滤）
+            # 去重是 BO workflow 的通用保护，不依赖 feasibility_filter。
+            # ----------------------------------------------------------
+            fc = config.feasibility_filter
+            use_filter = fc.enabled and fc.candidate_pool_size > 1
+
+            # 已评估 fingerprint 集合（每轮重建，保证最新）
+            evaluated_fps = build_evaluated_set(cases)
+
+            # 迭代相关 seed：避免每轮候选池固定
+            base_seed = config.random_seed
+            iter_seed = (
+                None if base_seed is None
+                else base_seed + idx * 1009 + consecutive_dup_count
             )
-            design_vars, derived_notes = apply_derived_vars(
-                design_vars_repaired, config.derived_var_specs,
-            )
-            x_eval = [design_vars_repaired.get(p, next_x[i]) for i, p in enumerate(paths)]
+
+            if use_filter:
+                # ---- 带可行性分类器的候选池路径 ----
+                clf = FeasibilityClassifier(fc)
+                rows = _build_feasibility_rows(cases)
+                feature_names = feasibility_feature_names(paths, config.derived_var_specs)
+                trained = clf.fit(rows, feature_names)
+
+                picked: dict[str, Any] | None = None
+                retry = 0
+                max_retries = es.max_duplicate_suggestions if es.enabled else 3
+                while retry <= max_retries:
+                    retry_seed = (
+                        None if iter_seed is None
+                        else iter_seed + retry * 7919
+                    )
+                    raw_candidates = _generate_candidate_points(
+                        optimizer, bounds, fc.candidate_pool_size, retry_seed,
+                    )
+                    screen_inputs: list[dict[str, Any]] = []
+                    full_candidates: list[dict[str, Any]] = []
+                    for j, x_raw in enumerate(raw_candidates):
+                        dv_raw = {**config.fixed_vars, **dict(zip(paths, x_raw))}
+                        dv_rep, rep_notes = repair_design_vars(
+                            dv_raw, config.integer_var_paths, config.param_bounds, {},
+                        )
+                        dv_full, der_notes = apply_derived_vars(
+                            dv_rep, config.derived_var_specs,
+                        )
+                        x_ev = [dv_rep.get(p, x_raw[i]) for i, p in enumerate(paths)]
+                        screen_inputs.append({
+                            **{name: dv_full.get(name) for name in feature_names},
+                            "__candidate_index": j,
+                        })
+                        full_candidates.append({
+                            "design_vars":   dv_full,
+                            "x_eval":        x_ev,
+                            "repair_notes":  rep_notes,
+                            "derived_notes": der_notes,
+                        })
+                    screened = clf.screen(screen_inputs, fallback_top_k=1)
+                    picked = pick_first_unseen_candidate(
+                        full_candidates, screened, evaluated_fps
+                    )
+                    if picked is not None:
+                        break
+                    retry += 1
+
+                if picked is None:
+                    # P0-2：候选池全部重复，绝不 fallback 运行重复点
+                    consecutive_dup_count += 1
+                    duplicate_skipped_iterations += 1
+                    no_unique_candidate_count += 1
+                    _log.warning(
+                        "贝叶斯优化 [%d/%d]：候选池连续 %d 次全部重复，跳过本轮。",
+                        idx + 1, n_total, consecutive_dup_count,
+                    )
+                    if es.enabled and consecutive_dup_count >= es.max_duplicate_suggestions:
+                        early_stopped = True
+                        early_stop_reason = "no_unique_candidate"
+                        _log.warning(
+                            "Early stopping triggered: reason=%s, 连续 %d 次未找到新候选，"
+                            "iteration=%d",
+                            early_stop_reason, consecutive_dup_count, idx + 1,
+                        )
+                    continue  # 直接跳过本轮，不调用 run_case
+                else:
+                    consecutive_dup_count = 0
+
+                prob = None
+                picked_fp = fingerprint_design_vars(picked["design_vars"])
+                for entry in screened:
+                    idx2 = int(entry.get("__candidate_index", 0))
+                    if fingerprint_design_vars(
+                        full_candidates[idx2]["design_vars"]
+                    ) == picked_fp:
+                        prob = entry.get("_predicted_feasible")
+                        break
+
+                design_vars   = picked["design_vars"]
+                x_eval        = picked["x_eval"]
+                repair_notes  = picked["repair_notes"]
+                derived_notes = picked["derived_notes"]
+
+                _log.info(
+                    "贝叶斯优化 [%d/%d] 可行性过滤：训练=%s，候选池=%d，"
+                    "筛选后=%d，重试次数=%d，选中概率=%s",
+                    idx + 1, n_total, trained,
+                    len(raw_candidates), len(screened), retry,
+                    f"{prob:.3f}" if prob is not None else "N/A",
+                )
+            else:
+                # ---- 无可行性分类器路径：optimizer.ask() + 去重保护 ----
+                picked_no_filter: dict[str, Any] | None = None
+                retry = 0
+                max_retries = es.max_duplicate_suggestions if es.enabled else 3
+                while retry <= max_retries:
+                    retry_seed = (
+                        None if iter_seed is None
+                        else iter_seed + retry * 7919
+                    )
+                    # 生成一批候选（optimizer.ask() 开头 + LHS 补充）
+                    raw_xs = _generate_candidate_points(optimizer, bounds, max(2, max_retries), retry_seed)
+                    for x_raw in raw_xs:
+                        dv_raw = {**config.fixed_vars, **dict(zip(paths, x_raw))}
+                        dv_rep, rep_notes = repair_design_vars(
+                            dv_raw, config.integer_var_paths, config.param_bounds, {},
+                        )
+                        dv_full, der_notes = apply_derived_vars(
+                            dv_rep, config.derived_var_specs,
+                        )
+                        x_ev = [dv_rep.get(p, x_raw[i]) for i, p in enumerate(paths)]
+                        fp = fingerprint_design_vars(dv_full)
+                        if fp not in evaluated_fps:
+                            picked_no_filter = {
+                                "design_vars":   dv_full,
+                                "x_eval":        x_ev,
+                                "repair_notes":  rep_notes,
+                                "derived_notes": der_notes,
+                            }
+                            break
+                    if picked_no_filter is not None:
+                        break
+                    retry += 1
+
+                if picked_no_filter is None:
+                    # P0-2：全部重复，跳过本轮
+                    consecutive_dup_count += 1
+                    duplicate_skipped_iterations += 1
+                    no_unique_candidate_count += 1
+                    _log.warning(
+                        "贝叶斯优化 [%d/%d]：无过滤器模式候选连续 %d 次全部重复，跳过本轮。",
+                        idx + 1, n_total, consecutive_dup_count,
+                    )
+                    if es.enabled and consecutive_dup_count >= es.max_duplicate_suggestions:
+                        early_stopped = True
+                        early_stop_reason = "no_unique_candidate"
+                        _log.warning(
+                            "Early stopping triggered: reason=%s, iteration=%d",
+                            early_stop_reason, idx + 1,
+                        )
+                    continue
+                else:
+                    consecutive_dup_count = 0
+
+                design_vars   = picked_no_filter["design_vars"]
+                x_eval        = picked_no_filter["x_eval"]
+                repair_notes  = picked_no_filter["repair_notes"]
+                derived_notes = picked_no_filter["derived_notes"]
             if repair_notes:
                 _log.debug("贝叶斯优化 [%d/%d] repair: %s", idx + 1, n_total, repair_notes)
 
@@ -472,7 +668,7 @@ def optimize_case(
             _log.info(
                 "贝叶斯优化 [%d/%d]：%s",
                 idx + 1, n_total,
-                {k.split("\\")[-1]: round(v, 4) for k, v in dict(zip(paths, next_x)).items()},
+                {p.split("\\")[-1]: round(x_eval[i], 4) for i, p in enumerate(paths)},
             )
 
             try:
@@ -530,6 +726,26 @@ def optimize_case(
                 case.status.value, case.success, case.run_time,
             )
 
+            # ---- 早停判断 ----
+            if es.enabled and y is not None and idx + 1 >= es.min_iterations:
+                improved = _check_improvement(y, best_y_so_far, config.minimize, es)
+                if improved or best_y_so_far is None:
+                    best_y_so_far = y
+                    no_improvement_count = 0
+                else:
+                    no_improvement_count += 1
+                    if no_improvement_count >= es.patience:
+                        early_stopped = True
+                        early_stop_reason = "objective_stagnation"
+                        _log.warning(
+                            "Early stopping triggered: reason=%s, "
+                            "iteration=%d, patience=%d, no_improvement=%d, best_y=%s",
+                            early_stop_reason, idx + 1, es.patience,
+                            no_improvement_count, best_y_so_far,
+                        )
+            elif es.enabled and y is not None and best_y_so_far is None:
+                best_y_so_far = y
+
     try:
         elapsed = time.monotonic() - t0
         best = _find_best_case(cases, config)
@@ -542,6 +758,12 @@ def optimize_case(
             _log.warning(
                 "贝叶斯优化因 driver 断开提前终止：已完成 %d/%d 个工况，%d 成功，耗时 %.1fs。",
                 len(cases), n_total, n_success, elapsed,
+            )
+        elif early_stopped:
+            _log.warning(
+                "贝叶斯优化早停：reason=%s，已完成 %d 个工况，%d 成功，耗时 %.1fs。"
+                " （注：在当前搜索策略下继续改进概率较低，不代表全局最优。）",
+                early_stop_reason, len(cases), n_success, elapsed,
             )
         else:
             best_str = (
@@ -566,6 +788,11 @@ def optimize_case(
             n_objective_error=n_objective_error,
             n_initial=config.n_initial,
             elapsed=elapsed,
+            early_stopped=early_stopped,
+            early_stop_reason=early_stop_reason,
+            completed_iterations=len(cases),
+            duplicate_skipped_iterations=duplicate_skipped_iterations,
+            no_unique_candidate_count=no_unique_candidate_count,
         )
     finally:
         if db is not None:
@@ -793,3 +1020,96 @@ def _fire_callback(
     except Exception as exc:
         _log.warning("on_case_complete 回调异常（已忽略）：%s", exc)
 
+
+# ---------------------------------------------------------------------------
+# 可行性分类器辅助函数
+# ---------------------------------------------------------------------------
+
+def _build_feasibility_rows(cases: list[ProcessCase]) -> list[dict[str, Any]]:
+    """
+    从历史工况中构造可行性分类器训练数据。
+
+    只使用 valid_for_classifier=True 且 design_vars 非空的工况。
+    label = case.feasible_label（等同于 case.success）。
+    """
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        if not case.valid_for_classifier:
+            continue
+        if not case.design_vars:
+            continue
+        rows.append({
+            "case_id":     case.case_id,
+            "design_vars": case.design_vars,
+            "label":       case.feasible_label,
+            "status":      case.status.value,
+        })
+    return rows
+
+
+def _generate_candidate_points(
+    optimizer: Any,
+    bounds: list[tuple[float, float]],
+    n_candidates: int,
+    seed: int | None,
+) -> list[list[float]]:
+    """
+    生成候选点池，用于可行性过滤。
+
+    第一个候选来自 optimizer.ask()（保留 BO 推荐），其余用 LHS 随机填充。
+    若 n_candidates <= 1，则只返回 optimizer.ask() 的一个候选。
+
+    Parameters
+    ----------
+    optimizer:
+        SurrogateOptimizer 实例。
+    bounds:
+        设计变量边界列表。
+    n_candidates:
+        候选点总数。
+    seed:
+        LHS 随机种子。
+
+    Returns
+    -------
+    list[list[float]]
+        至少包含 1 个候选点。
+    """
+    first = optimizer.ask()
+    if n_candidates <= 1:
+        return [first]
+
+    rest = _lhs_sample(bounds, n_candidates - 1, seed)
+    return [first] + rest
+
+
+def _check_improvement(
+    current_y: float,
+    best_y: float | None,
+    minimize: bool,
+    es: Any,  # EarlyStoppingConfig
+) -> bool:
+    """
+    判断 current_y 相对 best_y 是否构成有效改善。
+
+    skopt 内部统一最小化，所以传入的 y 已是最小化方向值。
+    minimize=True 时：current_y < best_y - delta 才算改善；
+    minimize=False 时：skopt 存的是 -y，所以 current_y < best_y - delta 仍然适用。
+    """
+    if best_y is None:
+        return True  # 第一个有效观测默认算改善
+
+    delta = current_y - best_y           # 负数 = 下降 = 改善（最小化）
+    if delta >= 0:
+        return False                     # 没有下降
+
+    abs_improvement = -delta
+    if abs_improvement < es.min_delta:
+        return False
+
+    if es.relative_delta is not None:
+        ref = abs(best_y) if best_y != 0 else 1.0
+        if abs_improvement / ref < es.relative_delta:
+            return False
+
+    return True

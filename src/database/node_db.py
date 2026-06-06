@@ -545,6 +545,7 @@ class NodeDB:
         min_case_count: int = 2,
         *,
         source_prefix: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """
         返回在至少 ``min_case_count`` 个不同工况中失败的路径。
@@ -558,6 +559,8 @@ class NodeDB:
         source_prefix:
             若指定，只统计 source 以该前缀开头的失败记录，
             如 ``"block"`` 只看 block 相关失败。
+        limit:
+            最多返回行数，``None`` 不限。
 
         Returns
         -------
@@ -579,6 +582,8 @@ class NodeDB:
             HAVING fail_count >= ?
             ORDER BY fail_count DESC
         """
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
         rows = self._conn.execute(
             sql, (source_prefix, source_prefix, min_case_count)
         ).fetchall()
@@ -884,6 +889,58 @@ class NodeDB:
         return self._conn.execute(
             "SELECT COUNT(*) FROM node_catalog WHERE catalog_id = ?", (catalog_id,)
         ).fetchone()[0]
+
+    def get_latest_catalog_scan_any(self) -> dict[str, Any] | None:
+        """
+        返回数据库中按 created_at 降序排列的最新 catalog scan 元数据，
+        不限制 aspen_file_hash。
+
+        适用于工具层在用户未指定 catalog_id 时给出参考信息；调用方应
+        在报告中明确注明这是"全库最新"而非"当前工艺关联的最新"，
+        以免 agent 误判 catalog 归属。
+
+        Returns
+        -------
+        dict | None
+            与 ``get_catalog_scan`` 返回结构相同，或 ``None``（库为空）。
+        """
+        row = self._conn.execute(
+            "SELECT * FROM catalog_scans ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_latest_manifest_by_catalog(self, catalog_id: str) -> dict[str, Any] | None:
+        """
+        返回指定 catalog_id 下按 created_at 降序排列的最新 manifest 元数据，
+        不校验 rules_hash / builder_version（与 ``get_latest_manifest`` 相比
+        更宽松，只需 catalog 匹配即可）。
+
+        适用于工具层在用户未指定 manifest_id 时自动定位同 catalog 的最新 manifest。
+
+        Parameters
+        ----------
+        catalog_id:
+            所属 catalog scan ID。
+
+        Returns
+        -------
+        dict | None
+            与 ``get_manifest`` 返回结构相同，或 ``None``（无匹配记录）。
+        """
+        row = self._conn.execute(
+            """
+            SELECT * FROM read_manifests
+            WHERE catalog_id = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (catalog_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["objective_names"] = self._decode_json(d.get("objective_names"), [])
+        d["is_valid"] = bool(d["is_valid"])
+        return d
 
     # ------------------------------------------------------------------ #
     # 写入：read manifest

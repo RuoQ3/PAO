@@ -112,6 +112,18 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("cases", "semantic_blocks", "ALTER TABLE cases ADD COLUMN semantic_blocks TEXT NOT NULL DEFAULT '{}'"),
 ]
 
+# export_feasibility_dataset 只导出经过 Aspen 运行且产生有意义结果的状态，
+# 与 ProcessCase.valid_for_classifier 的 MVP 规则保持一致。
+# PENDING 及其他未运行状态不属于可行性训练样本，不得导出为负样本。
+_VALID_CLASSIFIER_STATUSES: frozenset[str] = frozenset({
+    "success",
+    "warnings",
+    "sim_failed",
+    "infeasible",
+    "objective_error",
+    "constraint_error",
+})
+
 # query_cases / query_by_objective 返回的摘要列（不含 blocks/streams/sim_result）
 _SUMMARY_COLS = (
     "case_id", "session_id", "iteration", "status",
@@ -403,6 +415,7 @@ class SimulationDB:
         max_value: float | None = None,
         order_desc: bool = True,
         limit: int | None = None,
+        success_only: bool = True,
     ) -> list[dict[str, Any]]:
         """
         按目标函数值过滤/排序，返回摘要行。
@@ -421,6 +434,10 @@ class SimulationDB:
             ``True``（默认）降序（最大化目标用）；``False`` 升序（最小化目标用）。
         limit:
             最多返回行数。
+        success_only:
+            ``True``（默认）仅返回 ``success=1`` 的工况，过滤掉
+            infeasible / sim_failed / objective_error 等失败点。
+            设为 ``False`` 可查看包含失败/不可行工况在内的全量排序。
 
         Returns
         -------
@@ -436,6 +453,8 @@ class SimulationDB:
         )
         params: list[Any] = [objective_name]
 
+        if success_only:
+            sql += " AND cases.success = 1"
         if min_value is not None:
             sql += " AND o.value >= ?"
             params.append(min_value)
@@ -464,6 +483,66 @@ class SimulationDB:
     def count(self) -> int:
         """返回 cases 表的总行数。"""
         return self._conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+
+    def export_feasibility_dataset(self) -> list[dict[str, Any]]:
+        """
+        导出可行性分类器训练数据集。
+
+        只导出经过 Aspen 运行且产生有意义结果的工况（对应 ``_VALID_CLASSIFIER_STATUSES``）；
+        ``PENDING`` 及其他未运行状态一律跳过，避免把"尚未运行"污染为负样本。
+        在此基础上，还要求 design_vars 非空；label 等同于数据库 success 列（bool）。
+        失败工况和不可行工况同样作为负样本纳入训练集。
+
+        Returns
+        -------
+        list[dict]
+            每行格式::
+
+                {
+                    "case_id":     str,
+                    "design_vars": dict,
+                    "label":       bool,   # True=可行正样本，False=负样本
+                    "status":      str,    # CaseStatus 字符串值
+                }
+
+            按 ``iteration ASC, created_at ASC`` 排序。
+            design_vars 为空字典、非 dict 或 JSON 解析失败的行将被跳过并记录警告。
+        """
+        rows = self._conn.execute(
+            "SELECT case_id, status, success, design_vars, iteration, created_at "
+            "FROM cases "
+            "ORDER BY iteration ASC, created_at ASC"
+        ).fetchall()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            # 过滤 pending 等未运行状态，只保留经过 Aspen 运行的结果
+            if row["status"] not in _VALID_CLASSIFIER_STATUSES:
+                continue
+
+            # 解析 design_vars JSON
+            raw_dv = row["design_vars"]
+            try:
+                design_vars = json.loads(raw_dv) if raw_dv else {}
+            except (json.JSONDecodeError, TypeError) as exc:
+                _log.warning(
+                    "export_feasibility_dataset：case '%s' 的 design_vars JSON 解析失败，已跳过。%s",
+                    row["case_id"], exc,
+                )
+                continue
+
+            # 必须是非空 dict
+            if not isinstance(design_vars, dict) or not design_vars:
+                continue
+
+            result.append({
+                "case_id":     row["case_id"],
+                "design_vars": design_vars,
+                "label":       bool(row["success"]),
+                "status":      row["status"],
+            })
+
+        return result
 
     # ------------------------------------------------------------------ #
     # 生命周期
