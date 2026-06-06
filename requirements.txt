@@ -12,6 +12,7 @@ scikit-optimize==0.10.2       # 贝叶斯优化代理模型 (GP / RF / ET / GBRT
 scikit-learn==1.7.2           # 机器学习算法（scikit-optimize 依赖）
 scipy==1.15.3                 # 科学计算（scikit-optimize / Pareto 超体积计算依赖）
 PyYAML==6.0.3                 # YAML 配置文件解析
+python-dotenv==1.0.0          # 从 .env 文件加载环境变量（LLM key 管理）
 
 # ------------------------------------------------------------------------------
 # 可视化（仅脚本工具 scripts/ 使用，主流程可选）

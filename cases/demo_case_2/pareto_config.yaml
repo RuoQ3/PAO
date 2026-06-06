@@ -45,14 +45,14 @@
 # 仿真文件
 # ---------------------------------------------------------------------------
 simulator:
-  filepath: cases/demo_case_2/2epsd.bkp
-  visible: false
-  suppress_dialogs: true
+  filepath: cases/demo_case_2/2epsd.bkp   # Aspen 仿真文件路径（.bkp），相对项目根目录
+  visible: false               # 是否显示 Aspen GUI；false=后台静默运行（批量优化更快更稳）
+  suppress_dialogs: true       # 自动抑制 Aspen 弹窗，避免优化被对话框阻塞
   require_type_library: true   # 强制加载 HAP 类型库，确保 block 状态检查可用
-  timeout: 300
-  reinit: true
-  verify_inputs: true
-  input_rtol: 1.0e-6
+  timeout: 300                 # 单次仿真超时秒数；超时判该工况失败，防止个别点卡死整轮
+  reinit: true                 # 每次运行前 reinit 重置状态，避免上一轮结果残留
+  verify_inputs: true          # 写入设计变量后回读校验，确认已真正写进 Aspen
+  input_rtol: 1.0e-6           # 输入回读校验的相对容差，偏差超过此比例则报错
 
 # ---------------------------------------------------------------------------
 # 设计变量
@@ -62,6 +62,18 @@ simulator:
 # 固定变量（不参与优化）：2 个（SOL × 2）
 # 总搜索维度：14 维（9 连续/derived + 5 整数）
 # F1/F2/F3 使用 derived frac 映射；S1/S2 使用 var_dependencies 保证 FEED_STAGE < NSTAGE
+#
+# 通用字段说明：
+#   name / description / aspen_path / type / lower_bound / upper_bound / initial_value / unit
+#   与 demo_case 一致（type 取值：continuous / integer / fixed / derived）。
+#
+# derived（派生变量）专属字段：不直接搜索绝对板号，而是搜索一个比例 frac，
+#   运行前再按 depends_on 的当前值映射成实际 FEED_STAGE，避免进料板贴底或越界：
+#     type: derived
+#     lo_frac / hi_frac   搜索的比例区间（如 0.35~0.85 表示进料板位于塔高 35%~85% 处）
+#     target_path         映射结果写入的实际 Aspen 路径（如 FEED_STAGE\F1）
+#     depends_on          所依赖的变量路径（通常是该塔的 NSTAGE，决定可用板范围）
+#     frac_lo             映射后允许的最小板号下限（防止落到太靠近塔顶的板）
 design_variables:
 
   # ── T1 塔 ──────────────────────────────────────────────────────────────
@@ -228,13 +240,13 @@ output_paths:
 # ---------------------------------------------------------------------------
 objectives:
   - name: TAC
-    type: tac
-    minimize: true
-    unit: "$/yr"
+    type: tac                        # 目标类型 tac：由经济模型按设备尺寸+公用工程计算总年化成本
+    minimize: true                   # 优化方向：最小化
+    unit: "$/yr"                     # 单位（仅展示用）
     annualization_factor: 0.1        # 10 年直线折旧
     operating_hours: 8000.0          # 年操作小时数
     skip_missing: false              # 任一设备缺数据则 TAC=None，不低估成本
-    allow_partial_objective: false
+    allow_partial_objective: false   # false=目标必须完整可算，否则该工况判为 objective_error
     utility_cost:
       steam_price: 14.19             # $/GJ，低压蒸汽（Turton 2018）
       cooling_water_price: 0.354     # $/GJ
@@ -267,17 +279,17 @@ objectives:
         T3: 0.8                      # m
 
   - name: EMISSIONS
-    type: emissions
-    minimize: true
-    unit: "tonne CO2-eq/yr"
-    operating_hours: 8000.0
-    skip_missing: false
-    allow_partial_objective: false
+    type: emissions                  # 目标类型 emissions：由公用工程消耗 × 排放因子计算 CO₂-eq
+    minimize: true                   # 优化方向：最小化
+    unit: "tonne CO2-eq/yr"          # 单位（仅展示用）
+    operating_hours: 8000.0          # 年操作小时数
+    skip_missing: false              # 任一设备缺数据则结果=None，不低估排放
+    allow_partial_objective: false   # false=目标必须完整可算，否则该工况判为 objective_error
     emission_factors:
       steam_factor: 66.0             # kg CO₂/GJ，天然气锅炉 η=0.85
       cooling_water_factor: 0.0      # 冷却水排放可忽略
       electricity_factor: 0.581      # kg CO₂/kWh，中国电网 2023
-    ghg_components:
+    ghg_components:                  # 各温室气体的 GWP（全球变暖潜值），折算为 CO₂-eq 的系数
       CO2: 1.0
       CH4: 27.9
       N2O: 273.0
@@ -286,6 +298,8 @@ objectives:
 # ---------------------------------------------------------------------------
 # 约束（对应原 MATLAB 的纯度约束 >= 0.999 mol frac）
 # ---------------------------------------------------------------------------
+# 字段：name 约束名 / description 说明 / aspen_path 读取节点 /
+#       operator 比较算子(>= <= > < ==) / threshold 阈值；不满足则该工况判为不可行。
 constraints:
   - name: D1_PF_purity
     description: D1 塔顶产品 PF 摩尔分率不低于 0.999（Aspen 组分名 PF，对应 MATLAB 中的 PROH）
@@ -331,17 +345,17 @@ extraction:
     - D2
     - D3
   block_max_depth: 2                 # 从 3 降为 2，避免遍历 Column Internals 深层节点
-  stream_max_depth: 3
-  stream_output_subtree: "Output\\STR_MAIN"
+  stream_max_depth: 3                # stream 子树遍历最大深度
+  stream_output_subtree: "Output\\STR_MAIN"   # stream 只提取主物流结果子树，跳过无关分支
   strict_extraction: false           # 节点级失败记录到 notes，不阻断目标计算
 
   # ── manifest runtime 模式（可选，启用后替代递归 TreeExporter）──────────────
   # 启用方式：将 mode 改为 manifest，首次运行会自动 catalog scan + build manifest
   # 优势：直接路径读取，COM 访问次数最小化，解决 CA_DIAM* 深层节点截断问题
-  mode: manifest
-  catalog_db: cases/demo_case_2/output/node.db
+  mode: manifest                     # 提取模式：manifest=按清单直接读取；full=递归遍历
+  catalog_db: cases/demo_case_2/output/node.db   # 节点目录/manifest 数据库路径
   manifest_id: auto                  # auto=自动查找最新 manifest；或指定具体 ID
-  semantic_rules_dir: configs/aspen_semantics
+  semantic_rules_dir: configs/aspen_semantics    # 语义标注规则目录（给节点附加业务含义）
   build_manifest_if_missing: true    # 首次运行自动 catalog scan + build manifest
   write_node_values: true            # 将读取结果写入 node.db node_values 表
   strict_manifest: true              # manifest invalid 时阻止优化（不把缺数据当有效样本）
@@ -350,7 +364,7 @@ extraction:
 # 优化器（多目标 Pareto 贝叶斯优化）
 # ---------------------------------------------------------------------------
 optimizer:
-  type: pareto_bayesian
+  type: pareto_bayesian             # 优化类型：pareto_bayesian=多目标 Pareto；bayesian=单目标
   n_initial_points: 42              # 14 维（6 连续 + 8 整数），建议初始 DOE >= 3 倍维度
   n_iterations: 150                 # 14 维混合整数空间，需要更多样本
   surrogate_model: RF               # RF 对混合整数、非线性响应面更稳健
@@ -362,8 +376,8 @@ optimizer:
   # RANDOM：纯随机采样，不用代理模型，不依赖 skopt。
 
   scalarization: chebyshev          # Chebyshev 标量化对非凸 Pareto 前沿覆盖更均匀
-  acquisition_function: EI          # Expected Improvement
-  random_seed: 42
+  acquisition_function: EI          # 采集函数：EI=期望改善 / UCB / PI
+  random_seed: 42                   # 全局随机种子，保证 DOE 与候选生成可复现
   n_initial_min: 5                  # 启用代理模型所需的最少成功样本数
   hv_margin: 0.1                    # 自动推断参考点时各维度扩展 10%
 
@@ -444,17 +458,21 @@ feasibility_gate:
 # 变量依赖约束
 # S1/S2 为整数优化变量，必须满足 < 对应塔的 NSTAGE。
 # F1/F2/F3 已由 derived frac 映射保证合法，不再放入 var_dependencies。
+# 格式：被约束路径: { 算子: 参照路径 }；算子 lt(<) / le(<=) / gt(>) / ge(>=)。
+# 采样违反依赖关系的候选点会在 repair 阶段被修正或拒绝，避免提交非法工况给 Aspen。
 # ---------------------------------------------------------------------------
 var_dependencies:
   \Data\Blocks\T1\Input\FEED_STAGE\S1:
-    lt: \Data\Blocks\T1\Input\NSTAGE
+    lt: \Data\Blocks\T1\Input\NSTAGE     # S1 进料板号必须小于 T1 总板数
   \Data\Blocks\T2\Input\FEED_STAGE\S2:
-    lt: \Data\Blocks\T2\Input\NSTAGE
+    lt: \Data\Blocks\T2\Input\NSTAGE     # S2 进料板号必须小于 T2 总板数
 
 # ---------------------------------------------------------------------------
 # Phase 0 可行性搜索（在 Phase 1 DOE 之前先找可行点）
 # ---------------------------------------------------------------------------
+# 高维混合整数空间随机点大多不可行，先用纯随机试验快速找到几个可行起点，
+# 给后续 DOE 和代理模型一个有意义的初始可行域。
 feasibility_search:
-  enabled: true
+  enabled: true                     # 是否启用 Phase 0 预搜索；false=直接进入 DOE
   n_trials: 30                      # 混合整数空间失败率更高，从 10 → 30
   stop_after_feasible: 3            # 找到 3 个可行点后提前停止

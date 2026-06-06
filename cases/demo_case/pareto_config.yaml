@@ -25,32 +25,45 @@
 # 仿真文件
 # ---------------------------------------------------------------------------
 simulator:
-  filepath: cases/demo_case/二级氢氰化工段.bkp
-  visible: false
-  suppress_dialogs: true
+  filepath: cases/demo_case/二级氢氰化工段.bkp   # Aspen 仿真文件路径（.bkp/.apw），相对项目根目录
+  visible: false               # 是否显示 Aspen GUI 窗口；false=后台静默运行（批量优化时更快更稳）
+  suppress_dialogs: true       # 自动抑制 Aspen 弹窗（如收敛警告对话框），避免优化被阻塞
   require_type_library: true   # 强制加载 HAP 类型库，确保 block 状态检查可用
-  timeout: 300
-  reinit: true
-  verify_inputs: true
-  input_rtol: 1.0e-6
+  timeout: 300                 # 单次仿真超时秒数；超过则判该工况失败，防止个别点卡死整轮优化
+  reinit: true                 # 每次运行前 reinit 重置仿真状态，避免上一轮结果残留影响当前点
+  verify_inputs: true          # 写入设计变量后回读校验，确认值已真正写进 Aspen（防静默写入失败）
+  input_rtol: 1.0e-6           # 输入回读校验的相对容差；回读值与写入值偏差超过此比例则报错
 
 # ---------------------------------------------------------------------------
 # 设计变量
 # ---------------------------------------------------------------------------
+# 每个变量的通用字段说明：
+#   name          变量标识名（日志、图表、数据库中显示用）
+#   description   人类可读说明（仅注释用途，不参与计算）
+#   aspen_path    该变量在 Aspen 变量树中的完整路径（写入点）
+#   type          变量类型：
+#                   continuous 连续变量，纳入贝叶斯优化搜索空间
+#                   integer    整数变量，搜索时按连续处理、repair 阶段 round/clamp 取整
+#                   fixed      固定变量，始终取 initial_value，不参与优化
+#                   derived    派生变量，按比例映射到某个依赖路径（见 demo_case_2）
+#   lower_bound   搜索下界（fixed 变量上下界相等）
+#   upper_bound   搜索上界
+#   initial_value 初始值（DOE 之前的基准点，也是 fixed 变量的取值）
+#   unit          物理单位（"-" 表示无量纲）
 design_variables:
   - name: T0301_BF
     description: T0301 塔底采出比（主要控制 ADN 产量）
     aspen_path: \Data\Blocks\T0301\Input\B:F
-    type: continuous
+    type: continuous            # 连续变量，参与 BO 搜索
     lower_bound: 0.3
     upper_bound: 0.9
     initial_value: 0.6
     unit: "-"
 
   - name: T0301_FEED_STAGE
-    description: T0301 进料板位置（固定，不参与优化）
+    description: T0301 进料板位置
     aspen_path: \Data\Blocks\T0301\Input\FEED_STAGE\0318
-    type: integer
+    type: integer               # 整数变量，repair 阶段 round/clamp 取整
     lower_bound: 10
     upper_bound: 20
     initial_value: 15
@@ -59,7 +72,7 @@ design_variables:
   - name: T0301_BASIS_RR
     description: T0301 回流比（主要控制分离效果和能耗）
     aspen_path: \Data\Blocks\T0301\Input\BASIS_RR
-    type: continuous
+    type: continuous            # 连续变量，参与 BO 搜索
     lower_bound: 1.0
     upper_bound: 3.0
     initial_value: 2.0
@@ -76,15 +89,21 @@ output_paths:
 # ---------------------------------------------------------------------------
 # 目标函数
 # ---------------------------------------------------------------------------
+# 字段说明：
+#   name        目标名（图表/数据库列名）
+#   type        目标取值方式：aspen_path 直接读 Aspen 节点；tac/emissions 由经济模型计算
+#   aspen_path  type=aspen_path 时的读取节点路径
+#   minimize    优化方向：true=最小化，false=最大化
+#   unit        目标单位（仅展示用）
 objectives:
   - name: ADN_FLOW
-    type: aspen_path
+    type: aspen_path           # 直接读取 Aspen 输出节点的数值作为目标
     aspen_path: \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
     minimize: false    # 最大化产量
     unit: "kg/hr"
 
   - name: REB_DUTY
-    type: aspen_path
+    type: aspen_path           # 直接读取再沸器热负荷节点
     aspen_path: \Data\Blocks\T0301\Output\REB_DUTY
     minimize: true     # 最小化能耗（再沸器热负荷，kW）
     unit: "kW"
@@ -92,6 +111,12 @@ objectives:
 # ---------------------------------------------------------------------------
 # 约束
 # ---------------------------------------------------------------------------
+# 字段说明：
+#   name        约束名
+#   description 人类可读说明
+#   aspen_path  约束量的读取节点
+#   operator    比较算子：>= / <= / > / < / ==
+#   threshold   阈值；不满足 operator threshold 的工况标记为 infeasible（不可行）
 constraints:
   - name: purity_min
     description: ADN 质量分数不低于 0.9（产品纯度下限）
@@ -102,36 +127,37 @@ constraints:
 # ---------------------------------------------------------------------------
 # block/stream 提取配置
 # ---------------------------------------------------------------------------
+# 控制每次仿真后从 Aspen 抓取哪些 block/stream 节点写入结果数据库。
 extraction:
-  check_status_paths:
+  check_status_paths:          # 仿真后检查这些 block/stream 的收敛状态，任一未收敛则判失败
     - \Data\Blocks\T0301
     - \Data\Streams\ADN
-  blocks:
+  blocks:                      # 需要提取 Output 子树的 block 列表
     - T0301
-  streams:
+  streams:                     # 需要提取的 stream 列表
     - ADN
-  block_max_depth: 3
-  stream_max_depth: 3
-  stream_output_subtree: "Output\\STR_MAIN"
-  strict_extraction: false
-  mode: manifest
-  catalog_db: cases/demo_case/output/node.db
-  manifest_id: auto
-  semantic_rules_dir: configs/aspen_semantics
-  build_manifest_if_missing: true
-  write_node_values: true
-  strict_manifest: true
+  block_max_depth: 3           # block 子树遍历最大深度（越深抓取越全，但越慢）
+  stream_max_depth: 3          # stream 子树遍历最大深度
+  stream_output_subtree: "Output\\STR_MAIN"   # stream 只提取此子树（主物流结果，跳过无关分支）
+  strict_extraction: false     # false=节点级提取失败仅记 notes，不阻断目标计算；true=直接判失败
+  mode: manifest               # 提取模式：manifest=按预建清单直接路径读取（快）；full=递归遍历
+  catalog_db: cases/demo_case/output/node.db   # 节点目录/manifest 数据库路径
+  manifest_id: auto            # 使用哪个 manifest；auto=自动选最新
+  semantic_rules_dir: configs/aspen_semantics  # 语义标注规则目录（给节点附加业务含义）
+  build_manifest_if_missing: true   # manifest 不存在时自动 catalog scan 并构建
+  write_node_values: true      # 将本轮读取的节点值写入 node.db 的 node_values 表
+  strict_manifest: true        # manifest 无效时阻止优化，避免把缺数据的工况当作有效样本
 
 # ---------------------------------------------------------------------------
 # 优化器（多目标 Pareto 贝叶斯优化）
 # ---------------------------------------------------------------------------
 optimizer:
-  type: pareto_bayesian
-  n_initial_points: 20
+  type: pareto_bayesian             # 优化类型：pareto_bayesian=多目标 Pareto；bayesian=单目标
+  n_initial_points: 20              # 初始 DOE 采样点数（建模前的随机/LHS 探索）
   n_iterations: 60                  # 总仿真次数 = 20 + 60 = 80
   scalarization: chebyshev          # 对非凸 Pareto 前沿覆盖更均匀
-  acquisition_function: EI
-  random_seed: 42
+  acquisition_function: EI          # 采集函数：EI=期望改善 / UCB / PI
+  random_seed: 42                   # 全局随机种子，保证 DOE 与候选生成可复现
 
   # ML-assisted feasibility filtering（运行时生效）
   # 作用：用历史仿真数据库中的成功/失败标签训练可行性分类器，在 BO 阶段先生成候选池，
@@ -158,7 +184,7 @@ optimizer:
   #   - 候选去重在 enabled=true 和 false 时都会生效（去重是保护机制，与早停无关）。
   early_stopping:
     enabled: true                    # 是否启用早停判断；false=跑满 n_iterations，去重仍生效
-    min_iterations: 40               # 至少完成多少次总迭代后才允许触发早停
+    min_iterations: 30               # 至少完成多少次总迭代后才允许触发早停
                                      # 设为 n_initial_points + 20，确保 BO 至少探索 20 轮再判断
     patience: 10                     # 连续多少轮无有效改善后停止；越大越宽松，允许更长停滞期
     min_delta: 1.0e-6                # hypervolume 改善量必须 > min_delta 才算有效改善；
