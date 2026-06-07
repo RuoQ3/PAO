@@ -1,5 +1,5 @@
 """
-workflows.py — run_demo_case_workflow 控制骨架。
+workflow.py — run_demo_case_workflow 控制骨架。
 
 把配置解析（workflow_helpers）、状态管理（state）、报告组装（workflow_report）
 串联成完整编排，通过可注入 DemoWorkflowToolRunner 调用 tools。
@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from src.agents.state import DemoWorkflowState
-from src.agents.workflow_helpers import prepare_demo_workflow_state
-from src.agents.workflow_report import build_demo_workflow_report
+from src.agents.demo_workflow.state import DemoWorkflowState
+from src.agents.demo_workflow.helpers import prepare_demo_workflow_state
+from src.agents.demo_workflow.report import build_demo_workflow_report
 
 
 # ---------------------------------------------------------------------------

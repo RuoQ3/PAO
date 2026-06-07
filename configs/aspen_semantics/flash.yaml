@@ -1,0 +1,123 @@
+# flash.yaml — Flash2 单元操作语义规则
+#
+# 覆盖范围：FLASH2（两出口闪蒸）
+# 关联文件：flash3.yaml（三出口闪蒸，第二液相出口）
+#
+# 可调输入字段（用于 discover_tunables）
+# ----------------------------------------
+# 字段中额外字段说明（manifest.py 忽略，discover_tunables 使用）：
+#   tunable:         true 表示此字段可作为优化设计变量
+#   suggested_lower: 建议下界（物理单位与 validators.unit_dimension 一致）
+#   suggested_upper: 建议上界
+#   confidence:      high / medium / low（经验边界可靠程度）
+#
+# 注意：Flash2 的规格设定三选一（TEMP+PRES / TEMP+VFRAC / PRES+VFRAC），
+#       Aspen 实际写入的是用户选中的规格变量，未选中的输入 path 通常不存在或值为 0。
+
+equipment_type: FLASH2
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  temperature:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 250       # K，经验下界
+    suggested_upper: 450       # K，经验上界
+    confidence: medium         # 经验估算，具体工艺范围需用户确认
+    candidates:
+      - pattern: "Input\\TEMP"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.1       # atm，经验下界
+    suggested_upper: 10        # atm，经验上界
+    confidence: medium         # 经验估算，高压工艺需用户调整
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  vapor_fraction:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.0       # 无量纲，物理下界
+    suggested_upper: 1.0       # 无量纲，物理上界
+    confidence: high           # 边界固定（汽化率 0~1），经验可靠
+    candidates:
+      - pattern: "Input\\VFRAC"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  heat_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\DUTY"
+        priority: 100
+      - pattern: "Output\\QNET"
+        priority: 80
+      - pattern: "Output\\Q*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  vapor_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\VAPOR"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW\\VAPOR"
+        priority: 90
+      - pattern: "Output\\VMOLE_FLOW"
+        priority: 70
+      - pattern: "Output\\VMASS_FLOW"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  liquid_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\LIQUID"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW\\LIQUID"
+        priority: 90
+      - pattern: "Output\\LMOLE_FLOW"
+        priority: 70
+      - pattern: "Output\\LMASS_FLOW"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\T"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

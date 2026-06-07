@@ -1,0 +1,81 @@
+# pump.yaml — Pump 泵语义规则
+#
+# 覆盖范围：PUMP（离心泵/正排量泵）
+# 关联文件：compr.yaml（压缩机，字段相似但优先级和典型范围不同）
+#
+# 典型工艺场景：
+#   液相增压（输送至高压反应器、精馏塔进料泵）
+#   设计变量：出口压力（主要影响能耗和下游操作）、泵效率（若可调）
+#   目标读取：净功率（TAC/排放核算）、出口温度
+
+equipment_type: PUMP
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  outlet_pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 1         # bar，经验下界（略高于进口压力）
+    suggested_upper: 100       # bar，经验上界（高压泵上限）
+    confidence: medium         # 范围取决于下游系统，需用户确认
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+      - pattern: "Input\\POUT"
+        priority: 90
+      - pattern: "Input\\POUT*"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  efficiency:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.5       # 无量纲，工业泵效率下限
+    suggested_upper: 0.9       # 无量纲，工业泵效率上限
+    confidence: medium         # 一般可在此范围内调节，高精度泵可超过 0.9
+    candidates:
+      - pattern: "Input\\EFF"
+        priority: 100
+      - pattern: "Input\\EFFP"
+        priority: 90           # 部分 Aspen 版本泵效率路径
+      - pattern: "Input\\EFF*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  power:
+    required_for: [TAC, EMISSIONS]
+    required: true
+    candidates:
+      - pattern: "Output\\WNET"
+        priority: 100
+      - pattern: "Output\\WNET*"
+        priority: 90
+      - pattern: "Output\\POWER"
+        priority: 80
+      - pattern: "Output\\W*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: power
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\TEMP_OUT"
+        priority: 90
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

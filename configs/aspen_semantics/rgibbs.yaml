@@ -1,0 +1,71 @@
+# rgibbs.yaml — RGibbs 吉布斯自由能最小化反应器语义规则（A2-3 补充）
+#
+# 覆盖范围：RGIBBS（基于 Gibbs 自由能最小化，无需指定反应化学计量）
+# 关联文件：rstoic.yaml（化学计量），requil.yaml（平衡反应器）
+#
+# RGibbs 的主要特点：
+#   1. 无转化率输入（热力学平衡由 Gibbs 最小化自动计算）
+#   2. 温度压力是主要可调设计变量（决定平衡态组成和能耗）
+#   3. 热负荷路径与 RStoic 相同（QCALC）
+
+equipment_type: RGIBBS
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  temperature:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null      # 强烈依赖体系，无通用下界
+    suggested_upper: null
+    confidence: low
+    candidates:
+      - pattern: "Input\\TEMP"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null
+    suggested_upper: null
+    confidence: low
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  heat_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\QCALC"
+        priority: 100
+      - pattern: "Output\\DUTY"
+        priority: 90
+      - pattern: "Output\\Q*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\TEMP_OUT"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

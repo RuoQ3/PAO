@@ -1,0 +1,63 @@
+# ssplit.yaml — SSplit 按组分分流器语义规则（A2-4 补充）
+#
+# 覆盖范围：SSPLIT（按流股组分分率分流，各出口相态可不同）
+# 关联文件：splitter.yaml（FSplit，按总流量分流）
+#
+# SSplit 与 FSplit 的差异：
+#   FSplit 对所有组分使用相同分流比；
+#   SSplit 可为每个组分指定独立的分流比，用于精细的组分分离控制。
+# 因此 SSplit 的分流比字段是多实例的（multi: true）。
+
+equipment_type: SSPLIT
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  split_fraction:
+    required_for: []
+    required: false
+    tunable: true
+    multi: true            # 每个组分对应一个独立分流比路径，全部保留
+    suggested_lower: 0.0
+    suggested_upper: 1.0
+    confidence: high
+    candidates:
+      - pattern: "Input\\FRAC\\*"
+        priority: 100          # * 匹配出口流股名（与 FSplit 路径结构相同）
+      - pattern: "Input\\FRAC*"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+      leaf_only: true          # 排除 Input\FRAC 父节点
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  outlet_mole_flow:
+    required_for: []
+    required: false
+    multi: true
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\*"
+        priority: 100
+      - pattern: "Output\\MOLE_FLOW*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: any
+      leaf_only: true
+
+  outlet_mass_flow:
+    required_for: []
+    required: false
+    multi: true
+    candidates:
+      - pattern: "Output\\MASS_FLOW\\*"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: any
+      leaf_only: true

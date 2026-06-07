@@ -1,0 +1,83 @@
+# compr.yaml — Compr 压缩机语义规则（A2-2d）
+#
+# 覆盖范围：COMPR（单级离心压缩机/往复式压缩机）
+# 关联文件：pump.yaml（泵，字段相似但压缩比和温升特性不同）
+#
+# 与 pump.yaml 的主要差异：
+#   1. 出口压力范围更宽（气相压缩比可达 10~100）
+#   2. 效率字段优先路径不同（等熵效率 EFFIS vs 多变效率 EFFP）
+#   3. 出口温度在压缩机中是重要的安全约束（气体温度上限）
+
+equipment_type: COMPR
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  outlet_pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 1         # bar，进口压力以上
+    suggested_upper: 200       # bar，高压气体压缩上限
+    confidence: medium
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+      - pattern: "Input\\POUT"
+        priority: 90
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  isentropic_efficiency:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.6       # 无量纲，压缩机等熵效率下限（老机型/高压比）
+    suggested_upper: 0.85      # 无量纲，现代离心压缩机上限
+    confidence: medium
+    candidates:
+      - pattern: "Input\\EFFIS"
+        priority: 100          # 等熵效率（常用规格方式）
+      - pattern: "Input\\EFF"
+        priority: 90
+      - pattern: "Input\\EFFP"
+        priority: 80           # 多变效率
+      - pattern: "Input\\EFF*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  power:
+    required_for: [TAC, EMISSIONS]
+    required: true
+    candidates:
+      - pattern: "Output\\WNET"
+        priority: 100
+      - pattern: "Output\\WNET*"
+        priority: 90
+      - pattern: "Output\\POWER"
+        priority: 80
+      - pattern: "Output\\W*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: power
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false             # 压缩机出口温度是重要安全约束，但 manifest 不强制要求
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\TEMP_OUT"
+        priority: 90
+      - pattern: "Output\\TEMP*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

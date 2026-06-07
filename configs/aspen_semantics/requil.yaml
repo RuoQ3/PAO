@@ -1,0 +1,71 @@
+# requil.yaml — REquil 平衡反应器语义规则（A2-3d）
+#
+# 覆盖范围：REQUIL（化学平衡反应器，基于平衡常数计算）
+# 关联文件：rstoic.yaml（化学计量反应器，字段结构相同）
+#
+# 与 rstoic.yaml 的差异：
+#   1. 无转化率输入（转化率由平衡计算确定，不可设定）
+#   2. 热负荷路径与 RStoic 相同
+#   3. 温度/压力对平衡的影响更显著，但边界仍依赖工艺
+
+equipment_type: REQUIL
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  temperature:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null
+    suggested_upper: null
+    confidence: low            # 平衡温度影响显著，无通用经验范围，需用户确认
+    candidates:
+      - pattern: "Input\\TEMP"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null
+    suggested_upper: null
+    confidence: low
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  heat_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\QCALC"
+        priority: 100
+      - pattern: "Output\\DUTY"
+        priority: 90
+      - pattern: "Output\\Q*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\TEMP_OUT"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

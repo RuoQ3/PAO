@@ -111,6 +111,15 @@ from .summarize_pareto import (
     _fmt_hv_section,
     _fmt_sensitivity_section,
 )
+from .discover_tunables import (
+    discover_tunables_tool,
+    discover_tunables_impl,
+    _scan_aspen_file,
+    _build_tunable_variables,
+    _build_readable_targets,
+    _compute_semantic_coverage,
+    _serialize_report,
+)
 
 # 共享工具（供测试直接访问）
 from ._common import (
@@ -141,6 +150,7 @@ def get_agent_tools() -> list[BaseTool]:
         query_node_db_tool,
         diagnose_case_tool,
         summarize_pareto_tool,
+        discover_tunables_tool,
     ]
 
 
@@ -153,6 +163,7 @@ __all__ = [
     "optimize_pareto_tool",
     "query_simulation_db_tool",
     "query_node_db_tool",
+    "discover_tunables_tool",
     # 工具注册
     "get_agent_tools",
     # 核心实现（供测试）
@@ -212,4 +223,11 @@ __all__ = [
     "_parse_tags_str",
     "_import_run_time_deps",
     "_import_pareto_deps",
+    # discover_tunables
+    "discover_tunables_tool",
+    "discover_tunables_impl",
+    "_build_tunable_variables",
+    "_build_readable_targets",
+    "_compute_semantic_coverage",
+    "_serialize_report",
 ]

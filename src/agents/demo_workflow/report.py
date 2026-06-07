@@ -1,5 +1,5 @@
 """
-workflow_report.py — run_demo_case_workflow 报告组装层。
+report.py — run_demo_case_workflow 报告组装层。
 
 只从 DemoWorkflowState 读取已有数据，生成最终文本报告。
 不调用任何 tools，不导入底层依赖，不读写数据库，不运行仿真。
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.agents.state import DemoWorkflowState, WorkflowStep
+    from src.agents.demo_workflow.state import DemoWorkflowState, WorkflowStep
 
 # ---------------------------------------------------------------------------
 # 内部格式化辅助
@@ -246,7 +246,7 @@ def build_demo_workflow_report(state: "DemoWorkflowState") -> str:
     不调用任何 tool，不读写数据库，不访问 Aspen，不伪装失败为成功。
     """
     # 运行时才导入 state，避免循环依赖
-    from src.agents.state import DemoWorkflowState as _DemoWorkflowState  # noqa: F401
+    from src.agents.demo_workflow.state import DemoWorkflowState as _DemoWorkflowState  # noqa: F401
 
     sections = [
         "=== run_demo_case_workflow 报告 ===",

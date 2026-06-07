@@ -358,6 +358,9 @@ class ManifestBuilder:
         for field_name, field_def in fields.items():
             required_for: list[str] = field_def.get("required_for", [])
             is_required: bool = field_def.get("required", False)
+            # multi:true 表示该字段对应多个实例（如各反应转化率、各分流出口），
+            # 应为每个通过校验的路径都生成一条 item，而不是只选第一个。
+            is_multi: bool = field_def.get("multi", False)
 
             # 判断此字段是否需要读取
             if required_for and not any(obj in required_for for obj in objective_names):
@@ -371,8 +374,94 @@ class ManifestBuilder:
                 candidates, key=lambda c: c.get("priority", 0), reverse=True
             )
 
+            # multi 模式：收集所有候选中所有通过校验的节点，去重后全部入 manifest
+            # 每个节点用唯一语义键（base_field:instance_name），避免后续 dict 压扁。
+            # instance_name 取自路径最后一段（叶节点名称），与 block_root 及 pattern 前缀无关。
+            if is_multi:
+                multi_items: list[ReadManifestItem] = []
+                seen_paths: set[str] = set()
+                rejection_details: list[str] = []
+                for idx, cand in enumerate(sorted_candidates):
+                    pattern = cand.get("pattern", "")
+                    priority = cand.get("priority", 0)
+                    base_rule_id = f"{block_type.lower()}.{field_name}.{idx}"
+
+                    matched_entries = self._match_pattern_all(
+                        block_name, pattern, path_index, catalog_id
+                    )
+                    if not matched_entries:
+                        rejection_details.append(f"'{pattern}' 无路径匹配")
+                        continue
+
+                    confidence = min(1.0, priority / 100.0)
+                    for entry in matched_entries:
+                        abs_upper = entry["abs_path"].upper()
+                        if abs_upper in seen_paths:
+                            continue  # 已被更高优先级候选收录，跳过
+                        val_err = self._validate_entry(entry, validators)
+                        if val_err:
+                            _log.debug(
+                                "block '%s' 字段 '%s'（multi）候选 '%s' 路径 '%s' 校验失败：%s",
+                                block_name, field_name, pattern, entry["abs_path"], val_err,
+                            )
+                            continue
+                        seen_paths.add(abs_upper)
+                        # 唯一语义键：base_field:instance_name（取路径末段）
+                        instance_name = entry["abs_path"].rsplit("\\", 1)[-1]
+                        unique_field = f"{field_name}:{instance_name}"
+                        multi_items.append(ReadManifestItem(
+                            manifest_id=manifest_id,
+                            source_type="block",
+                            source_name=block_name,
+                            equipment_type=block_type,
+                            semantic_field=unique_field,
+                            abs_path=entry["abs_path"],
+                            rel_path=entry["rel_path"],
+                            unit_string=entry.get("unit_string", ""),
+                            value_type=entry.get("value_type", 0),
+                            required=is_required,
+                            confidence=confidence,
+                            rule_id=base_rule_id,
+                            error="",
+                        ))
+
+                if multi_items:
+                    items.extend(multi_items)
+                    _log.debug(
+                        "block '%s' 字段 '%s'（multi）共命中 %d 个节点",
+                        block_name, field_name, len(multi_items),
+                    )
+                else:
+                    rejection_summary = "；".join(rejection_details) if rejection_details else "无候选"
+                    err_msg = (
+                        f"block '{block_name}'（{block_type}）字段 '{field_name}'（multi）"
+                        f"在 catalog 中未找到任何匹配路径（{rejection_summary}）"
+                    )
+                    if is_required:
+                        errors.append(err_msg)
+                        _log.warning(err_msg)
+                    else:
+                        _log.debug(err_msg)
+                    items.append(ReadManifestItem(
+                        manifest_id=manifest_id,
+                        source_type="block",
+                        source_name=block_name,
+                        equipment_type=block_type,
+                        semantic_field=field_name,
+                        abs_path="",
+                        rel_path="",
+                        unit_string="",
+                        value_type=0,
+                        required=is_required,
+                        confidence=0.0,
+                        rule_id=f"{block_type.lower()}.{field_name}.missing",
+                        error=err_msg,
+                    ))
+                continue  # multi 字段处理完毕，进入下一字段
+
+            # 普通单值模式：选最高优先级第一个通过校验的节点
             best_item: ReadManifestItem | None = None
-            rejection_details: list[str] = []
+            rejection_details = []
             for idx, cand in enumerate(sorted_candidates):
                 pattern = cand.get("pattern", "")
                 priority = cand.get("priority", 0)
@@ -580,5 +669,20 @@ class ManifestBuilder:
                     )
             except (ValueError, TypeError):
                 pass  # 非数值 sample_value 不拒绝
+
+        # leaf_only 校验：排除非叶父节点和向量/矩阵（dimension != 0）
+        # 用于 multi 字段，防止 Input\CONV 父节点与 Input\CONV\1/2/3 子节点同时入 manifest。
+        if validators.get("leaf_only", False):
+            if not entry.get("is_leaf", True):
+                return (
+                    f"is_leaf=False，节点是父节点，不是可写标量"
+                    f"（leaf_only=true，abs_path={entry.get('abs_path', '')}）"
+                )
+            dim = entry.get("dimension", 0)
+            if dim not in (0, None):
+                return (
+                    f"dimension={dim}，节点是向量/矩阵，不是标量"
+                    f"（leaf_only=true，abs_path={entry.get('abs_path', '')}）"
+                )
 
         return ""

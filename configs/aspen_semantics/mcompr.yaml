@@ -1,0 +1,78 @@
+# mcompr.yaml — MCompr 多级压缩机语义规则（A2-2 补充）
+#
+# 覆盖范围：MCOMPR（多级压缩机，含中间冷却器）
+# 关联文件：compr.yaml（单级压缩机）
+#
+# MCompr 是多级压缩的集成单元，每级压比单独控制，
+# 但 Aspen 以整体 block 方式提供总净功率和出口温度。
+# 可调规格通常是各级出口压力（通过压比间接指定）或最终出口压力。
+
+equipment_type: MCOMPR
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  outlet_pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 1
+    suggested_upper: 300       # bar，多级压缩出口压力上限更高
+    confidence: medium
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100          # 最终出口压力（整体规格）
+      - pattern: "Input\\POUT"
+        priority: 90
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  isentropic_efficiency:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.6
+    suggested_upper: 0.85
+    confidence: medium
+    candidates:
+      - pattern: "Input\\EFFIS"
+        priority: 100
+      - pattern: "Input\\EFF"
+        priority: 90
+      - pattern: "Input\\EFF*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  power:
+    required_for: [TAC, EMISSIONS]
+    required: true
+    candidates:
+      - pattern: "Output\\WNET"
+        priority: 100          # 总净功率（所有级之和）
+      - pattern: "Output\\WNET*"
+        priority: 90
+      - pattern: "Output\\POWER"
+        priority: 80
+      - pattern: "Output\\W*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: power
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100          # 最终出口温度
+      - pattern: "Output\\TEMP_OUT"
+        priority: 90
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

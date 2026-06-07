@@ -1,0 +1,130 @@
+# flash3.yaml — Flash3 三出口闪蒸语义规则（A2-1d）
+#
+# Flash3 在 Flash2 基础上增加第二液相出口（LIQUID2），
+# 用于液液两相分离工艺（如萃取、共沸蒸馏进料前处理）。
+# 其他规格字段（TEMP/PRES/VFRAC/DUTY）与 Flash2 完全一致。
+
+equipment_type: FLASH3
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  temperature:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 250
+    suggested_upper: 450
+    confidence: medium
+    candidates:
+      - pattern: "Input\\TEMP"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.1
+    suggested_upper: 10
+    confidence: medium
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  vapor_fraction:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.0
+    suggested_upper: 1.0
+    confidence: high
+    candidates:
+      - pattern: "Input\\VFRAC"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  heat_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\DUTY"
+        priority: 100
+      - pattern: "Output\\QNET"
+        priority: 80
+      - pattern: "Output\\Q*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  vapor_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\VAPOR"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW\\VAPOR"
+        priority: 90
+      - pattern: "Output\\VMOLE_FLOW"
+        priority: 70
+      - pattern: "Output\\VMASS_FLOW"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  liquid_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\LIQUID"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW\\LIQUID"
+        priority: 90
+      - pattern: "Output\\LMOLE_FLOW"
+        priority: 70
+      - pattern: "Output\\LMASS_FLOW"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  # Flash3 独有：第二液相出口（LIQUID2）
+  liquid2_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\LIQUID2"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW\\LIQUID2"
+        priority: 90
+      - pattern: "Output\\L2MOLE_FLOW"
+        priority: 70
+      - pattern: "Output\\L2MASS_FLOW"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\T"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

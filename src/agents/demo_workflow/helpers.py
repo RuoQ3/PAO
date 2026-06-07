@@ -1,5 +1,5 @@
 """
-workflow_helpers.py — run_demo_case_workflow 的配置解析辅助层。
+helpers.py — run_demo_case_workflow 的配置解析辅助层。
 
 只做纯 Python 的配置读取与路径解析，把 case_config_path 的关键信息
 填入 DemoWorkflowState。
@@ -13,10 +13,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from src.agents.state import DemoWorkflowState
+from src.agents.demo_workflow.state import DemoWorkflowState
 
-# 项目根目录（src/agents/workflow_helpers.py → 上三层）
-_PROJECT_ROOT: Path = Path(__file__).parent.parent.parent
+# 项目根目录（src/agents/demo_workflow/helpers.py → 上四层）
+_PROJECT_ROOT: Path = Path(__file__).parent.parent.parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ def _resolve_config_path(case_config_path: str) -> str:
     解析优先级：
     1. 绝对路径直接使用
     2. 相对于当前工作目录
-    3. 相对于项目根目录（src/agents/workflow_helpers.py 往上三层）
+    3. 相对于项目根目录（src/agents/demo_workflow/helpers.py 往上四层）
 
     Returns:
         已验证存在的绝对路径字符串。

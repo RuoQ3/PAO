@@ -1,0 +1,69 @@
+# splitter.yaml — FSplit 流量分配器语义规则
+#
+# 覆盖范围：FSPLIT（按总流量分率分流，各出口相态不变）
+# 关联文件：mixer.yaml（混合器，无可调输入）
+#
+# 典型工艺场景：
+#   循环流分配（再循环比控制）、产品/馏分切割
+#   设计变量：各出口分流比（分流比之和 = 1，Aspen 约束最后一个出口 = 1 - 其余）
+#   目标读取：各出口流量（质量平衡核算、约束检验）
+#
+# 注意
+# ----
+#   - Input\FRAC\* 中 * 匹配出口流股名称（Aspen 路径段，单级匹配）
+#   - 分流比物理上界 < 1（Aspen 通常允许最多 1，但最后一个出口不需指定）
+#   - FSplit 无能量计算，heat_duty 不适用
+
+equipment_type: FSPLIT
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  split_fraction:
+    required_for: []
+    required: false
+    tunable: true
+    multi: true            # 各出口分流比是独立路径，全部保留
+    suggested_lower: 0.0       # 无量纲，物理下界（全部不分到此出口）
+    suggested_upper: 1.0       # 无量纲，物理上界
+    confidence: high           # 分流比范围固定 0~1，经验可靠
+    candidates:
+      - pattern: "Input\\FRAC\\*"
+        priority: 100          # * 匹配出口流股名（单级）
+      - pattern: "Input\\FRAC*"
+        priority: 80           # 兜底，匹配无出口名的简化路径
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+      leaf_only: true          # 排除 Input\FRAC 父节点
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  outlet_mole_flow:
+    required_for: []
+    required: false
+    multi: true            # 每个出口对应一条流量路径，全部保留
+    candidates:
+      - pattern: "Output\\MOLE_FLOW\\*"
+        priority: 100          # * 匹配各出口流股名
+      - pattern: "Output\\MOLE_FLOW*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: any
+      leaf_only: true          # 排除 Output\MOLE_FLOW 父节点
+
+  outlet_mass_flow:
+    required_for: []
+    required: false
+    multi: true            # 每个出口对应一条流量路径，全部保留
+    candidates:
+      - pattern: "Output\\MASS_FLOW\\*"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: any
+      leaf_only: true          # 排除 Output\MASS_FLOW 父节点

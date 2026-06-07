@@ -1,0 +1,97 @@
+# rstoic.yaml — RStoic 化学计量反应器语义规则
+#
+# 覆盖范围：RSTOIC（化学计量反应器，指定转化率）
+# 关联文件：requil.yaml（平衡反应器，字段结构相同）
+#
+# 典型工艺场景：
+#   已知化学计量关系和转化率规格的反应步骤（如氢氰化、酯化、氯化）
+#   设计变量：反应温度（影响副反应和能耗）、转化率（影响产率和分离负荷）
+#   目标读取：热负荷（能耗核算、换热器设计）、出口温度
+#
+# 注意
+# ----
+#   - 反应温度/压力的建议范围为 confidence=low，因其强烈依赖具体工艺，
+#     需用户根据实际反应体系手动确认
+#   - 转化率 Input\CONV\* 含通配符，匹配单个反应段（每个反应对应一个路径段）
+#   - QCALC 是反应热负荷（正值=放热，负值=吸热），是 TAC/排放核算的关键
+#   - 出口温度 TOUT 在绝热反应器中是设计变量的函数，不可直接设定
+
+equipment_type: RSTOIC
+
+fields:
+
+  # ---- 可调输入字段 --------------------------------------------------------
+
+  temperature:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null      # 反应温度范围强烈依赖工艺，无通用经验下界
+    suggested_upper: null      # 同上
+    confidence: low            # 无经验边界，边界为 None，需用户手动填写
+    candidates:
+      - pattern: "Input\\TEMP"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
+
+  pressure:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null
+    suggested_upper: null
+    confidence: low
+    candidates:
+      - pattern: "Input\\PRES"
+        priority: 100
+    validators:
+      value_type: numeric
+      unit_dimension: pressure
+
+  conversion:
+    required_for: []
+    required: false
+    tunable: true
+    multi: true            # 每个反应对应一个独立转化率路径，全部保留
+    suggested_lower: 0.0       # 无量纲，物理下界（无转化）
+    suggested_upper: 1.0       # 无量纲，物理上界（完全转化）
+    confidence: high           # 转化率范围固定 0~1，经验可靠
+    candidates:
+      - pattern: "Input\\CONV\\*"
+        priority: 100          # * 匹配各反应的组分/反应段名称
+      - pattern: "Input\\CONV*"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+      leaf_only: true          # 排除 Input\CONV 父节点（has_children=True, dim=1）
+
+  # ---- 可读输出字段 --------------------------------------------------------
+
+  heat_duty:
+    required_for: [TAC, EMISSIONS, ENERGY]
+    required: true
+    candidates:
+      - pattern: "Output\\QCALC"
+        priority: 100          # RStoic 标准反应热负荷路径
+      - pattern: "Output\\DUTY"
+        priority: 90
+      - pattern: "Output\\Q*"
+        priority: 60
+    validators:
+      value_type: numeric
+      unit_dimension: energy_rate
+
+  outlet_temperature:
+    required_for: [ENERGY]
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\TEMP_OUT"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: temperature

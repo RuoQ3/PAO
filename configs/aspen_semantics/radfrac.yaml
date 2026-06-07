@@ -158,3 +158,55 @@ fields:
     validators:
       value_type: numeric
       unit_dimension: pressure
+
+  # ---- 补充可调输入字段（A2-5c 验收要求）-------------------------------
+  # 以下字段供 discover_tunables 使用；
+  # 额外字段 tunable/suggested_*/confidence 由 A3 读取，manifest.py 忽略。
+
+  basis_reflux_ratio:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 1.0       # 无量纲，最小回流比（通常 > 最小回流比）
+    suggested_upper: 5.0       # 无量纲，上限（过高能耗极大）
+    confidence: medium         # 经验范围，精馏系统差异较大，建议用户确认
+    candidates:
+      - pattern: "Input\\BASIS_RR"
+        priority: 100          # 精馏塔基准回流比（Aspen RADFRAC 主要设计规格）
+      - pattern: "Input\\BASIS_RR*"
+        priority: 90
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  bottoms_to_feed_ratio:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: 0.1       # 无量纲，极小塔底采出比（几乎不采出）
+    suggested_upper: 0.95      # 无量纲，极大塔底采出比（塔顶几乎无出料）
+    confidence: medium         # 由质量平衡约束，实际范围还受纯度约束限制
+    candidates:
+      - pattern: "Input\\B:F"
+        priority: 100          # 塔底采出比（Bottoms:Feed ratio），Aspen 路径含冒号
+      - pattern: "Input\\BF*"
+        priority: 70           # 少数版本可能使用不同命名
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless
+
+  feed_stage:
+    required_for: []
+    required: false
+    tunable: true
+    suggested_lower: null      # 进料板下界依赖塔板总数（建议 = nstage * 0.3，由 A4 推算）
+    suggested_upper: null      # 进料板上界依赖塔板总数（建议 = nstage * 0.7）
+    confidence: medium         # 规则命中，但边界需结合 nstage 推算
+    candidates:
+      - pattern: "Input\\FEED_STAGE\\*"
+        priority: 100          # * 匹配进料流股名称（如 0318、FEED 等）
+      - pattern: "Input\\FEED_STAGE*"
+        priority: 80           # 兜底，匹配无流股名的简化路径
+    validators:
+      value_type: numeric
+      unit_dimension: dimensionless

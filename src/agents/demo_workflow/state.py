@@ -1,5 +1,5 @@
 """
-state.py — agent 控制层状态结构定义。
+state.py — demo_workflow 控制层状态结构定义。
 
 只含纯 Python 数据类，不导入任何底层依赖（AspenDriver、SimulationDB、
 NodeDB、src.workflows、src.aspen_driver、src.database、LangGraph）。

@@ -1,241 +1,47 @@
 """
-process_advisor.py — 只读 ProcessAdvisorAgent。
+agent.py — ProcessAdvisor agent 核心逻辑。
 
-定位：在不接触 Aspen、不重跑仿真、不写任何数据库的前提下，对一个 case
-配置 + 其历史数据库做只读体检，产出一份结构化顾问报告。
+分两层：
+  run_process_advisor()       — 只读证据收集器（规则型，调用 6 个安全工具）
+  run_process_advisor_agent() — LLM 层：读取证据报告，输出语言分析
 
-与 run_demo_case_workflow 的区别：
-  workflows.py        —— 会触发 run_case / optimize_pareto（需要 Aspen COM）
-  process_advisor.py  —— 严格只读，只调用 6 个安全工具，永不驱动仿真
+安全边界：
+  - 严格只读：不驱动 Aspen、不重跑仿真、不写数据库。
+  - LLM 只读取证据文本做分析，不被授予任何写工具。
+  - 缺 API key 或 LLM 调用失败时降级返回证据报告 + 说明，绝不伪装成"已分析"。
 
-允许调用的安全工具（全部不依赖 Aspen COM）：
-  load_config、validate_config、query_simulation_db、
-  summarize_pareto、diagnose_case、query_node_db
-
-禁止调用：
-  run_case_tool、optimize_pareto_tool、AspenDriver、win32com
-
-禁止导入（保持只读隔离，由测试 TestEngineeringBoundary 强制）：
+禁止导入（保持只读隔离）：
   src.aspen_driver、win32com、src.agents.tools.run_case、
   src.agents.tools.optimize_pareto
-
-报告固定 5 个章节：
-  1. 配置摘要
-  2. 历史数据库状态
-  3. Pareto 摘要
-  4. 失败诊断
-  5. 下一步建议（next_action）
-
-没有历史数据库时，明确报告"无历史数据库"，绝不伪装成查询成功。
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal
 
-# 仅复用纯 Python 的配置解析层（不调用 tool、不碰 Aspen、不碰 DB）
-from src.agents.workflow_helpers import prepare_demo_workflow_state
+from src.agents.process_advisor.tools import (
+    ProcessAdvisorToolRunner,
+    ReadOnlyToolRunner,
+    _is_tool_error,
+)
+from src.agents.process_advisor.prompts import SYSTEM_PROMPT, USER_TEMPLATE
+
+# 模块级 import：让 monkeypatch 可在测试中替换这些名字
+from src.agents.llm_client import chat, is_configured, load_llm_config  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 只读 Tool Runner 协议
+# 内部工具函数
 # ---------------------------------------------------------------------------
 
-@runtime_checkable
-class ProcessAdvisorToolRunner(Protocol):
-    """注入到 run_process_advisor 的只读 tool 调用接口。
-
-    只声明 6 个安全（不依赖 Aspen COM）工具，刻意不包含
-    run_case / optimize_pareto，从类型层面杜绝写操作。
-
-    所有方法均返回字符串报告；以 "错误：" 开头表示失败。
-    """
-
-    def load_config(self, case_config_path: str) -> str: ...
-
-    def validate_config(self, case_config_path: str) -> str: ...
-
-    def query_simulation_db(
-        self,
-        db_path: str,
-        mode: str = "query",
-        status: str | None = None,
-        objective_name: str | None = None,
-        limit: int = 10,
-        case_id: str | None = None,
-        session_id: str | None = None,
-    ) -> str: ...
-
-    def summarize_pareto(
-        self,
-        db_path: str,
-        objective_names: list[str],
-        include_infeasible: bool = False,
-        session_id: str | None = None,
-    ) -> str: ...
-
-    def diagnose_case(self, db_path: str, case_id: str) -> str: ...
-
-    def query_node_db(
-        self,
-        db_path: str,
-        mode: str = "node_values",
-        case_id: str | None = None,
-        limit: int = 20,
-    ) -> str: ...
-
-    def get_failed_case_ids(
-        self,
-        db_path: str,
-        limit: int = 3,
-        session_id: str | None = None,
-    ) -> list[str]:
-        """返回最近失败工况 case_id 列表，空列表表示无失败工况。"""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# 默认只读 Runner（真实工具适配）
-# ---------------------------------------------------------------------------
-
-# 失败工况机器可读区块：query_simulation_db_tool 在 mode='query' 时输出
-#   [CASE_IDS]\n<uuid>\n...\n[/CASE_IDS]
-# 只解析该协议区块，绝不从自然语言文本里猜 case_id。
-import re as _re  # noqa: E402
-
-_CASE_IDS_PATTERN = _re.compile(r"\[CASE_IDS\]\n(.*?)\n\[/CASE_IDS\]", _re.DOTALL)
-
-
-def _is_tool_error(report: str) -> bool:
-    """tool 返回值是否为失败（允许前导空白，全/半角冒号）。"""
-    stripped = report.lstrip()
-    return stripped.startswith("错误：") or stripped.startswith("错误:")
-
-
-def _extract_case_ids(report: str, limit: int) -> list[str]:
-    """从 [CASE_IDS]...[/CASE_IDS] 区块提取 case_id，区块不存在返回 []。"""
-    m = _CASE_IDS_PATTERN.search(report)
-    if not m:
-        return []
-    ids = [line.strip() for line in m.group(1).splitlines() if line.strip()]
-    return ids[:limit]
-
-
-class ReadOnlyToolRunner:
-    """把 ProcessAdvisorToolRunner 协议适配到 6 个真实安全工具。
-
-    刻意从各工具子模块直接导入 tool 对象，而不是 from src.agents.tools import，
-    这样既避免在导入期连带引入 run_case / optimize_pareto（它们引用 Aspen），
-    也让本模块在静态检查上不出现任何被禁工具的名字。
-
-    不持有 AspenDriver / SimulationDB / NodeDB 实例，不做任何写操作。
-    """
-
-    @staticmethod
-    def _invoke(tool, payload: dict) -> str:
-        result = tool.invoke(payload)
-        return "" if result is None else str(result)
-
-    def load_config(self, case_config_path: str) -> str:
-        from src.agents.tools.load_config import load_case_config_tool
-        return self._invoke(load_case_config_tool, {"config_path": case_config_path})
-
-    def validate_config(self, case_config_path: str) -> str:
-        from src.agents.tools.validate_config import validate_config_tool
-        return self._invoke(validate_config_tool, {"config_path": case_config_path})
-
-    def query_simulation_db(
-        self,
-        db_path: str,
-        mode: str = "query",
-        status: str | None = None,
-        objective_name: str | None = None,
-        limit: int = 10,
-        case_id: str | None = None,
-        session_id: str | None = None,
-    ) -> str:
-        from src.agents.tools.query_simulation_db import query_simulation_db_tool
-        payload: dict = {"db_path": db_path, "mode": mode, "limit": limit}
-        if status is not None:
-            payload["status"] = status
-        if objective_name is not None:
-            payload["objective_name"] = objective_name
-        if case_id is not None:
-            payload["case_id"] = case_id
-        if session_id is not None:
-            payload["session_id"] = session_id
-        return self._invoke(query_simulation_db_tool, payload)
-
-    def summarize_pareto(
-        self,
-        db_path: str,
-        objective_names: list[str],
-        include_infeasible: bool = False,
-        session_id: str | None = None,
-    ) -> str:
-        from src.agents.tools.summarize_pareto import summarize_pareto_tool
-        payload: dict = {
-            "db_path": db_path,
-            "objective_names": ",".join(objective_names),
-            "include_infeasible": include_infeasible,
-        }
-        if session_id is not None:
-            payload["session_id"] = session_id
-        return self._invoke(summarize_pareto_tool, payload)
-
-    def diagnose_case(self, db_path: str, case_id: str) -> str:
-        from src.agents.tools.diagnose_case import diagnose_case_tool
-        return self._invoke(diagnose_case_tool, {"db_path": db_path, "case_id": case_id})
-
-    def query_node_db(
-        self,
-        db_path: str,
-        mode: str = "node_values",
-        case_id: str | None = None,
-        limit: int = 20,
-    ) -> str:
-        from src.agents.tools.query_node_db import query_node_db_tool
-        payload: dict = {"db_path": db_path, "mode": mode, "limit": limit}
-        if case_id is not None:
-            payload["case_id"] = case_id
-        return self._invoke(query_node_db_tool, payload)
-
-    def get_failed_case_ids(
-        self,
-        db_path: str,
-        limit: int = 3,
-        session_id: str | None = None,
-    ) -> list[str]:
-        """查询失败工况，从 [CASE_IDS] 协议区块提取 case_id。
-
-        query 返回 "错误：..." 时抛 RuntimeError，由上层记为诊断错误，
-        绝不把查询失败伪装成"无失败工况"。
-        """
-        report = self.query_simulation_db(
-            db_path=db_path, mode="query", status="sim_failed", limit=limit,
-            session_id=session_id,
-        )
-        if _is_tool_error(report):
-            raise RuntimeError(f"query_simulation_db 返回错误报告 — {report}")
-        return _extract_case_ids(report, limit)
-
-
-# ---------------------------------------------------------------------------
-# 内部：数据库路径解析（只读，不创建文件）
-# ---------------------------------------------------------------------------
-
-_PROJECT_ROOT: Path = Path(__file__).parent.parent.parent
+_PROJECT_ROOT: Path = Path(__file__).parent.parent.parent.parent
 
 
 def _resolve_existing_db(db_path: str | None) -> Path | None:
-    """把候选 db_path 解析为一个已存在的文件，找不到返回 None。
-
-    解析顺序：绝对路径 → CWD 相对 → 项目根相对。
-    只检查存在性，绝不创建文件（SimulationDB() 构造会建库，这里刻意不调用）。
-    """
+    """把候选 db_path 解析为一个已存在的文件，找不到返回 None。"""
     if not db_path:
         return None
     p = Path(db_path)
@@ -277,14 +83,9 @@ def _determine_next_actions(
     diagnosed_ids: list[str],
     objective_names: list[str],
 ) -> list[str]:
-    """根据只读体检结果，用规则推断下一步建议。
-
-    本 agent 只读，建议中绝不出现"已运行成功"之类伪装；缺数据时
-    明确建议先跑优化生成数据库。
-    """
+    """根据只读体检结果，用规则推断下一步建议。"""
     actions: list[str] = []
 
-    # 配置解析失败：最高优先级
     if config_parse_error is not None:
         actions.append("配置解析失败：请检查 YAML 路径与语法，修复后重新体检。")
         return actions
@@ -296,7 +97,6 @@ def _determine_next_actions(
         )
         return actions
 
-    # 无数据库（路径未推断出，或文件不存在）
     if eff_db_path is None or db_resolved is None:
         if not is_pareto:
             actions.append(
@@ -310,7 +110,6 @@ def _determine_next_actions(
             )
         return actions
 
-    # 有数据库但查询失败
     if not db_query_ok:
         actions.append(
             "历史数据库查询失败：请确认 simulation.db 未损坏、可读，"
@@ -318,7 +117,6 @@ def _determine_next_actions(
         )
         return actions
 
-    # 有数据库且查询成功
     if diagnosed_ids:
         actions.append(
             f"发现 {len(diagnosed_ids)} 个失败工况已诊断：请按【4. 失败诊断】中的建议"
@@ -356,7 +154,7 @@ def _determine_next_actions(
 
 
 # ---------------------------------------------------------------------------
-# 入口函数
+# 主入口：只读证据收集
 # ---------------------------------------------------------------------------
 
 def run_process_advisor(
@@ -374,23 +172,16 @@ def run_process_advisor(
 
     Args:
         case_config_path: YAML 配置路径（相对或绝对）。
-        db_path:          SimulationDB 路径；None 时从配置自动推断
-                          （pareto_bayesian → {config_dir}/output/simulation.db）。
+        db_path:          SimulationDB 路径；None 时从配置自动推断。
         node_db_path:     NodeDB 路径；None 时从配置 extraction.catalog_db 推断。
-        mode:             "db"（默认）= 含历史数据库分析；"config" = 仅做配置体检，
-                          跳过所有数据库查询章节。非法值返回报告级错误，不静默执行。
-        session_id:       仅分析指定优化 session 的工况；None 时分析全库历史。
-                          强烈建议为单次优化结果体检时传入，避免把历史累计数据
-                          混入本轮分析（与 plot_pareto 的 session 口径一致）。
+        mode:             "db"（默认）含历史数据库分析；"config" 仅做配置体检。
+        session_id:       仅分析指定优化 session；None 时分析全库历史。
         tool_runner:      实现 ProcessAdvisorToolRunner 协议的 runner；
-                          默认 ReadOnlyToolRunner（生产用真实工具）。测试可注入 FakeRunner。
+                          默认 ReadOnlyToolRunner。测试可注入 FakeRunner。
 
     Returns:
-        含 5 个固定章节的文本报告：
-          1. 配置摘要  2. 历史数据库状态  3. Pareto 摘要
-          4. 失败诊断  5. 下一步建议
+        含 5 个固定章节的文本报告。
     """
-    # mode 严格校验：非法值直接返回报告级错误，不退回 db 路径静默执行
     if mode not in ("config", "db"):
         return (
             "=== ProcessAdvisor 只读体检报告 ===\n\n"
@@ -403,7 +194,9 @@ def run_process_advisor(
 
     sections: list[str] = ["=== ProcessAdvisor 只读体检报告 ===", ""]
 
-    # ── 配置解析（纯 Python，不调用 tool）──────────────────────────────────
+    # ── 配置解析 ──────────────────────────────────────────────────────────
+    from src.agents.demo_workflow.helpers import prepare_demo_workflow_state
+
     config_parse_error: str | None = None
     optimizer_type = ""
     objective_names: list[str] = []
@@ -421,12 +214,10 @@ def run_process_advisor(
         config_parse_error = f"{type(exc).__name__}: {exc}"
 
     is_pareto = optimizer_type == "pareto_bayesian"
-
-    # 调用方显式传入优先；否则用配置推断值
     eff_db_path = db_path if db_path is not None else inferred_db
     eff_node_db = node_db_path if node_db_path is not None else inferred_node_db
 
-    # ── 章节 1：配置摘要 ───────────────────────────────────────────────────
+    # ── 章节 1：配置摘要 ──────────────────────────────────────────────────
     cfg_lines = ["【1. 配置摘要】"]
     cfg_lines.append(f"  配置路径（原始）   : {case_config_path}")
     cfg_lines.append(f"  配置路径（已解析） : {resolved_config}")
@@ -444,7 +235,6 @@ def run_process_advisor(
         )
         cfg_lines.append(f"  推断 db_path      : {eff_db_path or '无（非 pareto 分支或未配置）'}")
         cfg_lines.append(f"  推断 node_db_path : {eff_node_db or '无'}")
-        # load_config / validate_config 只读校验
         try:
             load_report = runner.load_config(resolved_config)
         except Exception as exc:  # noqa: BLE001
@@ -460,14 +250,13 @@ def run_process_advisor(
     sections.append("\n".join(cfg_lines))
     sections.append("")
 
-    # 供章节 5（next_action）决策的状态标志
     db_resolved: Path | None = None
     db_query_ok = False
     pareto_ok = False
     diagnosed_ids: list[str] = []
     config_mode = (mode == "config")
 
-    # ── 章节 2：历史数据库状态 ─────────────────────────────────────────────
+    # ── 章节 2：历史数据库状态 ────────────────────────────────────────────
     db_lines = ["【2. 历史数据库状态】"]
     if config_mode:
         db_lines.append("  mode='config'：仅做配置体检，跳过历史数据库查询。")
@@ -535,7 +324,6 @@ def run_process_advisor(
     elif not db_query_ok:
         d_lines.append("  历史工况查询失败，跳过诊断（不从失败查询中猜 case_id）。")
     else:
-        # 通过结构化接口获取失败 case_id（不解析自然语言）
         get_failed = getattr(runner, "get_failed_case_ids", None)
         if get_failed is None:
             d_lines.append("  runner 未提供结构化失败 case_id 接口，跳过诊断。")
@@ -559,7 +347,6 @@ def run_process_advisor(
                     diag = f"错误：diagnose_case({cid}) 调用异常 [{type(exc).__name__}] — {exc}"
                 d_lines.append(f"  ── case_id: {cid} ──")
                 d_lines.append(_indent_block(diag, prefix="    ", max_lines=50))
-            # 取第一个失败工况补充 node_db 视角（若有 node_db 路径）
             if diagnosed_ids and eff_node_db:
                 node_resolved = _resolve_existing_db(eff_node_db)
                 if node_resolved is not None:
@@ -579,7 +366,7 @@ def run_process_advisor(
     sections.append("\n".join(d_lines))
     sections.append("")
 
-    # ── 章节 5：下一步建议（next_action）──────────────────────────────────
+    # ── 章节 5：下一步建议 ────────────────────────────────────────────────
     next_actions = _determine_next_actions(
         config_parse_error=config_parse_error,
         config_mode=config_mode,
@@ -597,3 +384,83 @@ def run_process_advisor(
     sections.append("\n".join(na_lines))
 
     return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# LLM 层入口
+# ---------------------------------------------------------------------------
+
+def run_process_advisor_agent(
+    case_config_path: str,
+    db_path: str | None = None,
+    session_id: str | None = None,
+    node_db_path: str | None = None,
+    mode: Literal["config", "db"] = "db",
+    model: str | None = None,
+    llm_config=None,
+    advisor_runner: ProcessAdvisorToolRunner | None = None,
+) -> str:
+    """收集只读证据并交大模型分析，返回"证据 + LLM 分析"合并报告。
+
+    严格只读：内部仅调用 run_process_advisor（6 个安全工具）+ LLM 文本推理，
+    任何环节都不驱动 Aspen、不写数据库。
+
+    Args:
+        case_config_path: YAML 配置路径。
+        db_path:          SimulationDB 路径；None 时从配置推断。
+        session_id:       仅分析指定 session 的工况；None=全库历史。
+        node_db_path:     NodeDB 路径；None 时从配置推断。
+        mode:             "db"（默认）| "config"。
+        model:            覆盖 PAO_LLM_MODEL。
+        llm_config:       直接注入 LLMConfig（测试用）；None 时从环境变量构造。
+        advisor_runner:   注入证据收集层的 tool_runner（测试用）。
+
+    Returns:
+        合并报告：先是只读证据报告，再追加【LLM 顾问分析】小节。
+        未配置 key 或 LLM 调用失败时，仅返回证据报告 + 降级说明。
+    """
+    # chat / is_configured / load_llm_config 从模块级 import 引入，支持 monkeypatch
+
+    evidence = run_process_advisor(
+        case_config_path=case_config_path,
+        db_path=db_path,
+        node_db_path=node_db_path,
+        mode=mode,
+        session_id=session_id,
+        tool_runner=advisor_runner,
+    )
+
+    cfg = llm_config if llm_config is not None else load_llm_config(model=model)
+
+    if not is_configured(cfg):
+        return (
+            f"{evidence}\n\n"
+            "【LLM 顾问分析】\n"
+            "  [降级] 未配置大模型 API key，本次仅返回只读证据报告，未做语言模型分析。\n"
+            f"  如需启用：请设置环境变量 {cfg.api_key_env}"
+            "（以及可选 PAO_LLM_PROVIDER / PAO_LLM_MODEL）后重试。\n"
+            f"  当前 LLM 配置：{cfg.redacted()}"
+        )
+
+    try:
+        analysis = chat(
+            cfg,
+            system=SYSTEM_PROMPT,
+            user=USER_TEMPLATE.format(evidence=evidence),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("LLM 分析失败，降级返回证据报告：%s", exc)
+        return (
+            f"{evidence}\n\n"
+            "【LLM 顾问分析】\n"
+            f"  [降级] 大模型调用失败，本次仅返回只读证据报告。\n"
+            f"  失败原因：{exc}\n"
+            f"  当前 LLM 配置：{cfg.redacted()}"
+        )
+
+    return (
+        f"{evidence}\n\n"
+        "【LLM 顾问分析】\n"
+        f"  （provider={cfg.provider}, model={cfg.model}）\n\n"
+        f"{analysis}"
+    )

@@ -1,0 +1,50 @@
+# mixer.yaml — Mixer 混合器语义规则（A2-4d）
+#
+# 覆盖范围：MIXER（多进一出混合器）
+# 关联文件：splitter.yaml（分流器）
+#
+# Mixer 无可调输入变量（出口完全由质量/能量平衡决定），
+# 仅提供出口流量可读字段，用于约束检验和目标读取。
+
+equipment_type: MIXER
+
+fields:
+
+  # ---- 可读输出字段 --------------------------------------------------------
+  # （无可调输入字段——Mixer 的出口由进口决定，不设可操控规格）
+
+  outlet_mole_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MOLE_FLOW"
+        priority: 100
+      - pattern: "Output\\MOLE_FLOW*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  outlet_mass_flow:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\MASS_FLOW"
+        priority: 100
+      - pattern: "Output\\MASS_FLOW*"
+        priority: 70
+    validators:
+      value_type: numeric
+      unit_dimension: any
+
+  outlet_temperature:
+    required_for: []
+    required: false
+    candidates:
+      - pattern: "Output\\TOUT"
+        priority: 100
+      - pattern: "Output\\TEMP_OUT"
+        priority: 80
+    validators:
+      value_type: numeric
+      unit_dimension: temperature
