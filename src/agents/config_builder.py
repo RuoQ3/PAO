@@ -145,7 +145,17 @@ def _map_goal_to_objective(
 
     # ── flow / yield：从 targets 找 semantic_role 含对应关键词的节点 ────────
     if metric in ("flow", "yield"):
-        keyword = "flow" if metric == "flow" else "flow"  # yield 也找 flow 节点
+        # 优先级 1：GoalSpec 直接指定了 custom_aspen_path，跳过 target 搜索
+        if goal.custom_aspen_path:
+            return {
+                "name":       goal.name or goal.metric.upper(),
+                "type":       "aspen_path",
+                "aspen_path": goal.custom_aspen_path,
+                "minimize":   minimize,
+                "unit":       "",
+            }
+        # 优先级 2：从 ReadableTarget 列表中按 semantic_role 关键词搜索
+        keyword = "flow"
         candidates = [
             t for t in targets
             if t.candidate_use in ("objective", "both")
@@ -154,13 +164,13 @@ def _map_goal_to_objective(
         if not candidates:
             warnings.append(
                 f"目标 metric='{goal.metric}'：在 ReadableTarget 列表中未找到"
-                f" semantic_role 含 '{keyword}' 的节点，该目标将被跳过。"
-                "请改用 metric='custom' 并手动指定 custom_aspen_path。"
+                f" semantic_role 含 '{keyword}' 的节点，且未提供 custom_aspen_path，该目标将被跳过。"
+                "请提供 custom_aspen_path 或改用 metric='custom'。"
             )
             return None
         t = candidates[0]
         return {
-            "name":       goal.metric.upper(),
+            "name":       goal.name or goal.metric.upper(),
             "type":       "aspen_path",
             "aspen_path": t.aspen_path,
             "minimize":   minimize,
@@ -197,7 +207,7 @@ def _map_goal_to_objective(
             )
             return None
         return {
-            "name":       "CUSTOM",
+            "name":       goal.name or "CUSTOM",
             "type":       "aspen_path",
             "aspen_path": goal.custom_aspen_path,
             "minimize":   minimize,
@@ -236,6 +246,15 @@ def _map_constraint_to_dict(
 
     # ── purity：找 candidate_use 含 constraint 且 semantic_role 含分数关键词 ──
     if metric == "purity":
+        # 优先级 1：GoalSpec 直接提供了 custom_aspen_path，直接使用
+        if constraint.custom_aspen_path:
+            return {
+                "name":       "purity_min",
+                "aspen_path": constraint.custom_aspen_path,
+                "operator":   ">=",
+                "threshold":  constraint.target_value,
+            }
+        # 优先级 2：从 ReadableTarget 列表按 semantic_role 关键词搜索
         frac_roles = ("mass_frac", "mole_frac", "massfrac", "molefrac", "frac", "purity")
         cands = [
             t for t in targets
@@ -245,7 +264,7 @@ def _map_constraint_to_dict(
         if not cands:
             warnings.append(
                 "约束 metric='purity'：未找到 candidate_use='constraint'/'both' 且"
-                " semantic_role 含分数/纯度关键词的节点，该约束将被跳过。"
+                " semantic_role 含分数/纯度关键词的节点，且未提供 custom_aspen_path，该约束将被跳过。"
             )
             return None
         t = cands[0]
@@ -328,18 +347,41 @@ def _map_tunable_to_design_var(
             f"  置信度={var.confidence}，原因：{var.reason}"
         )
 
+    lower: float | None = var.suggested_lower
+    upper: float | None = var.suggested_upper
+
+    # integer 变量的边界必须为整数值，否则优化框架会拒绝。
+    # 规则 YAML 可能给出 continuous 用途的经验边界（如 efficiency [0.5, 0.9]）
+    # 却被通配匹配到整数节点，此处防御性取整并写 warning。
+    if var.suggested_type == "integer":
+        if lower is not None and lower != float(int(lower)):
+            rounded_lower = int(lower)
+            warnings.append(
+                f"integer 变量 {var.aspen_path} 的 lower_bound={lower} 不是整数，"
+                f"已自动取整为 {rounded_lower}。请确认边界是否合理。"
+            )
+            lower = float(rounded_lower)
+        if upper is not None and upper != float(int(upper)):
+            rounded_upper = int(upper) + (1 if upper > int(upper) else 0)
+            warnings.append(
+                f"integer 变量 {var.aspen_path} 的 upper_bound={upper} 不是整数，"
+                f"已自动向上取整为 {rounded_upper}。请确认边界是否合理。"
+            )
+            upper = float(rounded_upper)
+
     # initial_value：用当前值，若无则取边界中点（若边界均有效），再否则 None
     initial: float | None = var.current_value
-    if initial is None and var.suggested_lower is not None and var.suggested_upper is not None:
-        initial = (var.suggested_lower + var.suggested_upper) / 2.0
+    if initial is None and lower is not None and upper is not None:
+        mid = (lower + upper) / 2.0
+        initial = float(round(mid)) if var.suggested_type == "integer" else mid
 
     return {
         "name":          name,
         "description":   f"{var.semantic_role} ({var.aspen_path})",
         "aspen_path":    var.aspen_path,
         "type":          var.suggested_type,
-        "lower_bound":   var.suggested_lower,
-        "upper_bound":   var.suggested_upper,
+        "lower_bound":   lower,
+        "upper_bound":   upper,
         "initial_value": initial,
         "unit":          var.unit,
     }
@@ -502,8 +544,34 @@ def build_config_draft(
     emiss_defs = _get_emissions_defaults()
 
     # ── 设计变量 ───────────────────────────────────────────────────────────
+    # 策略：只有 confidence=high/medium 且 bounds 完整的变量才进入 design_variables。
+    # confidence=low 或 bounds 含 None 的变量不放入 design_variables：
+    #   - 没有边界的变量无法构建搜索空间（load_optimize_config 会报 float(None) 错误）
+    #   - low confidence 变量未经语义验证，不应直接进入批量仿真
+    # 这些被排除的变量记入 warnings 供 onboarding_agent 生成问题让用户补充，
+    # 用户通过 apply_user_feedback 补充边界后，可再次调用 build_config_draft 重新生成。
     design_vars: list[dict[str, Any]] = []
+    excluded_low: list[str] = []
+    excluded_no_bounds: list[str] = []
+
     for var in report.tunable_variables:
+        has_bounds = (var.suggested_lower is not None and var.suggested_upper is not None)
+
+        if var.confidence == "low":
+            excluded_low.append(var.aspen_path)
+            continue  # 不进入 design_variables
+
+        if not has_bounds:
+            excluded_no_bounds.append(var.aspen_path)
+            warnings.append(
+                f"请手动填写 {var.aspen_path} 的变量边界"
+                f"（suggested_lower={var.suggested_lower}，"
+                f"suggested_upper={var.suggested_upper}）。"
+                f"  置信度={var.confidence}，原因：{var.reason}"
+            )
+            continue  # 边界不完整也不放入
+
+        # confidence=high/medium 且 bounds 完整：放入 design_variables
         dv = _map_tunable_to_design_var(var, warnings)
         design_vars.append(dv)
         if var.confidence != "high":
@@ -512,6 +580,20 @@ def build_config_draft(
                 f"建议边界 [{var.suggested_lower}, {var.suggested_upper}] 需用户确认。"
                 f"  原因：{var.reason}"
             )
+
+    # 汇总被排除的变量到 warnings（一行一条，不逐个展开避免洪水）
+    if excluded_low:
+        warnings.append(
+            f"已排除 {len(excluded_low)} 个 confidence=low 的变量（未匹配语义规则，无可靠边界），"
+            "如需纳入请在 apply_user_feedback 中补充边界后重新生成草案。"
+            f"  首批路径示例：{', '.join(excluded_low[:3])}{' …' if len(excluded_low) > 3 else ''}"
+        )
+    if excluded_no_bounds:
+        warnings.append(
+            f"已排除 {len(excluded_no_bounds)} 个规则命中但边界不完整的变量，"
+            "请补充边界后重新生成。"
+            f"  路径：{', '.join(excluded_no_bounds[:5])}{' …' if len(excluded_no_bounds) > 5 else ''}"
+        )
 
     # ── 目标函数 ───────────────────────────────────────────────────────────
     all_targets = report.readable_targets
@@ -534,10 +616,19 @@ def build_config_draft(
     optimizer = _build_optimizer_section(intent, len(design_vars), len(objectives))
 
     # ── 提取配置 ───────────────────────────────────────────────────────────
+    # 只从已纳入 design_variables 的变量（design_vars）中提取 block/stream，
+    # 排除的 low-confidence 变量不应影响提取范围。
+    from src.models.tunable import TunableVariable as _TV
+    active_tunable_vars = [
+        v for v in report.tunable_variables
+        if v.confidence != "low"
+        and v.suggested_lower is not None
+        and v.suggested_upper is not None
+    ]
     extraction = _build_extraction_section(
         report.aspen_file,
         node_db_path,
-        report.tunable_variables,
+        active_tunable_vars,
         report.readable_targets,
     )
 
@@ -546,13 +637,10 @@ def build_config_draft(
     n_med    = sum(1 for v in report.tunable_variables if v.confidence == "medium")
     n_low    = sum(1 for v in report.tunable_variables if v.confidence == "low")
     n_total  = len(report.tunable_variables)
-    null_bounds = sum(
-        1 for dv in design_vars
-        if dv.get("lower_bound") is None or dv.get("upper_bound") is None
-    )
     confidence_summary = (
-        f"共 {n_total} 个设计变量（high={n_high}, medium={n_med}, low={n_low}），"
-        f"{null_bounds} 个变量边界待补充；"
+        f"共 {n_total} 个扫描变量（high={n_high}, medium={n_med}, low={n_low}），"
+        f"纳入 design_variables：{len(design_vars)} 个"
+        f"（已排除 low={len(excluded_low)} 个、边界缺失={len(excluded_no_bounds)} 个）；"
         f"{len(objectives)} 个目标函数，{len(constraints)} 个约束。"
         f"语义覆盖率={report.semantic_coverage:.0%}。"
     )
@@ -614,28 +702,36 @@ _INTENT_SYSTEM_PROMPT = """\
 输出 JSON 格式（严格按此结构，不添加任何说明文字）：
 {
   "goals": [
-    {"metric": "TAC", "direction": "min"},
-    {"metric": "emissions", "direction": "min"},
-    {"metric": "flow", "direction": "max"},
-    {"metric": "custom", "direction": "min", "custom_aspen_path": "\\\\Data\\\\..."}
+    {"metric": "flow",   "direction": "max", "name": "ADN_FLOW",
+     "custom_aspen_path": "\\\\Data\\\\Streams\\\\ADN\\\\Output\\\\MASSFLOW\\\\MIXED\\\\ADN"},
+    {"metric": "custom", "direction": "min", "name": "REB_DUTY",
+     "custom_aspen_path": "\\\\Data\\\\Blocks\\\\T0301\\\\Output\\\\REB_DUTY"}
   ],
   "hard_constraints": [
-    {"metric": "purity", "direction": "max", "target_value": 0.9}
+    {"metric": "purity", "direction": "max", "target_value": 0.9,
+     "custom_aspen_path": "\\\\Data\\\\Streams\\\\ADN\\\\Output\\\\MASSFRAC\\\\MIXED\\\\ADN"}
   ],
   "n_initial": 20,
   "n_iterations": 60,
   "notes": "原始用户意图"
 }
 
-metric 取值规则：
-- TAC        → 总年化成本（minimize）
-- emissions  → CO₂排放（minimize）
-- purity     → 产品纯度约束（通常 maximize 或设阈值）
+metric 取值规则（重要）：
+- TAC        → 仅当用户明确说"年化成本"或"TAC"时使用
+- emissions  → 仅当用户明确说"排放"或"CO2"时使用
+- purity     → 产品纯度约束，必须提供 target_value 数值和 custom_aspen_path
 - yield      → 产率
-- flow       → 质量/摩尔流量
-- custom     → 自定义 Aspen 节点路径
+- flow       → 质量/摩尔流量目标，必须提供 custom_aspen_path 指向对应 stream 的 MASSFLOW 或 MOLEFLOW 节点
+- custom     → 设备参数（如热负荷、压降），必须提供 custom_aspen_path
 
-若用户意图不够明确，使用 TAC 最小化 + 排放最小化作为默认目标。
+提取规则：
+1. 用户提到"产量"、"流量"、"最大化产品"→ metric=flow，提供 custom_aspen_path
+2. 用户提到"热负荷"、"能耗"、"再沸器" → metric=custom，提供 custom_aspen_path
+3. 用户提到"纯度"、"质量分数" → 放入 hard_constraints，metric=purity，提供 target_value 和 custom_aspen_path
+4. 若用户提供了具体的 Aspen 路径，直接使用；未提供时根据描述推断
+5. 不要把"产量最大化"解析为 TAC 或 emissions
+6. 只有当用户未提及任何具体指标时，才使用 TAC + emissions 作为兜底
+
 只输出 JSON，不输出任何解释。"""
 
 

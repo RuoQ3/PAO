@@ -409,26 +409,26 @@ src/agents/
 
 **文件**：`src/agents/onboarding_agent.py`（新建）
 
-- [ ] **B1-1** 定义 `OnboardingResult` dataclass
+- [x] **B1-1** 定义 `OnboardingResult` dataclass
   - 字段：`config_draft: ConfigDraft`、`tunable_report: TunableReport`、`questions_for_user: list[str]`、`warnings: list[str]`
   - `questions_for_user` 由以下规则生成：
     - 每个 `confidence != "high"` 的设计变量边界 → 生成"请确认 {var.aspen_path} 的合理范围（建议 [{lo}, {hi}]）"
     - 目标函数映射有 warning 时 → 生成对应的确认问题
     - `n_initial` / `n_iterations` 建议值 → 生成"建议运行 {n_initial} 次初始采样 + {n_iterations} 次优化迭代，是否接受？"
 
-- [ ] **B1-2** 实现 `run_onboarding(aspen_file_path: str, intent_text: str, node_db_path: str, llm_config: LLMConfig | None) -> OnboardingResult`
+- [x] **B1-2** 实现 `run_onboarding(aspen_file_path: str, intent_text: str, node_db_path: str, llm_config: LLMConfig | None) -> OnboardingResult`
   - 调用 `discover_tunables_tool` 获取 `TunableReport`
   - 若 `intent_text` 非空：调用 `parse_intent_from_text` 解析意图；LLM 不可用时使用默认意图
   - 调用 `build_config_draft` 生成 `ConfigDraft`
   - 生成 `questions_for_user` 列表
   - **不启动优化，不调 `run_case` / `optimize_pareto`**
 
-- [ ] **B1-3** 实现 `apply_user_feedback(draft: ConfigDraft, feedback: dict) -> ConfigDraft`
+- [x] **B1-3** 实现 `apply_user_feedback(draft: ConfigDraft, feedback: dict) -> ConfigDraft`
   - `feedback` 格式：`{"bounds": {aspen_path: [lo, hi]}, "objectives": [...], "n_initial": int}`
   - 把用户修改合并进 `ConfigDraft`，重新校验
   - 更新 `warnings`（已被用户确认的条目可从 warnings 移除）
 
-- [ ] **B1-4** 单元测试 `tests/agents/test_onboarding_agent.py`
+- [x] **B1-4** 单元测试 `tests/agents/test_onboarding_agent.py`
   - 覆盖：`questions_for_user` 对各种 confidence 级别的生成
   - 覆盖：`apply_user_feedback` 正确合并用户修改
   - 使用 mock `TunableReport` 和 mock `parse_intent`，不依赖 LLM 和 Aspen
@@ -443,56 +443,56 @@ src/agents/
 
 > 参考 CMU `2506.20921v2` 的 GroupChat 架构，适配 PAO 的 HITL 场景。
 
-- [ ] **B2-1** 定义 `PAOGraphState` dataclass（仅含基本类型，不含 ProcessCase 等底层对象）
+- [x] **B2-1** 定义 `PAOGraphState` dataclass（仅含基本类型，不含 ProcessCase 等底层对象）
   - 字段：`session_id: str`、`aspen_file: str`、`intent_text: str`、`current_phase: str`（`"onboarding"/"confirming"/"optimizing"/"analyzing"/"done"`）、`config_draft: ConfigDraft | None`、`config_yaml_path: str | None`（草案写成文件后的路径）、`db_path: str | None`、`onboarding_result: OnboardingResult | None`、`analysis_report: str`、`iteration: int`、`max_iterations: int`（默认 5）、`messages: list[str]`、`termination_reason: str | None`
 
-- [ ] **B2-2** 实现 `onboarding_node(state: PAOGraphState) -> PAOGraphState`
+- [x] **B2-2** 实现 `onboarding_node(state: PAOGraphState) -> PAOGraphState`
   - 调用 `run_onboarding`，把结果存入 state
   - 更新 `current_phase = "confirming"`
   - 把 `questions_for_user` 追加到 `messages` 供前端/用户展示
 
-- [ ] **B2-3** 实现 `human_confirm_node`（HITL 节点）
-  - LangGraph `interrupt()` 暂停，等待外部注入用户反馈
+- [x] **B2-3** 实现 `human_confirm_node`（HITL 节点）
+  - LangGraph `interrupt_before` 模式暂停，等待客户端注入用户反馈
   - 用户反馈通过 `apply_user_feedback` 合并进 `config_draft`
   - 把 `ConfigDraft.to_yaml_dict()` 写成临时 YAML 文件，路径存入 `state.config_yaml_path`
   - 调用 `validate_config_tool` 校验；校验 fatal 失败时回到 `confirming`，最多重试 3 次
   - 通过后更新 `current_phase = "optimizing"`
 
-- [ ] **B2-4** 实现 `optimization_node(state: PAOGraphState) -> PAOGraphState`
+- [x] **B2-4** 实现 `optimization_node(state: PAOGraphState) -> PAOGraphState`
   - 调用 `optimize_pareto_tool`，传入 `state.config_yaml_path`
   - 更新 `db_path`（从 config yaml 推断）
   - 更新 `current_phase = "analyzing"`
   - 若工具返回错误前缀：更新 `current_phase = "done"`，`termination_reason = "optimization_failed"`
 
-- [ ] **B2-5** 实现 `analysis_node(state: PAOGraphState) -> PAOGraphState`
+- [x] **B2-5** 实现 `analysis_node(state: PAOGraphState) -> PAOGraphState`
   - 调用 `process_advisor_agent`（只读，6 个安全工具 + LLM 分析）
   - 把报告存入 `state.analysis_report`
   - 更新 `current_phase = "deciding"`
   - 把分析报告摘要追加到 `messages`
 
-- [ ] **B2-6** 实现 `human_decide_node`（HITL 节点）
-  - LangGraph `interrupt()` 暂停，等待用户决策
+- [x] **B2-6** 实现 `human_decide_node`（HITL 节点）
+  - LangGraph `interrupt_before` 模式暂停，等待用户决策
   - 用户决策选项：`"continue"`（收窄边界继续优化）/ `"adjust"`（调整意图重新配置）/ `"done"`（终止）
   - `"continue"` 且 `state.iteration < state.max_iterations` → 转到 `human_confirm_node`（带新边界）
   - `"adjust"` → 转到 `onboarding_node`（重新走意图解析）
   - `"done"` 或超过最大迭代次数 → 转到 `done_node`
 
-- [ ] **B2-7** 实现 `done_node(state: PAOGraphState) -> PAOGraphState`
+- [x] **B2-7** 实现 `done_node(state: PAOGraphState) -> PAOGraphState`
   - 更新 `current_phase = "done"`
-  - 生成最终摘要追加到 `messages`（总轮次、最终 Pareto 前沿大小、最优 TAC/排放点）
+  - 生成最终摘要追加到 `messages`（总轮次、终止原因、结果数据库、分析报告状态）
 
-- [ ] **B2-8** 用 `StateGraph` 串联所有节点
+- [x] **B2-8** 用 `StateGraph` 串联所有节点
   - 边：`START → onboarding → human_confirm → optimization → analysis → human_decide → (循环或 done_node) → END`
   - 条件边：`human_decide` 根据用户决策 dispatch
 
-- [ ] **B2-9** 单元测试 `tests/agents/test_graph.py`
-  - 用 `FakeToolRunner`（所有 tool 返回固定字符串）+ mock `interrupt` 模拟用户输入
+- [x] **B2-9** 单元测试 `tests/agents/test_graph.py`
+  - 用 mock patch 替换所有外部调用 + `interrupt_before` 模式下的 HITL 流程
   - 覆盖：完整的 mock 闭环（onboarding → confirm → optimize → analyze → done）
   - 覆盖：迭代超过 `max_iterations` 时自动终止
   - 覆盖：optimization 失败时直接终止
   - 覆盖：用户选择 "adjust" 时回到 onboarding
 
-**验收标准**：所有单测通过；状态机在 mock 模式下能完整走完 2 轮迭代后自然终止；`current_phase` 转换路径与设计一致。
+**验收标准**：所有单测通过；状态机在 mock 模式下能完整走完 2 轮迭代后自然终止；`current_phase` 转换路径与设计一致；校验超过 `max_confirm_retries` 次失败时终止（`termination_reason="confirm_validation_failed"`）且 `optimize_pareto_tool` 未被调用；无 checkpointer 时发出 `UserWarning`。
 
 ---
 
@@ -596,7 +596,7 @@ A1 和 A2 无依赖，**可同时开始**。A3 和 A4 依赖 A1/A2 完成后并�
 
 1. **Aspen driver 边界**：`discover_tunables.py` 是唯一新增的会打开 Aspen 的路径，只读扫描，不仿真。上层所有模块（`config_builder`、`onboarding_agent`、`graph.py`）导入时不得引入 `src.aspen_driver`。
 
-2. **HITL 硬约束**：`graph.py` 的优化节点（`optimization_node`）执行前，必须经过 `human_confirm_node` 的 `interrupt()`，用户必须显式批准才能继续。
+2. **HITL 硬约束**：`graph.py` 的优化节点（`optimization_node`）执行前，必须经过 `human_confirm_node` 的 `interrupt_before` 暂停，用户必须显式注入反馈（`Command(update={'user_feedback': {...}})`）且配置草案通过 `validate_config_tool` 后才能继续。校验始终失败（超过 `max_confirm_retries`）时流程终止，不允许以未通过验证的草案进入优化。
 
 3. **LLM 只解析意图**：`parse_intent_from_text` 中 LLM 的唯一职责是把自由文本解析成结构化 `OptimizationIntent`，不直接生成配置字段。所有配置字段由规则映射器生成。
 

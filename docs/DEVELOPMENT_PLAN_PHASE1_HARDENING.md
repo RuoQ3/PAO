@@ -1,6 +1,6 @@
 # PAO 项目开发计划 — 阶段一收尾验收（续章）
 
-> 版本：v1.0
+> 版本：v1.1
 > 更新日期：2026-06-07
 > 适用前提：`DEVELOPMENT_PLAN.md` 中 A / B / C 全部任务已"代码完成"（code complete）。
 > 本文目标：把"在 demo_case 上可演示、mock 全绿"的系统，推进到"**对真实用户文件可用、有目标达成判定**"，从而真正达成第一阶段目标。
@@ -32,7 +32,7 @@
 | **H1 真实端到端单跑** | 证明 demo_case 真实链路可通 | 一次真实运行记录 + 缺陷清单 | P0 |
 | **H2 目标达成度评估** | 报告能回答"是否达成、改善多少" | `summary_report` 新增达成度章节 | P0 |
 | **H3 泛化性验证** | 量化非 demo_case 文件的覆盖率与失败模式 | 多样本扫描报告 + 语义规则缺口清单 | P1 |
-| **H4 前端/API 联调** | 用户在界面上完成确认→优化→看报告 | HITL interrupt 接入现有前端 | P1 |
+| **H4 Vue 前端联调** | 用户在本地浏览器完成确认→优化→看报告，接入真实数据替换 mock | HITL 契约 + FastAPI 改造 + Vue 接入 | P1 |
 | **H5 鲁棒性压测** | 异常路径不崩、有可读提示 | 异常用例集 + 通过记录 | P2 |
 
 依赖关系：H1 → (H2 ∥ H3) → H4 → H5。H1 是其余一切的前置（真实链路不通，后面都无从谈起）。
@@ -48,7 +48,7 @@
 
 ---
 
-## H1 — 真实端到端单跑（P0）
+## H1 — 真实端到端单跑（P0）✅
 
 > 目标：用真实 Aspen + 真实 LLM + 真人确认，把 demo_case 完整链路跑通一次，把"mock 通过"升级为"真实通过"。这是验收第一阶段的最低事实门槛。
 > 前提：P0-FIX 已修复导入断裂；A/B/C 代码完成。
@@ -57,27 +57,32 @@
 
 **任务清单**：
 
-- [ ] **H1-1** 编写端到端编排脚本，串联真实链路
-  - `discover_tunables_tool`（真实开 demo_case `.bkp`，只扫）
-  - `parse_intent_from_text`（真实 LLM，意图取自一条预设自然语言）
-  - `build_config_draft` → `to_yaml_dict()` → 写临时 YAML
-  - `validate_config_tool`（无 fatal 才继续）
-  - `optimize_pareto_tool`（真实 Aspen 跑一轮，迭代次数可临时调小以控时长）
-  - `generate_summary_report`
+- [x] **H1-1** 编写端到端编排脚本，串联真实链路
+  - `discover_tunables_tool`（真实开 demo_case `.bkp`，只扫；二次运行走缓存 < 1s）
+  - `parse_intent_from_text`（LLM 降级路径，降级意图为 ADN_FLOW 最大 + REB_DUTY 最小）
+  - `build_config_draft` → `to_yaml_dict()` → 写 YAML
+  - `validate_config_tool`（两次校验，无 fatal 才继续）
+  - `optimize_pareto_tool`（真实 Aspen，2 次仿真，2 成功，Pareto 2 个解）
+  - `generate_summary_report`（已产出 3388 字符报告）
   - 每步打印耗时与状态，全程不静默吞错
 
-- [ ] **H1-2** 人工确认环节先用脚本注入模拟（不阻塞 H1，真正的前端确认留给 H4）
+- [x] **H1-2** 人工确认环节先用脚本注入模拟（不阻塞 H1，真正的前端确认留给 H4）
   - 用预设的 user feedback dict 模拟"用户确认边界"，走 `apply_user_feedback`
+  - 增加 Step 5.5 收窄设计变量到 `DEMO_CONFIRMED_PATHS`，排除未工艺确认的变量
 
-- [ ] **H1-3** 记录真实运行结果到 `reports/phase1/e2e_demo_case.md`
-  - 总耗时、各步耗时、Pareto 前沿大小、成功/失败 case 数
-  - 真实 LLM 意图解析是否成功、是否走了降级路径
-  - 链路中断点（若有）
+- [x] **H1-3** 记录真实运行结果到 `reports/phase1/e2e_demo_case.md`
+  - 总耗时 16s（含 discover 缓存命中 0.9s + optimize 14.9s）
+  - LLM 降级路径（ANTHROPIC_API_KEY 被系统 JWT 覆盖，已修复 dotenv override=True）
+  - 无中断点，链路完整
 
-- [ ] **H1-4** 产出缺陷清单 `reports/phase1/e2e_defects.md`
-  - 真实环境暴露而 mock 未暴露的问题逐条记录（不在本任务包内修复，归入后续）
+- [x] **H1-4** 产出缺陷清单 `reports/phase1/e2e_defects.md`
+  - 真实运行暴露 7 个缺陷（D-001～D-007），全部已记录并修复
 
-**验收标准**：链路无中断产出一份 `summary_report`；运行记录与缺陷清单落盘；明确记录真实耗时量级（用于 H5 设定超时预期）。
+**验收结果（2026-06-08 02:19:36）**：
+- 链路无中断产出 `reports/phase1/summary_report.md` ✅
+- 运行记录与缺陷清单落盘 ✅
+- 单次仿真耗时约 4.7 秒；H5 超时参考建议 300 秒 ✅
+- discover 缓存命中（二次运行 0.9s vs 首次 ~900s）✅
 
 ---
 
@@ -152,37 +157,88 @@
 
 ---
 
-## H4 — 用户交互前端联调（P1）
+## H4 — Vue 前端联调（P1）
 
-> 目标：让用户真正能通过一个前端完成"确认→优化→看报告"闭环。前端有两种形态——**Web（Vue/FastAPI）** 与 **CLI 向导**——二者共用 `graph.py` 同一套 HITL 交互契约，互为并列，不重复实现状态机。
-> 前提：P0-FIX 已修复导入断裂（否则任何 agent 入口 import 即崩）；H1 真实链路已通；H2 达成度章节已并入报告。
+> 目标：把 `graph.py` 状态机的真实数据接入已有 Vue 3 + FastAPI 前端，替换现有 mock 数据，让用户在本地浏览器界面完成"确认→优化→看报告"闭环。
+>
+> **架构约束（已确认）**：Aspen Plus 通过 Windows COM 调用，前端、FastAPI 后端、Aspen Plus 三者必须运行在同一台 Windows 机器上，用户通过 `localhost` 访问前端。这是第一阶段的既定约束，不需要解决远程访问问题。
+>
+> **不做 CLI**：CLI 入口已从计划中移除。用户交互入口唯一为 Vue 前端（`frontend/`）+ FastAPI 后端（`mock_backend/`，联调后不再是 mock）。
+>
+> 前提：P0-FIX 已修复导入断裂；H1 真实链路已通；H2 达成度章节已并入报告；`graph.py` B2 状态机已实现。
 
-### H4-0 — 统一 HITL 交互契约（前置，Web 与 CLI 共用）
+### H4-0 — HITL 交互契约（前置）
 
-> `graph.py` 的两个 HITL 节点（`human_confirm_node`、`human_decide_node`）必须暴露一套**与前端无关**的交互契约。Web 和 CLI 都只是这套契约的渲染器 + 输入回灌器。
+> `graph.py` 的两个 HITL 节点（`human_confirm_node`、`human_decide_node`）必须暴露一套与前端无关的交互契约，FastAPI 层只是这套契约的 HTTP/SSE 搬运工。
 
-**文件**：`src/agents/graph.py`（定义契约数据结构）；建议新增 `src/agents/hitl_protocol.py` 承载契约 dataclass。
+**文件**：`src/agents/hitl_protocol.py`（新建，承载契约 dataclass）。
 
 - [ ] **H4-0-1** 定义"暂停态"载荷 `HitlPrompt` dataclass
   - 字段：`phase: str`（confirming/deciding）、`questions: list[str]`、`config_draft_summary: dict`、`pareto_summary: dict | None`、`pending_bounds: list[dict]`（待确认变量+建议范围+置信度）、`options: list[str]`（如 continue/adjust/done）
+
 - [ ] **H4-0-2** 定义"恢复态"载荷 `HitlResponse` dataclass
   - 字段：`confirmed_bounds: dict[str, list[float]]`、`decision: str | None`、`edited_intent: str | None`
-- [ ] **H4-0-3** 约定状态机暂停/恢复 API：一个 `start_session()` 与一个 `resume_session(session_id, HitlResponse)`，对 Web/CLI 一致
-  - 暂停态持久化方式（LangGraph checkpoint 或会话态）在此定一次，两个前端复用
 
-**验收标准**：契约 dataclass 与 start/resume API 定型；有一份说明文档/docstring 明确"前端只读 HitlPrompt、只回 HitlResponse"。
+- [ ] **H4-0-3** 约定状态机暂停/恢复 API
+  - `start_session(aspen_file, intent_text) -> session_id`
+  - `resume_session(session_id, HitlResponse) -> HitlPrompt | FinalResult`
+  - 暂停态持久化方式（LangGraph MemorySaver checkpoint）在此定一次
 
-### H4-API — Web 前端联调
+**验收标准**：`HitlPrompt`/`HitlResponse` dataclass 可独立导入；start/resume API 有 docstring 说明契约边界。
 
-> 接入项目记忆 `project_pao_frontend` 中的 FastAPI/Vue。
+### H4-1 — FastAPI 后端替换 mock
 
-- [ ] **H4-API-1** API 层把 `HitlPrompt` 经 SSE/轮询推给前端，`resume_session` 接收 `HitlResponse`
-- [ ] **H4-API-2** 前端：确认边界表单 + 决策按钮，复用现有 advisor chat / Pareto 图组件
-- [ ] **H4-API-3** 一次界面驱动完整走查：发起→看待确认问题→确认→优化→看报告（含 H2 达成度章节）
+> 现有 `mock_backend/` 的 SSE 流是脚本写死的，需替换为真实 `graph.py` 状态机驱动。
 
-**验收标准**：用户纯界面完成"确认→优化→看报告"；HITL 暂停/恢复不丢上下文。
+**文件**：`mock_backend/`（改造，不重写）；改造完成后可考虑重命名为 `backend/`。
 
-<!-- PLACEHOLDER-H4CLI -->
+- [ ] **H4-1-1** 新增 `/api/session/start` 端点
+  - 接收 `aspen_file`（本地绝对路径）+ `intent_text`
+  - 调 `start_session()`，返回 `session_id`
+
+- [ ] **H4-1-2** 改造 `/api/stream/{session_id}` SSE 端点
+  - 替换 mock 脚本，改为从 `graph.py` checkpoint 实时读取状态推送
+  - 优化进行中：推送每次仿真完成事件（iteration、objective values）
+  - HITL 暂停时：推送 `HitlPrompt` payload，前端切换为确认界面
+
+- [ ] **H4-1-3** 新增 `/api/session/{session_id}/resume` 端点
+  - 接收前端提交的 `HitlResponse`，调 `resume_session()` 恢复状态机
+
+- [ ] **H4-1-4** 保留现有 mock 数据路由不删除
+  - 加 `?mock=true` 参数切换，便于前端开发调试时不依赖真实 Aspen
+
+**验收标准**：三个新端点可通过 `curl`/Postman 手动验证；SSE 流在真实优化运行时有事件推送；HITL 暂停/恢复状态机状态不丢失。
+
+### H4-2 — Vue 前端接入真实数据
+
+> 现有 `/optimization` 页面的 Pareto 图和 HV 曲线已有组件，需把数据源从 mock 切换到真实 SSE 流。
+
+**文件**：`frontend/src/` 下相关组件（改造，不重写）。
+
+- [ ] **H4-2-1** `/optimization` 页面：新增"发起优化"表单
+  - 输入：Aspen 文件本地路径 + 自然语言意图
+  - 提交后调 `/api/session/start`，拿到 `session_id`，订阅 SSE 流
+
+- [ ] **H4-2-2** HITL 确认界面：变量边界确认表单
+  - 收到 `HitlPrompt`（phase=confirming）时弹出
+  - 逐条展示低置信度变量 + 建议范围，用户可编辑后提交
+  - 提交后调 `/api/session/{id}/resume`
+
+- [ ] **H4-2-3** HITL 决策界面：continue/adjust/done 按钮
+  - 收到 `HitlPrompt`（phase=deciding）时展示分析摘要 + 达成度概览
+  - 三个按钮对应三种 `HitlResponse.decision`
+
+- [ ] **H4-2-4** 报告展示
+  - 优化完成后从后端拉取 `summary_report`（含 H2 达成度章节）
+  - 在 `/optimization` 页面内嵌展示 Markdown 报告
+
+- [ ] **H4-2-5** 保留 mock 模式切换
+  - 界面上加一个"演示模式"开关，切到 mock 数据，用于展示/汇报时不依赖 Aspen
+
+**验收标准**：用户在浏览器发起一次完整调优（本地 Aspen 文件 → 意图 → 确认变量 → 优化 → 决策 → 看报告），全程不碰命令行；Pareto 图实时更新；报告含达成度章节；mock 模式可切换。
+
+
+
 
 
 
@@ -230,5 +286,75 @@
 
 阶段二的细化，待第一阶段收尾验收（H1–H5）通过后再行规划，避免重蹈"计划标 [x] 但工作树失真"的覆辙。
 
+---
 
+## H 系列任务编排计划
 
+> 前提：`DEVELOPMENT_PLAN.md` 中 A / B / C 全部任务真正完成（代码可导入、测试全绿、无 collect error）。
+
+### 依赖关系图
+
+```
+H1（真实端到端单跑）
+    │
+    ├──────────────────────┐
+    ↓                      ↓
+H2（目标达成度评估）    H3（泛化性验证）
+    │
+    ↓
+H4-0（HITL 契约定型）
+    │
+    ├──────────────────┐
+    ↓                  ↓
+H4-1（FastAPI 改造）  H4-2（Vue 前端接入）
+    └────────┬─────────┘
+             ↓
+           H5（鲁棒性压测）
+```
+
+### 并行规则
+
+**H1 必须最先、单独跑完。** 它是所有后续任务的事实基础——真实链路不通，H2 的达成度数据无法验证、H4 接入没有意义。H1 同时会产出缺陷清单，H2/H3 开发时需要参考。
+
+**H2 ∥ H3 可并行**，在 H1 完成后同时放出：
+
+| 任务 | 并行理由 |
+|------|---------|
+| H2 目标达成度评估 | 纯新模块（`goal_attainment.py`），只读 SimulationDB，不依赖 H3 |
+| H3 泛化性验证 | 测量任务，只跑 `discover_tunables`，只需要 Aspen 文件，不依赖 H2 |
+
+**H4-0 → H4-1 ∥ H4-2**，在 H1 + H2 都完成后放出：
+- H4-0（HITL 契约）很小，只定两个 dataclass，完成后 H4-1 与 H4-2 可立即并行。
+- H4-1（FastAPI）与 H4-2（Vue）并行时，H4-2 可先用 mock API 开发，H4-1 完成后再联调。
+- H4 必须等 H2 完成，因为前端报告展示需要包含达成度章节。
+
+**H5 必须最后**，H4 联调收尾、前端稳定后才有意义跑异常压测。
+
+**H3 不阻塞 H4**。H3 是测量任务，产出语义规则缺口清单；补规则属于后续迭代，不卡 H4 进行。
+
+### 时间线参考
+
+| 阶段 | 任务 | 备注 |
+|------|------|------|
+| Week 1 | **H1** | 可能需要调试真实链路问题，预留充足时间 |
+| Week 2 | **H2 ∥ H3** | H2 写代码；H3 跑扫描，速度取决于手头 Aspen 文件数量 |
+| Week 3 | **H4-0 → H4-1 ∥ H4-2** | H4-0 一天内完成；H4-1/H4-2 并行开发 |
+| Week 4 | **H4 联调收尾 → H5** | H4-1/H4-2 联调；H5 压测 |
+
+### 不能并行的约束（硬依赖）
+
+- H1 → H2：H2 需要真实链路产出的 DB 数据做验证
+- H1 → H4：前端接入的是真实 `graph.py` 流程，H1 不通则 H4 接入无意义
+- H2 → H4：前端报告页需要达成度章节，H2 未完成则 H4-2 报告展示不完整
+- H4 → H5：压测依赖完整链路与前端都稳定
+
+### 派发 agent 的建议
+
+每个任务包独立派发，不混合：
+- **H1**：编排脚本 agent，调用已有工具，不写新模块
+- **H2**：新模块 agent，只接触 `src/reporting/`，不碰其他层
+- **H3**：测量 agent，只运行脚本、产出报告，不改代码
+- **H4-0**：设计 agent，只写 `src/agents/hitl_protocol.py`，不改 `graph.py`
+- **H4-1**：后端 agent，只改 `mock_backend/`
+- **H4-2**：前端 agent，只改 `frontend/`
+- **H5**：测试 agent，只写 `tests/integration/test_phase1_robustness.py`

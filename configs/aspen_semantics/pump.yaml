@@ -44,11 +44,29 @@ fields:
         priority: 100
       - pattern: "Input\\EFFP"
         priority: 90           # 部分 Aspen 版本泵效率路径
-      - pattern: "Input\\EFF*"
-        priority: 70
     validators:
       value_type: numeric
       unit_dimension: dimensionless
+
+  # EFF_COEF*：泵效率曲线的多项式系数节点，无量纲系数，不应作为优化变量
+  efficiency_curve_coef:
+    required_for: []
+    required: false
+    tunable: false             # 明确禁止作为设计变量
+    candidates:
+      - pattern: "Input\\EFF_COEF*"
+        priority: 100
+      - pattern: "Input\\EFFCOEF*"
+        priority: 90
+
+  # EFF_NPOINT：效率曲线的整数型数据点数，不应作为优化变量
+  efficiency_curve_npoint:
+    required_for: []
+    required: false
+    tunable: false             # 明确禁止作为设计变量
+    candidates:
+      - pattern: "Input\\EFF_NPOINT"
+        priority: 100
 
   # ---- 可读输出字段 --------------------------------------------------------
 

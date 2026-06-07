@@ -1,0 +1,148 @@
+constraints:
+- aspen_path: \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+  name: purity_min
+  operator: '>='
+  threshold: 0.9
+design_variables:
+- aspen_path: \Data\Blocks\T0301\Input\B:F
+  description: bottoms_to_feed_ratio (\Data\Blocks\T0301\Input\B:F)
+  initial_value: 0.87
+  lower_bound: 0.3
+  name: Input_B:F
+  type: continuous
+  unit: '-'
+  upper_bound: 0.9
+- aspen_path: \Data\Blocks\T0301\Input\BASIS_RR
+  description: basis_reflux_ratio (\Data\Blocks\T0301\Input\BASIS_RR)
+  initial_value: 0.2
+  lower_bound: 1.0
+  name: Input_BASIS_RR
+  type: continuous
+  unit: '-'
+  upper_bound: 3.0
+extraction:
+  block_max_depth: 3
+  blocks:
+  - P0301
+  - P0302
+  - P0401
+  - T0301
+  - T0302
+  - T0303
+  - V0301
+  - V0302
+  - R0303-1
+  build_manifest_if_missing: true
+  catalog_db: E:\Project\GitHub Repo\PAO\cases\demo_case\output\node.db
+  check_status_paths:
+  - \Data\Blocks\P0301
+  - \Data\Blocks\P0302
+  - \Data\Blocks\P0401
+  - \Data\Blocks\T0301
+  - \Data\Blocks\T0302
+  - \Data\Blocks\T0303
+  - \Data\Blocks\V0301
+  - \Data\Blocks\V0302
+  - \Data\Blocks\R0303-1
+  - \Data\Streams\0301
+  - \Data\Streams\0303
+  - \Data\Streams\0304
+  - \Data\Streams\0305
+  - \Data\Streams\0306
+  - \Data\Streams\0307
+  - \Data\Streams\0308
+  - \Data\Streams\0309
+  - \Data\Streams\0310
+  - \Data\Streams\0311
+  - \Data\Streams\0315
+  - \Data\Streams\0316
+  - \Data\Streams\0317
+  - \Data\Streams\0318
+  - \Data\Streams\0319
+  - \Data\Streams\0320
+  - \Data\Streams\0322
+  - \Data\Streams\0323
+  - \Data\Streams\0324
+  - \Data\Streams\0325
+  - \Data\Streams\ADN
+  - \Data\Streams\CAT
+  - \Data\Streams\HCN2
+  manifest_id: auto
+  mode: manifest
+  semantic_rules_dir: configs/aspen_semantics
+  stream_max_depth: 3
+  stream_output_subtree: Output\STR_MAIN
+  streams:
+  - '0301'
+  - '0303'
+  - '0304'
+  - '0305'
+  - '0306'
+  - '0307'
+  - 0308
+  - 0309
+  - '0310'
+  - '0311'
+  - '0315'
+  - '0316'
+  - '0317'
+  - 0318
+  - 0319
+  - '0320'
+  - '0322'
+  - '0323'
+  - '0324'
+  - '0325'
+  - ADN
+  - CAT
+  - HCN2
+  strict_extraction: false
+  strict_manifest: true
+  write_node_values: true
+objectives:
+- aspen_path: \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
+  minimize: false
+  name: ADN_FLOW
+  type: aspen_path
+  unit: ''
+- aspen_path: \Data\Blocks\T0301\Output\REB_DUTY
+  minimize: true
+  name: REB_DUTY
+  type: aspen_path
+  unit: ''
+optimizer:
+  acquisition_function: EI
+  early_stopping:
+    check_first_front: true
+    check_hypervolume: true
+    enabled: true
+    max_duplicate_suggestions: 3
+    min_delta: 1.0e-06
+    min_iterations: 30
+    patience: 10
+    relative_delta: null
+  feasibility_filter:
+    candidate_pool_size: 200
+    enabled: false
+    min_samples: 20
+    model: extra_trees
+    random_seed: 42
+    threshold: 0.4
+  n_initial_points: 3
+  n_iterations: 3
+  random_seed: 42
+  scalarization: chebyshev
+  type: pareto_bayesian
+output_paths:
+- \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
+- \Data\Blocks\T0301\Output\REB_DUTY
+- \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+simulator:
+  filepath: E:\Project\GitHub Repo\PAO\cases\demo_case\二级氢氰化工段.bkp
+  input_rtol: 1.0e-06
+  reinit: true
+  require_type_library: true
+  suppress_dialogs: true
+  timeout: 300
+  verify_inputs: true
+  visible: false

@@ -199,11 +199,15 @@ class GoalSpec:
         纯最大/最小化目标时为 None。
     custom_aspen_path:
         metric="custom" 时的 Aspen 树路径；其他 metric 时为 None。
+    name:
+        目标/约束在生成配置中使用的名称（如 "ADN_FLOW"、"REB_DUTY"）；
+        None 时由 config_builder 按 metric 自动推断。
     """
     metric: str
     direction: Literal["min", "max"]
     target_value: float | None = None
     custom_aspen_path: str | None = None
+    name: str | None = None
 
 
 # ---------------------------------------------------------------------------

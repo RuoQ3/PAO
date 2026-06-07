@@ -621,7 +621,8 @@ def generate_variable_importance(
             lines.append(f"> ⚠ {w}")
 
     # 简短解读（使用绝对值排序的 top 变量，但显示带符号 ρ）
-    if ranked:
+    # 样本不足时跳过解读，避免输出不可靠的 ρ 值误导用户
+    if ranked and not sens.warnings:
         top_path, top_abs = ranked[0]
         top_short = _fmt_path_tail(top_path)
         top_rho = signed_rho.get(top_path)

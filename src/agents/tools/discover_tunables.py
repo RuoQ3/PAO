@@ -111,11 +111,46 @@ def _scan_aspen_file(
         from src.database.node_db import NodeDB
     except ImportError as exc:
         warnings.append(f"无法导入 aspen_driver 模块：{exc}")
-        # 返回一个空的 mock scan 供上层处理
         return _make_empty_scan(aspen_path), [], warnings
 
+    # ── 缓存命中检查：文件 hash 相同则复用已有 catalog，跳过 COM 扫描 ──────────
+    file_hash = _compute_file_hash(aspen_path)
+    if file_hash:
+        try:
+            with NodeDB(node_db_path) as node_db:
+                cached = node_db.get_latest_catalog_scan(file_hash)
+                if cached:
+                    catalog_id = cached["catalog_id"]
+                    entries = node_db.get_catalog_entries(catalog_id)
+                    if entries:
+                        _log.info(
+                            "discover_tunables：命中缓存 catalog（hash=%s...，id=%s，%d 节点），跳过 COM 扫描。",
+                            file_hash[:8], catalog_id[:8], len(entries),
+                        )
+                        warnings.append(
+                            f"[缓存] 复用已有 catalog（id={catalog_id[:8]}...，{len(entries)} 节点），未重新扫描 Aspen。"
+                        )
+                        from src.models.node_catalog import CatalogScan
+                        scan = CatalogScan(
+                            catalog_id=catalog_id,
+                            aspen_file_path=cached.get("aspen_file_path", aspen_path),
+                            aspen_file_hash=file_hash,
+                            aspen_version=cached.get("aspen_version", ""),
+                            n_blocks=cached.get("n_blocks", 0),
+                            n_streams=cached.get("n_streams", 0),
+                            n_entries=len(entries),
+                            scan_depth=cached.get("scan_depth", max_depth),
+                            created_at=cached.get("created_at", ""),
+                            notes=cached.get("notes", ""),
+                        )
+                        return scan, entries, warnings
+        except Exception as cache_exc:
+            _log.warning("缓存命中检查失败，回退到完整扫描：%s", cache_exc)
+
+    # ── 无缓存：完整 COM 扫描 ──────────────────────────────────────────────────
     try:
         driver = AspenDriver(visible=False, suppress_dialogs=True)
+        driver.connect()
         driver.open(aspen_path)
 
         with NodeDB(node_db_path) as node_db:
@@ -142,7 +177,7 @@ def _scan_aspen_file(
     finally:
         if driver is not None:
             try:
-                driver.close()
+                driver.disconnect()
             except Exception as exc:
                 warnings.append(f"关闭 Aspen driver 时出错：{exc}")
 

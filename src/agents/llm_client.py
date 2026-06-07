@@ -39,14 +39,14 @@ _log = logging.getLogger(__name__)
 # 只在 .env 存在时才加载；未安装 python-dotenv 时静默跳过（不阻断正常使用）。
 # override=False：已有的系统环境变量优先于 .env，避免覆盖 CI/CD 注入的 key。
 
-def _load_dotenv_if_present() -> None:
+def _load_dotenv_if_present(override: bool = False) -> None:
     env_file = Path(__file__).parent.parent.parent / ".env"
     if not env_file.exists():
         return
     try:
         from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_file, override=False)
-        _log.debug("已加载 .env：%s", env_file)
+        load_dotenv(dotenv_path=env_file, override=override)
+        _log.debug("已加载 .env（override=%s）：%s", override, env_file)
     except ImportError:
         _log.debug("python-dotenv 未安装，跳过 .env 加载（可 pip install python-dotenv）")
 
@@ -118,6 +118,10 @@ def load_llm_config(
 ) -> LLMConfig:
     """从环境变量构造 LLMConfig，显式参数优先。
 
+    每次调用都重新从 .env 加载一次（override=True），确保 .env 里的 key
+    始终优先于系统环境变量中可能残留的无效值（如 COM 调用后被清空的 token）。
+    这样即使 Aspen COM 扫描过程中环境变量状态改变，此后的调用仍能拿到正确 key。
+
     Args:
         provider: 覆盖 PAO_LLM_PROVIDER；None 时读环境变量，再缺省为 anthropic。
         model:    覆盖 PAO_LLM_MODEL；None 时读环境变量，再缺省为 provider 默认模型。
@@ -126,6 +130,15 @@ def load_llm_config(
         LLMConfig。未知 provider 回退到默认 provider 并告警。
         api_key 仅从对应环境变量读取，缺失时为 None（由 is_configured 判定）。
     """
+    # 每次调用重新加载 .env（override=True：.env 优先于系统环境变量）
+    # 先把空字符串 key 从 os.environ 中删除，防止 dotenv 把空值视为"已设置"而跳过覆盖
+    _prov_check = (provider or os.environ.get("PAO_LLM_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
+    if _prov_check in _PROVIDER_DEFAULTS:
+        _, _key_env = _PROVIDER_DEFAULTS[_prov_check]
+        if os.environ.get(_key_env) == "":
+            del os.environ[_key_env]
+    _load_dotenv_if_present(override=True)
+
     prov = (provider or os.environ.get("PAO_LLM_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
     if prov not in _PROVIDER_DEFAULTS:
         _log.warning(
