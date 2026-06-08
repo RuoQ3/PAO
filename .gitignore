@@ -77,3 +77,4 @@ ehthumbs.db
 .claude/
 scripts/
 .pytest_cache/
+docs/
