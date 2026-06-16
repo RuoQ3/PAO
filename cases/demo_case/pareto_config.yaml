@@ -8,7 +8,7 @@
 # 优化目标：
 #   ADN_FLOW   最大化 ADN 产品质量流量（kg/hr）—— 代表产量/吞吐量
 #   REB_DUTY   最小化再沸器热负荷（kW）         —— 代表能耗/操作成本
-#
+#   
 # 为什么这两个目标存在真实权衡（而非原来的 TAC vs EMISSIONS）：
 #   - B:F（塔底采出比）主要控制 ADN_FLOW：B:F 越高 -> 产量越高
 #   - RR（回流比）主要控制 REB_DUTY：RR 越高 -> 能耗越高
@@ -122,7 +122,7 @@ constraints:
     description: ADN 质量分数不低于 0.9（产品纯度下限）
     aspen_path: \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
     operator: ">="
-    threshold: 0.9
+    threshold: 0.999
 
 # ---------------------------------------------------------------------------
 # block/stream 提取配置
@@ -156,8 +156,21 @@ optimizer:
   n_initial_points: 20              # 初始 DOE 采样点数（建模前的随机/LHS 探索）
   n_iterations: 60                  # 总仿真次数 = 20 + 60 = 80
   scalarization: chebyshev          # 对非凸 Pareto 前沿覆盖更均匀
+  surrogate_model: qEHVI            # BoTorch qLogEHVI，样本效率优于 ParEGO
   acquisition_function: EI          # 采集函数：EI=期望改善 / UCB / PI
   random_seed: 42                   # 全局随机种子，保证 DOE 与候选生成可复现
+  hv_margin: 0.1
+
+
+trust_region:
+  enabled: true
+  initial_radius: 0.4             # 初始在 ±40% 范围内采样（比 ±20% 稍宽，给 qEHVI 更多空间）
+  min_radius: 0.05                # 最小不低于 ±5%，防止搜索退化为单点
+  max_radius: 1.0                 # 最大 = 全局搜索
+  gamma_expand: 1.5               # HV 改进 > 5% 时扩张 50%
+  gamma_shrink: 0.7               # 无改进时收缩 30%
+  eta_success: 0.05               # HV 相对改进 5% 以上视为成功
+  failure_tolerance: 5            # 连续 5 次无 HV 改进后重置到初始半径
 
   # ML-assisted feasibility filtering（运行时生效）
   # 作用：用历史仿真数据库中的成功/失败标签训练可行性分类器，在 BO 阶段先生成候选池，

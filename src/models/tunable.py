@@ -76,6 +76,8 @@ class TunableVariable:
     unit: str
     confidence: Literal["high", "medium", "low"]
     reason: str
+    priority_score: float = 0.5   # 0.0~1.0；LLM 评分，降级时由 confidence 映射
+    priority_reason: str = ""     # LLM 给出的重要性说明
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +145,7 @@ class TunableReport:
     readable_targets: list[ReadableTarget] = field(default_factory=list)
     scan_warnings: list[str] = field(default_factory=list)
     semantic_coverage: float = 0.0
+    topology: dict = field(default_factory=dict)   # {"nodes": [...], "edges": [...]}
 
     def get_high_confidence_vars(self) -> list[TunableVariable]:
         """返回置信度为 high 的设计变量列表。"""
@@ -291,6 +294,7 @@ class ConfigDraft:
         """
         将草案序列化为符合 pareto_config.yaml schema 的字典。
 
+
         输出格式与 cases/demo_case/pareto_config.yaml 兼容。
         lower_bound / upper_bound 为 None 的变量保持 None 值（YAML 中显示为 null）。
 
@@ -336,3 +340,40 @@ class ConfigDraft:
             "optimizer": self.optimizer,
         }
         return result
+
+
+# ---------------------------------------------------------------------------
+# A1-7 WriteCheckResult / WriteFeasibilityReport — 试写验证结果
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WriteCheckResult:
+    """单个设计变量的 COM 层试写验证结果。"""
+    aspen_path: str
+    original_value: Any    # 试写前读到的原值（恢复用）
+    test_value: Any        # 实际写入的测试值（通常取 lower_bound）
+    writable: bool         # True=写入+读回均成功
+    error: str = ""        # 失败时的错误描述；成功时为 ""
+
+
+@dataclass
+class WriteFeasibilityReport:
+    """一次试写验证的完整报告（覆盖 ConfigDraft 所有设计变量）。"""
+    aspen_file: str
+    results: list[WriteCheckResult] = field(default_factory=list)
+    unwritable_paths: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# A1-8 PrioritizationResult — LLM 优先级排序结果
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PrioritizationResult:
+    """LLM 对设计变量按优化目标重要性排序的完整结果。"""
+    ranked_variables: list[TunableVariable]   # 已按 priority_score 降序排列
+    ranking_notes: str = ""                    # LLM 对整体排序的说明
+    warnings: list[str] = field(default_factory=list)
+    source: str = "llm"                        # "llm" | "fallback"
+

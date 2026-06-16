@@ -53,6 +53,10 @@ class AspenDriver:
         self._hap_constants: dict[str, int] | None = None
         # set_value() 每次调用后递增，用于检测 run_case() 后是否有输入被修改。
         self._mutation_count: int = 0
+        # COM 自愈标志：仿真超时或 Run2 抛 COM 异常后置为 True，
+        # 表示底层 COM/引擎可能已处于不一致状态，下一次运行前应先 reconnect()。
+        # 这是执行层自愈的核心信号，与具体工艺无关。
+        self._needs_recovery: bool = False
 
     # ------------------------------------------------------------------ #
     # 连接生命周期
@@ -246,7 +250,13 @@ class AspenDriver:
             raise AspenRunError(f"重新初始化失败：{exc}") from exc
 
     def run(self, timeout: float = _RUN_TIMEOUT) -> None:
-        """运行仿真，阻塞直到完成或超时。"""
+        """运行仿真，阻塞直到完成或超时。
+
+        超时或启动失败时,除抛出异常外还会置 _needs_recovery=True,
+        提示上层在下一次运行前调用 recover() 重建 COM 连接——
+        因为超时后 Aspen 引擎常处于不一致状态,后续 Run2 会连续抛
+        COM 异常(DISP_E_EXCEPTION),不重建连接则整轮 DOE 全部报废。
+        """
         self._require_connection()
         engine = self._app.Engine
 
@@ -254,6 +264,8 @@ class AspenDriver:
         try:
             engine.Run2(True)
         except Exception as exc:
+            # Run2 启动即抛异常,通常是上一次超时残留的坏连接 → 标记需恢复
+            self._needs_recovery = True
             raise AspenRunError(f"无法启动仿真：{exc}") from exc
 
         _log.debug("driver.run: Run2(True) 返回，IsRunning=%s", self._engine_is_running(engine))
@@ -267,6 +279,8 @@ class AspenDriver:
                     engine.Stop()
                 except Exception:
                     pass
+                # 超时:引擎可能卡在内部计算,COM 状态不可信 → 标记需恢复
+                self._needs_recovery = True
                 raise AspenRunTimeoutError(timeout)
             time.sleep(self._POLL_INTERVAL)
             poll_count += 1
@@ -388,6 +402,62 @@ class AspenDriver:
         if not isinstance(count, int) or count < 1:
             raise ValueError(f"mark_mutated() 的 count 必须为正整数，收到：{count!r}")
         self._mutation_count += count
+
+    # ------------------------------------------------------------------ #
+    # COM 自愈（执行层,与工艺无关）
+    # ------------------------------------------------------------------ #
+
+    @property
+    def needs_recovery(self) -> bool:
+        """
+        底层 COM/引擎是否处于需要重建的不一致状态。
+
+        在仿真超时或 Run2 启动异常后置为 True。上层运行循环应在每次
+        run 前检查此标志,为 True 时先调用 recover(),避免坏连接导致
+        后续所有仿真连锁失败(DISP_E_EXCEPTION)。
+        """
+        return self._needs_recovery
+
+    def recover(self) -> bool:
+        """
+        重建 Aspen COM 连接并重新打开当前文件,清除 needs_recovery 标志。
+
+        用于超时/COM 崩溃后的执行层自愈:彻底断开旧连接(释放损坏的 COM
+        对象),重新 connect() + open() 当前文件。整个过程与具体工艺无关。
+
+        Returns
+        -------
+        bool
+            True  恢复成功,可继续运行后续工况。
+            False 恢复失败(连接或打开文件抛异常),调用方应终止本轮优化。
+            无论成败,_needs_recovery 都会被清零(失败时由上层据返回值终止)。
+        """
+        saved_filepath = self._filepath
+        _log.warning(
+            "driver.recover: 检测到 COM 需恢复,开始重建连接(file=%s)。",
+            saved_filepath,
+        )
+        # 先彻底断开旧连接,释放可能损坏的 COM 对象
+        try:
+            self.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("driver.recover: disconnect 阶段异常(已忽略,继续重连)：%s", exc)
+
+        # disconnect 把 _filepath 清空了,这里用保存的路径重开
+        self._needs_recovery = False
+        try:
+            self.connect()
+            if saved_filepath is not None:
+                self.open(saved_filepath)
+            _log.info("driver.recover: COM 连接已重建,文件已重新打开。")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _log.error("driver.recover: 重建连接失败,本轮优化应终止：%s", exc)
+            return False
+
+    def clear_recovery_flag(self) -> None:
+        """手动清除 needs_recovery 标志(上层已用其他方式处理时使用)。"""
+        self._needs_recovery = False
 
     def _require_connection(self) -> None:
         if self._app is None:

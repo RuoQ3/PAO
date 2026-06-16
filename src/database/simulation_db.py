@@ -405,6 +405,52 @@ class SimulationDB:
             params.append(offset)
 
         rows = self._conn.execute(sql, params).fetchall()
+
+        # session_id 前缀容错回退：
+        # 历史上 backend 曾用 8 字符前缀（uuid[:8]）作为 session_id，而工况写库时
+        # 用的是完整 UUID（经 YAML optimizer.session_id 注入）。两者精确匹配会失败，
+        # 导致 Pareto/报告查回 0 行（前端“结果全为 0、找不到解”）。
+        # 当精确匹配 0 行、且 session_id 看起来像 UUID 前缀（无连字符、长度较短）时，
+        # 回退到前缀匹配，找回这类历史数据。新代码已统一完整 UUID，此回退只兜底旧库。
+        if (
+            not rows
+            and session_id is not None
+            and 0 < len(session_id) < 36
+            and "-" not in session_id
+        ):
+            # 重建条件与参数：把 session_id 等值条件换成前缀匹配，其余保持不变。
+            fb_conditions: list[str] = []
+            fb_params: list[Any] = []
+            _p_iter = iter(params)
+            for c in conditions:
+                val = next(_p_iter)
+                if c == "cases.session_id = ?":
+                    fb_conditions.append("cases.session_id LIKE ?")
+                    fb_params.append(f"{session_id}%")
+                else:
+                    fb_conditions.append(c)
+                    fb_params.append(val)
+            # params 尾部的 LIMIT/OFFSET 值原样保留
+            fb_params.extend(_p_iter)
+
+            fb_sql = f"SELECT {cols} FROM cases"
+            if fb_conditions:
+                fb_sql += " WHERE " + " AND ".join(fb_conditions)
+            fb_sql += " ORDER BY cases.iteration ASC, cases.created_at ASC"
+            if limit is not None:
+                fb_sql += " LIMIT ?" + (" OFFSET ?" if offset else "")
+            elif offset:
+                fb_sql += " LIMIT -1 OFFSET ?"
+
+            fb_rows = self._conn.execute(fb_sql, fb_params).fetchall()
+            if fb_rows:
+                _log.warning(
+                    "query_cases: session_id=%r 精确匹配 0 行，前缀匹配命中 %d 行"
+                    "（疑似历史 8 字符前缀 ID 与完整 UUID 不一致）。",
+                    session_id, len(fb_rows),
+                )
+                rows = fb_rows
+
         return [self._row_to_summary_dict(r) for r in rows]
 
     def query_by_objective(

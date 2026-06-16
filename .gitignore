@@ -78,3 +78,13 @@ ehthumbs.db
 scripts/
 .pytest_cache/
 docs/
+
+
+cases/demo_case_2/epsd/
+cases/demo_case_2/GLY2.1/
+
+cases/Aspen示例/
+
+frontend/
+
+backend/

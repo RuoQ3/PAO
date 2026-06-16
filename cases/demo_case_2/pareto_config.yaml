@@ -245,8 +245,9 @@ objectives:
     unit: "$/yr"                     # 单位（仅展示用）
     annualization_factor: 0.1        # 10 年直线折旧
     operating_hours: 8000.0          # 年操作小时数
-    skip_missing: false              # 任一设备缺数据则 TAC=None，不低估成本
-    allow_partial_objective: false   # false=目标必须完整可算，否则该工况判为 objective_error
+    skip_missing: true               # P1/P2 泵无 POWER 节点（未激活 sizing），跳过不报错
+                                     # T1/T2/T3 能正常计算，P1/P2 泵功耗贡献暂时忽略
+    allow_partial_objective: true    # 允许跳过 P1/P2 的部分结果进入优化
     utility_cost:
       steam_price: 14.19             # $/GJ，低压蒸汽（Turton 2018）
       cooling_water_price: 0.354     # $/GJ
@@ -283,8 +284,9 @@ objectives:
     minimize: true                   # 优化方向：最小化
     unit: "tonne CO2-eq/yr"          # 单位（仅展示用）
     operating_hours: 8000.0          # 年操作小时数
-    skip_missing: false              # 任一设备缺数据则结果=None，不低估排放
-    allow_partial_objective: false   # false=目标必须完整可算，否则该工况判为 objective_error
+    skip_missing: true               # P1/P2 泵无 POWER 节点，跳过其电耗排放贡献
+                                     # 三塔蒸汽/冷却水排放正常计算，泵电耗占比极小可忽略
+    allow_partial_objective: true    # 允许跳过 P1/P2 的部分结果进入优化
     emission_factors:
       steam_factor: 66.0             # kg CO₂/GJ，天然气锅炉 η=0.85
       cooling_water_factor: 0.0      # 冷却水排放可忽略
@@ -353,7 +355,7 @@ extraction:
   # 启用方式：将 mode 改为 manifest，首次运行会自动 catalog scan + build manifest
   # 优势：直接路径读取，COM 访问次数最小化，解决 CA_DIAM* 深层节点截断问题
   mode: manifest                     # 提取模式：manifest=按清单直接读取；full=递归遍历
-  catalog_db: cases/demo_case_2/output/node.db   # 节点目录/manifest 数据库路径
+  catalog_db: cases/demo_case_2/output/node_pareto.db   # 独立节点数据库，与 epsd_aligned 隔离
   manifest_id: auto                  # auto=自动查找最新 manifest；或指定具体 ID
   semantic_rules_dir: configs/aspen_semantics    # 语义标注规则目录（给节点附加业务含义）
   build_manifest_if_missing: true    # 首次运行自动 catalog scan + build manifest

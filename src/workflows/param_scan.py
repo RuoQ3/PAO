@@ -123,6 +123,10 @@ class ParamScanConfig:
     tags: list[str] = field(default_factory=list)
     on_case_complete: Callable[[ProcessCase, int, int], None] | None = None
     max_cases: int | None = None
+    # 初始收敛解（来自 .bkp 文件的 initial_value），将其作为第一个扫描点注入。
+    # 格式：{Aspen路径: 值}，路径须在 scan_vars 中，注入时取最近的扫描值。
+    # None 表示不注入，保持原有顺序。
+    initial_point: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +243,17 @@ def param_scan(
     _validate_config(config)
 
     combos = _generate_combinations(config)
+
+    # 若配置了初始收敛解，将最接近初始值的扫描点移到列表最前面
+    if config.initial_point:
+        best_idx = _find_closest_combo(combos, config.initial_point)
+        if best_idx > 0:
+            combos.insert(0, combos.pop(best_idx))
+            _log.info(
+                "参数扫描：已将最接近初始收敛解的参数组合移至第一位（原索引 %d）。",
+                best_idx,
+            )
+
     n_total = len(combos)
 
     _log.info(
@@ -441,6 +456,31 @@ def _generate_combinations(config: ParamScanConfig) -> list[dict[str, Any]]:
         dict(zip(paths, combo))
         for combo in itertools.product(*value_lists)
     ]
+
+
+def _find_closest_combo(
+    combos: list[dict[str, Any]],
+    initial_point: dict[str, Any],
+) -> int:
+    """
+    找到 combos 中与 initial_point 欧氏距离最近的组合的索引。
+    仅对 initial_point 中存在的路径计算距离，其余路径忽略。
+    """
+    best_idx = 0
+    best_dist = float("inf")
+    for i, combo in enumerate(combos):
+        dist = 0.0
+        for path, ref_val in initial_point.items():
+            if path in combo:
+                try:
+                    diff = float(combo[path]) - float(ref_val)
+                    dist += diff * diff
+                except (TypeError, ValueError):
+                    pass
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = i
+    return best_idx
 
 
 # ---------------------------------------------------------------------------

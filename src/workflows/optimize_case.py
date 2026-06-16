@@ -177,6 +177,8 @@ class OptimizeCaseConfig:
     feasibility_filter: FeasibilityConfig = field(default_factory=FeasibilityConfig)
     # 早停配置；enabled=False（默认）时完全不影响原有流程
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
+    # Phase 0 可行性搜索（以初始收敛解为中心的局部 LHS）；None=不启用
+    feasibility_search: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +362,32 @@ def optimize_case(
     early_stop_reason: str | None = None
     duplicate_skipped_iterations = 0
     no_unique_candidate_count = 0
+
+    # ------------------------------------------------------------------
+    # Phase 0（可选）：以初始收敛解为中心的局部 LHS 可行性搜索
+    # 复用多目标版本的 _feasibility_search()，传入简化版 config 适配器
+    # ------------------------------------------------------------------
+    if config.feasibility_search is not None and config.feasibility_search.enabled:
+        from .optimize_pareto_case import _feasibility_search as _fs
+        # 构造 _feasibility_search 所需的最小参数对象
+        class _FSAdapter:
+            feasibility_search = config.feasibility_search
+            fixed_vars         = config.fixed_vars
+            integer_var_paths  = config.integer_var_paths
+            param_bounds       = config.param_bounds
+            var_dependencies: dict = {}
+            derived_var_specs  = config.derived_var_specs
+            run_config         = config.run_config
+            tags: list[str]    = []
+            random_seed        = config.random_seed
+            session_id: str    = ""
+
+        _fs_cases, driver_dead, _fs_xs = _fs(
+            driver, _FSAdapter(), paths, bounds, db, 0
+        )
+        for c, x in zip(_fs_cases, _fs_xs):
+            cases.append(c)
+            case_xs.append(x)
 
     # ------------------------------------------------------------------
     # Phase 1：初始 DOE（拉丁超立方采样）

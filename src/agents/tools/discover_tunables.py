@@ -143,11 +143,15 @@ def _scan_aspen_file(
                             created_at=cached.get("created_at", ""),
                             notes=cached.get("notes", ""),
                         )
-                        return scan, entries, warnings
+                        # 缓存命中：从 catalog entries 提取 Block 节点（无连接边）
+                        from src.aspen_driver.topology import topology_from_catalog_entries
+                        cached_topo = topology_from_catalog_entries(entries)
+                        return scan, entries, warnings, cached_topo
         except Exception as cache_exc:
             _log.warning("缓存命中检查失败，回退到完整扫描：%s", cache_exc)
 
     # ── 无缓存：完整 COM 扫描 ──────────────────────────────────────────────────
+    topology: dict = {}
     try:
         driver = AspenDriver(visible=False, suppress_dialogs=True)
         driver.connect()
@@ -169,11 +173,18 @@ def _scan_aspen_file(
             # 读取全部节点条目（不过滤，由上层按 rel_path 判断 Input/Output）
             entries = node_db.get_catalog_entries(scan.catalog_id)
 
-        return scan, entries, warnings
+        # Aspen 文件仍在打开状态时读取流程拓扑（stream 连接关系）
+        try:
+            from src.aspen_driver.topology import read_process_topology
+            topology = read_process_topology(driver)
+        except Exception as topo_exc:
+            warnings.append(f"流程拓扑读取失败（{type(topo_exc).__name__}）：{topo_exc}")
+
+        return scan, entries, warnings, topology
 
     except Exception as exc:
         warnings.append(f"扫描 Aspen 文件失败（{type(exc).__name__}）：{exc}")
-        return _make_empty_scan(aspen_path), [], warnings
+        return _make_empty_scan(aspen_path), [], warnings, {}
     finally:
         if driver is not None:
             try:
@@ -704,7 +715,8 @@ def discover_tunables_impl(
     aspen_file_path:
         Aspen 仿真文件路径（.bkp / .apw）。
     node_db_path:
-        NodeDB SQLite 文件路径。
+        NodeDB SQLite 文件路径。留空时自动在 Aspen 文件同目录下创建
+        ``<case_name>_node.db``。
     rules_dir:
         语义规则 YAML 目录，默认 "configs/aspen_semantics"。
     max_depth:
@@ -714,6 +726,12 @@ def discover_tunables_impl(
     -------
     TunableReport
     """
+    # 空路径回退：在 Aspen 文件同目录下自动创建 node.db
+    if not node_db_path or not node_db_path.strip():
+        _aspen_p = Path(aspen_file_path)
+        node_db_path = str(_aspen_p.parent / (_aspen_p.stem + "_node.db"))
+        _log.info("discover_tunables：node_db_path 为空，自动设为 %s", node_db_path)
+
     all_warnings: list[str] = []
 
     # 加载语义规则（不依赖 Aspen，可在导入时调用）
@@ -729,8 +747,8 @@ def discover_tunables_impl(
     # 计算 Aspen 文件 hash（用于 TunableReport）
     aspen_file_hash = _compute_file_hash(aspen_file_path)
 
-    # 扫描 Aspen 文件
-    scan, entries, scan_warnings = _scan_aspen_file(
+    # 扫描 Aspen 文件（返回 4 元组，含拓扑）
+    scan, entries, scan_warnings, topology = _scan_aspen_file(
         aspen_file_path, node_db_path, max_depth
     )
     all_warnings.extend(scan_warnings)
@@ -744,6 +762,7 @@ def discover_tunables_impl(
             readable_targets=[],
             scan_warnings=all_warnings,
             semantic_coverage=0.0,
+            topology=topology,
         )
 
     # 构建变量和目标列表；两个函数均返回 (list, warnings)
@@ -765,6 +784,7 @@ def discover_tunables_impl(
         readable_targets=readable_targets,
         scan_warnings=all_warnings,
         semantic_coverage=coverage,
+        topology=topology,
     )
 
 

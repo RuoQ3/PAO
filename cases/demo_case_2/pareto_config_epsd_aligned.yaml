@@ -1,0 +1,497 @@
+# pareto_config_epsd_aligned.yaml — 完全对齐 MATLAB NSGA-II 的 PAO 优化配置
+#
+# 目的：与 cases/demo_case_2/epsd/Opt_simulationColumn.m 及
+#       simulationOPEX.m / simulationCAPEX.m 保持完全一致，
+#       以便直接比较 PAO（贝叶斯优化）与 MATLAB（NSGA-II）的
+#       优化结果和运行时间。
+#
+# 设计变量：16 维（MATLAB xl/xu 完全一致）
+#   x1-x4：T1 塔（NSTAGE、RR、进料板 frac、萃取剂进料 frac）
+#   x5-x8：T2 塔（NSTAGE、RR、进料板 frac、萃取剂进料 frac）
+#   x9-x11：T3 塔（NSTAGE、RR、进料板 frac）
+#   x12-x13：SOL1、SOL2（萃取剂流量）
+#   x14-x16：T1、T2、T3 操作压力
+#
+# 优化目标（与 MATLAB 完全一致）：
+#   CAPEX = CO₂+SO₂+NOₓ 年排放量（tonne/yr，simulationCAPEX.m）
+#   OPEX  = TCC/3 + TOC（改良 Guthrie 法 3 年折旧，simulationOPEX.m）
+#
+# 约束：三个产品流股纯度 >= 0.999 mol frac（与 MATLAB 一致）
+
+# 运行方式：
+#   python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml
+#   python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --dry-run
+
+# ---------------------------------------------------------------------------
+# 仿真文件
+# ---------------------------------------------------------------------------
+simulator:
+  filepath: cases/demo_case_2/2epsd.bkp
+  visible: false
+  suppress_dialogs: true
+  require_type_library: true
+  timeout: 300
+  reinit: true
+  verify_inputs: true
+  input_rtol: 1.0e-6
+
+# ---------------------------------------------------------------------------
+# 设计变量（完全对齐 MATLAB xl/xu）
+# ---------------------------------------------------------------------------
+# MATLAB 的 16 个变量按以下规则映射到 PAO：
+#   x1(NSTAGE_T1)[4,200]    → T1_NSTAGE integer
+#   x2(RR_T1)[0.001,20]     → T1_RR continuous
+#   x3(FeedFrac_T1)[0,1]    → T1_FEED_F1_FRAC derived (lo_frac=0, hi_frac=1, frac_lo=3)
+#   x4(S1Frac_T1)[0,1]      → T1_FEED_S1_FRAC derived (lo_frac=0, hi_frac=1, frac_lo=3)
+#   x5(NSTAGE_T2)[4,200]    → T2_NSTAGE integer
+#   x6(RR_T2)[0.001,20]     → T2_RR continuous
+#   x7(FeedFrac_T2)[0,1]    → T2_FEED_F2_FRAC derived (lo_frac=0, hi_frac=1, frac_lo=3)
+#   x8(S2Frac_T2)[0,1]      → T2_FEED_S2_FRAC derived (lo_frac=0, hi_frac=1, frac_lo=3)
+#   x9(NSTAGE_T3)[4,100]    → T3_NSTAGE integer
+#   x10(RR_T3)[0.001,10]    → T3_RR continuous
+#   x11(FeedFrac_T3)[0,1]   → T3_FEED_F3_FRAC derived (lo_frac=0, hi_frac=1, frac_lo=3)
+#   x12(SOL1)[10,2000]      → SOL1_FLOW integer
+#   x13(SOL2)[10,2000]      → SOL2_FLOW integer
+#   x14(P_T1)[0.01,10]      → T1_PRES continuous
+#   x15(P_T2)[0.01,10]      → T2_PRES continuous
+#   x16(P_T3)[0.01,10]      → T3_PRES continuous
+#
+# 进料板映射公式（与 MATLAB 一致）：
+#   MATLAB: Feed_Stage = round((Stages-6)*X_frac + 3)
+#   PAO derived: target = round(depends_on * frac) 且 >= frac_lo
+#   两者等效：Stages×frac + 3 - 6×frac = frac×(Stages-6) + 3
+
+design_variables:
+
+  # ── T1 塔 ──────────────────────────────────────────────────────────────────
+  - name: T1_NSTAGE
+    description: T1 理论板数（boundary_advisor 锚定初值 50,真空塔板数较迟钝）
+    aspen_path: \Data\Blocks\T1\Input\NSTAGE
+    type: integer
+    lower_bound: 17
+    upper_bound: 150
+    initial_value: 50
+    unit: "-"
+
+  - name: T1_RR
+    description: T1 回流比（boundary_advisor 锚定初值 0.832,低回流比敏感）
+    aspen_path: \Data\Blocks\T1\Input\BASIS_RR
+    type: continuous
+    lower_bound: 0.416
+    upper_bound: 2.08
+    initial_value: 0.832
+    unit: "-"
+
+  - name: T1_FEED_F1_FRAC
+    description: T1 主进料 F1 归一化位置（range [0,1]，映射为 FEED_STAGE\F1）
+    type: derived
+    lo_frac: 0.4535
+    hi_frac: 0.6335
+    initial_value: 0.5435  # 反算：(FEED_STAGE=28 - frac_lo=3) / (NSTAGE=50 - frac_lo=3 - 1) = 25/46
+    target_path: \Data\Blocks\T1\Input\FEED_STAGE\F1
+    depends_on: \Data\Blocks\T1\Input\NSTAGE
+    frac_lo: 3
+    unit: "-"
+
+  - name: T1_FEED_S1_FRAC
+    description: T1 萃取剂 S1 归一化进料位置（range [0,1]，映射为 FEED_STAGE\S1）
+    type: derived
+    lo_frac: 0
+    hi_frac: 0.00115694
+    initial_value: 0.0     # 反算：(FEED_STAGE=3 - frac_lo=3) / (NSTAGE=50 - frac_lo=3 - 1) = 0/46 = 0（萃取剂靠近塔顶）
+    target_path: \Data\Blocks\T1\Input\FEED_STAGE\S1
+    depends_on: \Data\Blocks\T1\Input\NSTAGE
+    frac_lo: 3
+    unit: "-"
+
+  # ── T2 塔 ──────────────────────────────────────────────────────────────────
+  - name: T2_NSTAGE
+    description: T2 理论板数（boundary_advisor 锚定初值 118）
+    aspen_path: \Data\Blocks\T2\Input\NSTAGE
+    type: integer
+    lower_bound: 39
+    upper_bound: 200
+    initial_value: 118
+    unit: "-"
+
+  - name: T2_RR
+    description: T2 回流比（boundary_advisor 锚定初值 0.23,极低回流比高敏感）
+    aspen_path: \Data\Blocks\T2\Input\BASIS_RR
+    type: continuous
+    lower_bound: 0.214272
+    upper_bound: 0.245728
+    initial_value: 0.230
+    unit: "-"
+
+  - name: T2_FEED_F2_FRAC
+    description: T2 主进料 F2 归一化位置（range [0,1]，映射为 FEED_STAGE\F2）
+    type: derived
+    lo_frac: 0.894246
+    hi_frac: 0.947954
+    initial_value: 0.9211  # 反算：(FEED_STAGE=108 - frac_lo=3) / (NSTAGE=118 - frac_lo=3 - 1) = 105/114
+    target_path: \Data\Blocks\T2\Input\FEED_STAGE\F2
+    depends_on: \Data\Blocks\T2\Input\NSTAGE
+    frac_lo: 3
+    unit: "-"
+
+  - name: T2_FEED_S2_FRAC
+    description: T2 萃取剂 S2 归一化进料位置（range [0,1]，映射为 FEED_STAGE\S2）
+    type: derived
+    lo_frac: 0.0031875
+    hi_frac: 0.0670125
+    initial_value: 0.0351  # 反算：(FEED_STAGE=7 - frac_lo=3) / (NSTAGE=118 - frac_lo=3 - 1) = 4/114（萃取剂靠近塔顶）
+    target_path: \Data\Blocks\T2\Input\FEED_STAGE\S2
+    depends_on: \Data\Blocks\T2\Input\NSTAGE
+    frac_lo: 3
+    unit: "-"
+
+  # ── T3 塔 ──────────────────────────────────────────────────────────────────
+  - name: T3_NSTAGE
+    description: T3 理论板数（boundary_advisor 锚定初值 14）
+    aspen_path: \Data\Blocks\T3\Input\NSTAGE
+    type: integer
+    lower_bound: 6
+    upper_bound: 35
+    initial_value: 14
+    unit: "-"
+
+  - name: T3_RR
+    description: T3 回流比（boundary_advisor 锚定初值 1.769）
+    aspen_path: \Data\Blocks\T3\Input\BASIS_RR
+    type: continuous
+    lower_bound: 0.8845
+    upper_bound: 4.4225
+    initial_value: 1.769
+    unit: "-"
+
+  - name: T3_FEED_F3_FRAC
+    description: T3 主进料 F3 归一化位置（range [0,1]，映射为 FEED_STAGE\F3）
+    type: derived
+    lo_frac: 0.21
+    hi_frac: 0.39
+    initial_value: 0.3     # 反算：(FEED_STAGE=6 - frac_lo=3) / (NSTAGE=14 - frac_lo=3 - 1) = 3/10
+    target_path: \Data\Blocks\T3\Input\FEED_STAGE\F3
+    depends_on: \Data\Blocks\T3\Input\NSTAGE
+    frac_lo: 3
+    unit: "-"
+
+  # ── 萃取剂流量（boundary_advisor 锚定初值,收窄到可行域附近,杠杆变量保守）──────
+  - name: SOL1_FLOW
+    description: 萃取剂 S1 总摩尔流量（锚定初值 69 kmol/hr,杠杆变量,收窄范围）
+    aspen_path: \Data\Streams\S1\Input\TOTFLOW\MIXED
+    type: integer
+    lower_bound: 35
+    upper_bound: 138
+    initial_value: 69
+    unit: "kmol/hr"
+
+  - name: SOL2_FLOW
+    description: 萃取剂 S2 总摩尔流量（锚定初值 231 kmol/hr,杠杆变量,收窄范围）
+    aspen_path: \Data\Streams\S2\Input\TOTFLOW\MIXED
+    type: integer
+    lower_bound: 116
+    upper_bound: 462
+    initial_value: 231
+    unit: "kmol/hr"
+
+  # ── 操作压力（真空操作!boundary_advisor 锚定初值,严锁在真空区间,绝不放到常压以上）──
+  - name: T1_PRES
+    description: T1 塔顶操作压力（真空操作,锚定初值 0.0576 atm）
+    aspen_path: \Data\Blocks\T1\Input\PRES1
+    type: continuous
+    lower_bound: 0.042048
+    upper_bound: 0.073152
+    initial_value: 0.0576
+    unit: "atm"
+
+  - name: T2_PRES
+    description: T2 塔顶操作压力（真空操作,锚定初值 0.183 atm）
+    aspen_path: \Data\Blocks\T2\Input\PRES1
+    type: continuous
+    lower_bound: 0.13359
+    upper_bound: 0.23241
+    initial_value: 0.183
+    unit: "atm"
+
+  - name: T3_PRES
+    description: T3 塔顶操作压力（真空操作,锚定初值 0.0598 atm）
+    aspen_path: \Data\Blocks\T3\Input\PRES1
+    type: continuous
+    lower_bound: 0.043654
+    upper_bound: 0.075946
+    initial_value: 0.0598
+    unit: "atm"
+
+# ---------------------------------------------------------------------------
+# 输出节点（目标函数和约束函数读取）
+# ---------------------------------------------------------------------------
+output_paths:
+  # 约束所需节点（产品流股纯度）
+  # 注意：2epsd.bkp 中组分名为 PF（非 PROH）和 NPA（非 BUAC），与 pareto_config.yaml 一致
+  - \Data\Streams\D1\Output\MOLEFRAC\MIXED\PF      # D1: PF 纯度（MATLAB 称 PROH）
+  - \Data\Streams\D2\Output\MOLEFRAC\MIXED\NPA     # D2: NPA 纯度（MATLAB 称 BUAC）
+  - \Data\Streams\D3\Output\MOLEFRAC\MIXED\WATER  # D3: WATER 纯度
+
+  # CAPEX 目标所需节点（再沸器热负荷）
+  - \Data\Blocks\T1\Output\REB_DUTY
+  - \Data\Blocks\T2\Output\REB_DUTY
+  - \Data\Blocks\T3\Output\REB_DUTY
+
+  # OPEX 目标所需节点（热负荷 + 温度 + 几何参数）
+  # 塔径：CA_DIAM6 是 Column Internals 计算后的实际塔径（Output 子树），CA_SUMP_DIAM 在此 bkp 不存在
+  - \Data\Blocks\T1\Output\COND_DUTY
+  - \Data\Blocks\T1\Output\TOP_TEMP
+  - \Data\Blocks\T1\Output\BOTTOM_TEMP
+  - \Data\Blocks\T1\Input\NSTAGE
+  - \Data\Blocks\T1\Input\PRES1
+  - \Data\Blocks\T1\Output\CA_DIAM6
+
+  - \Data\Blocks\T2\Output\COND_DUTY
+  - \Data\Blocks\T2\Output\TOP_TEMP
+  - \Data\Blocks\T2\Output\BOTTOM_TEMP
+  - \Data\Blocks\T2\Input\NSTAGE
+  - \Data\Blocks\T2\Input\PRES1
+  - \Data\Blocks\T2\Output\CA_DIAM6
+
+  - \Data\Blocks\T3\Output\COND_DUTY
+  - \Data\Blocks\T3\Output\TOP_TEMP
+  - \Data\Blocks\T3\Output\BOTTOM_TEMP
+  - \Data\Blocks\T3\Input\NSTAGE
+  - \Data\Blocks\T3\Input\PRES1
+  - \Data\Blocks\T3\Output\CA_DIAM6
+
+  # 换热器 H 和 W3 流股（OPEX 中的换热器成本）
+  - \Data\Blocks\H\Output\QCALC
+  - \Data\Streams\W3\Output\TEMP_OUT\MIXED
+
+# ---------------------------------------------------------------------------
+# 目标函数（完全对齐 MATLAB）
+# ---------------------------------------------------------------------------
+objectives:
+  - name: CAPEX
+    type: custom_module
+    module: cases/demo_case_2/epsd_objectives.py
+    function: make_epsd_capex_objective
+    minimize: true
+    unit: "tonne/yr"
+
+  - name: OPEX
+    type: custom_module
+    module: cases/demo_case_2/epsd_objectives.py
+    function: make_epsd_opex_objective
+    minimize: true
+    unit: "RMB/yr"
+
+# ---------------------------------------------------------------------------
+# 约束（完全对齐 MATLAB：纯度 >= 0.999 mol frac）
+# ---------------------------------------------------------------------------
+constraints:
+  - name: D1_PF_purity
+    description: D1 塔顶产品 PF 摩尔分率 >= 0.999（Aspen 组分名 PF，MATLAB 称 PROH）
+    aspen_path: \Data\Streams\D1\Output\MOLEFRAC\MIXED\PF
+    operator: ">="
+    threshold: 0.999
+
+  - name: D2_NPA_purity
+    description: D2 塔顶产品 NPA 摩尔分率 >= 0.999（Aspen 组分名 NPA，MATLAB 称 BUAC）
+    aspen_path: \Data\Streams\D2\Output\MOLEFRAC\MIXED\NPA
+    operator: ">="
+    threshold: 0.999
+
+  - name: D3_WATER_purity
+    description: D3 塔顶产品 WATER 摩尔分率 >= 0.999
+    aspen_path: \Data\Streams\D3\Output\MOLEFRAC\MIXED\WATER
+    operator: ">="
+    threshold: 0.999
+
+# ---------------------------------------------------------------------------
+# block/stream 提取配置
+# ---------------------------------------------------------------------------
+extraction:
+  check_status_paths:
+    - \Data\Blocks\T1
+    - \Data\Blocks\T2
+    - \Data\Blocks\T3
+    - \Data\Streams\D1
+    - \Data\Streams\D2
+    - \Data\Streams\D3
+  blocks:
+    - T1
+    - T2
+    - T3
+  streams:
+    - D1
+    - D2
+    - D3
+  block_max_depth: 2
+  stream_max_depth: 3
+  stream_output_subtree: "Output\\STR_MAIN"
+  strict_extraction: false
+
+  mode: manifest
+  catalog_db: cases/demo_case_2/output/node.db
+  manifest_id: auto
+  semantic_rules_dir: configs/aspen_semantics
+  build_manifest_if_missing: true
+  write_node_values: true
+  strict_manifest: false      # 首次运行可能无 manifest，允许 fallback 到 full 模式
+
+# ---------------------------------------------------------------------------
+# 优化器（Pareto 贝叶斯优化，16 维）
+# ---------------------------------------------------------------------------
+# 16 维搜索空间（7 整数 + 9 连续/derived）
+# n_initial 建议 >= 3 × 维度数 = 48，取 60
+# n_iterations 设为 200，关闭 early_stopping 以便完整对比运行时间
+optimizer:
+  type: pareto_bayesian
+  n_initial_points: 60              # 16 维 × ~3.75
+  n_iterations: 200                 # 总仿真次数（含 DOE）
+  surrogate_model: qEHVI            # BoTorch qLogEHVI，样本效率优于 ParEGO
+  scalarization: chebyshev          # qEHVI 路径不使用，skopt fallback 时生效
+  acquisition_function: EI
+  random_seed: 42
+  n_initial_min: 5
+  hv_margin: 0.1
+
+  # Trust Region 配置（FuRBO 简化版）
+  # 以 Phase 0 找到的第一个可行点为中心，在局部范围内搜索
+  # 可行率低时自动收缩，HV 改进时自动扩张
+  trust_region:
+    enabled: true
+    initial_radius: 0.4             # 初始在 ±40% 范围内采样（比 ±20% 稍宽，给 qEHVI 更多空间）
+    min_radius: 0.05                # 最小不低于 ±5%，防止搜索退化为单点
+    max_radius: 1.0                 # 最大 = 全局搜索
+    gamma_expand: 1.5               # HV 改进 > 5% 时扩张 50%
+    gamma_shrink: 0.7               # 无改进时收缩 30%
+    eta_success: 0.05               # HV 相对改进 5% 以上视为成功
+    failure_tolerance: 5            # 连续 5 次无 HV 改进后重置到初始半径
+
+  # ML-assisted feasibility filtering
+  feasibility_filter:
+    enabled: true
+    model: extra_trees
+    min_samples: 50                 # 高维需要更多样本才能训练可靠分类器
+    threshold: 0.30                 # 保守阈值，宽松范围下不可行率更高
+    candidate_pool_size: 500        # 16 维空间需要更大候选池
+    random_seed: 42
+
+  # 早停配置（对齐 pareto_config.yaml，16 维调整参数）
+  early_stopping:
+    enabled: true
+    min_iterations: 80              # 至少完成 60（DOE）+ 20 轮 BO 后才允许触发
+    patience: 15                    # 宽松范围下改善更慢，patience 比 14 维版本更大
+    min_delta: 1.0e-6
+    relative_delta: 1.0e-4
+    max_duplicate_suggestions: 3
+    check_hypervolume: true
+    check_first_front: true
+
+# ---------------------------------------------------------------------------
+# 离线可行性评估配置（与 pareto_config.yaml 对齐，阈值匹配 feasibility_filter）
+# ---------------------------------------------------------------------------
+feasibility_evaluation:
+  test_size: 0.25
+  random_seed: 42
+  threshold: 0.30                   # 与 optimizer.feasibility_filter.threshold 保持一致
+  min_samples: 50                   # 与 optimizer.feasibility_filter.min_samples 保持一致
+  model: extra_trees                # 与 optimizer.feasibility_filter.model 保持一致
+
+# ---------------------------------------------------------------------------
+# 可行性过滤器质量门控（与 pareto_config.yaml 对齐）
+# ---------------------------------------------------------------------------
+feasibility_gate:
+  enabled: true
+  min_samples: 50
+  min_recall: 0.90                  # 高维宽松搜索空间更强调不错杀可行点
+  max_false_negative_rate: 0.08
+  max_false_negative_count: 2
+  min_precision: null
+  min_f1: null
+  require_no_warnings: false
+  allow_single_class: false
+
+# ---------------------------------------------------------------------------
+# 变量依赖约束（S1/S2 进料板必须小于对应塔的 NSTAGE）
+# ---------------------------------------------------------------------------
+var_dependencies:
+  \Data\Blocks\T1\Input\FEED_STAGE\S1:
+    lt: \Data\Blocks\T1\Input\NSTAGE
+  \Data\Blocks\T2\Input\FEED_STAGE\S2:
+    lt: \Data\Blocks\T2\Input\NSTAGE
+
+# ---------------------------------------------------------------------------
+# Phase 0 可行性搜索
+# ---------------------------------------------------------------------------
+# 16 维混合整数空间 + 宽松边界（P 到 10 atm，NSTAGE 到 200），随机点不可行率极高
+feasibility_search:
+  enabled: true
+  n_trials: 60                      # 宽松边界下需要更多随机试验
+  stop_after_feasible: 5            # 找到 5 个可行点即停
+
+# ---------------------------------------------------------------------------
+# Phase 0.5 敏感度探针
+# ---------------------------------------------------------------------------
+# 在 Phase 0 找到初始可行点之后、Phase 1 DOE 之前，
+# 对每个变量单独做 k 次扰动仿真，量化各变量的"收敛敏感度"。
+#
+# 敏感度 ≈ 1：该变量稍微偏离就不收敛（如 T3_PRES、T3_NSTAGE）
+# 敏感度 ≈ 0：该变量大范围变动都能收敛（如 T1_NSTAGE、SOL1_FLOW）
+#
+# 探针结果驱动：
+#   1. Phase 1 DOE 对高敏感变量使用窄 bounds，低敏感变量全局范围
+#   2. Phase 2 BO HV 停滞时逐步解冻敏感变量，失败率升高则收回
+#
+# 额外仿真成本：n_vars × n_perturbations = 16 × 3 = 48 次（< 1 次 DOE 成本占比）
+sensitivity_probe:
+  enabled: true
+  n_perturbations: 3              # 每个变量扰动 3 次（平衡成本与精度）
+  perturbation_radius: 0.20       # 扰动幅度 ±20%，相对于 center 值本身（非全局范围）
+                                  # 例：T3_PRES=0.06 → delta=±0.012 atm，物理上有意义
+  min_doe_radius: 0.10            # 高敏感变量 DOE 搜索半径下限（≥10% 保留探索空间）
+  correlation_threshold: 0.70     # 联合失败率 >= 70% 判定为强相关对
+  thaw_hv_stall_patience: 10      # HV 连续 10 轮无改进后触发解冻
+  thaw_step_radius: 0.10          # 每次解冻时范围扩大 10%
+  refreeze_fail_window: 5         # 用最近 5 次仿真计算失败率
+  refreeze_fail_threshold: 0.60   # 失败率 > 60% 则重冻
+  tags: ["sensitivity_probe"]
+
+# ---------------------------------------------------------------------------
+# 飞行前检查（阶段2）：提交 Aspen 前拦截荒谬工况,零成本,与工艺无关
+# ---------------------------------------------------------------------------
+# reference_values 自动从各设计变量 initial_value 提取（已收敛解,无需手填）。
+# 三条规则：偏离初值倍数 + 变量依赖（见 var_dependencies）+ 计算量代理乘积。
+preflight:
+  enabled: true
+  # 候选值相对初值的归一化偏离超过此倍数即拦截。5 表示允许 ±5 量级波动,
+  # 既挡掉真空塔压力被采到 10 atm 这类荒谬点,又保留足够探索空间。
+  max_deviation_factor: 5.0
+  check_var_dependencies: true
+  # 计算量代理：塔板数 × 回流比 的乘积正比于 RADFRAC 单点耗时。
+  # 乘积相对初始工况放大超过 max_ratio 即判为"大概率超时",提前拦截。
+  cost_proxy_groups:
+    - name: T1_cost
+      var_paths:
+        - \Data\Blocks\T1\Input\NSTAGE
+        - \Data\Blocks\T1\Input\BASIS_RR
+      max_ratio: 4.0
+    - name: T2_cost
+      var_paths:
+        - \Data\Blocks\T2\Input\NSTAGE
+        - \Data\Blocks\T2\Input\BASIS_RR
+      max_ratio: 4.0
+    - name: T3_cost
+      var_paths:
+        - \Data\Blocks\T3\Input\NSTAGE
+        - \Data\Blocks\T3\Input\BASIS_RR
+      max_ratio: 4.0
+
+# ---------------------------------------------------------------------------
+# 数据驱动边界收缩（阶段4）：跑起来后用实际可行样本周期性收紧边界（只收不放）
+# ---------------------------------------------------------------------------
+boundary_refine:
+  enabled: true
+  interval: 20          # 每 20 轮 BO 重估一次
+  min_feasible: 15      # 至少 15 个可行样本才触发收缩
+  margin_frac: 0.25     # 在可行点实际范围两侧各留 25% 裕量,不贴死
+  max_shrink_frac: 0.1  # 单次最多把宽度收到原来的 10%,防过度收缩
+  only_shrink: true     # 只收不放,放宽交给 sensitivity_probe 的解冻机制

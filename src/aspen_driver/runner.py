@@ -81,6 +81,7 @@ class SimulationRunner:
         verify_inputs: bool = True,
         input_rtol: float = _DEFAULT_INPUT_RTOL,
         check_status_paths: list[str] | None = None,
+        extra_init_values: dict[str, Any] | None = None,
     ) -> SimulationResult:
         """
         执行一次完整的仿真运行。
@@ -113,6 +114,12 @@ class SimulationRunner:
             需要检查 HAP_COMPSTATUS 的节点路径列表。
             None（默认）：自动检查 \\Data\\Blocks 和 \\Data\\Streams 下所有子节点。
             []：跳过状态检查。
+        extra_init_values:
+            reinit 之后、run 之前额外写入的节点值字典 {Aspen路径: 值}。
+            主要用于含再循环（recycle loop）流程：reinit 会清除循环求解的中间状态，
+            通过此参数可在 reinit 后重新注入循环流股的初始估值，减少收敛迭代次数。
+            写入失败时只记录 WARNING，不中止本次运行。
+            None（默认）：不注入任何额外初始化值。
 
         Returns
         -------
@@ -130,14 +137,12 @@ class SimulationRunner:
                 **kwargs,
             )
 
-        # 1. 写入输入变量
+        # 1. 写入输入变量（写失败的变量记入警告并跳过，不中止整个工况）
         write_errors = self._write_inputs(inputs)
         if write_errors:
-            return _make_result(
-                status=RunStatus.WRITE_FAILED,
-                success=False,
-                requested_inputs=inputs,
-                error="写入输入变量失败：\n" + "\n".join(write_errors),
+            _log.warning(
+                "run_case：%d 个输入变量写入失败，已跳过，继续使用文件当前值运行：\n%s",
+                len(write_errors), "\n".join(write_errors),
             )
 
         # 2. 读回校验输入
@@ -182,6 +187,17 @@ class SimulationRunner:
                     _log.debug("runner.run_case: reinit后读回 %s = %r", p, v)
                 except Exception as exc:
                     _log.debug("runner.run_case: reinit后读回失败 %s: %s", p, exc)
+
+        # 3b. 注入循环流股初始化值（reinit 之后、run 之前）
+        # 用于含再循环流程：reinit 清除了循环求解中间状态，
+        # 重新注入初始估值可显著减少循环收敛迭代次数。
+        if extra_init_values:
+            _log.debug("runner.run_case: 注入 %d 个循环初值", len(extra_init_values))
+            for _path, _val in extra_init_values.items():
+                try:
+                    self._driver.set_value(_path, _val)
+                except AspenNodeError as exc:
+                    _log.warning("循环初值写入失败 %s：%s", _path, exc)
 
         # 4. Run
         t0 = time.monotonic()

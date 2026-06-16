@@ -62,6 +62,82 @@ ObjectiveFn  = Callable[[ProcessCase], ObjectiveValue]
 ConstraintFn = Callable[[ProcessCase], ConstraintValue]
 
 
+# ---------------------------------------------------------------------------
+# 循环流程热启动配置
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RecycleWarmstartConfig:
+    """
+    含再循环（Recycle Loop）流程的热启动配置。
+
+    reinit() 会清除 Aspen 内部的循环求解中间状态（撕裂流初值），
+    导致每个新工况都从零迭代求解循环，收敛慢、超时率高。
+    本配置允许在 reinit 之后、run 之前重新注入循环流股的初始估值。
+
+    两种模式
+    --------
+    mode="fixed":
+        每次 reinit 后写入 init_values 里声明的固定初值。
+        适合参数空间较窄、循环流率变化不大的工况。
+    mode="inherit":
+        每次仿真成功后，从 Aspen 读取 read_paths 里声明的节点值，
+        存为下次运行的初值。首次运行（尚无历史值）时回退到 init_values（若有）。
+        适合宽范围 Bayesian 优化，初值随工况自适应更新。
+
+    Attributes
+    ----------
+    mode:
+        "fixed" 或 "inherit"，默认 "fixed"。
+    init_values:
+        {Aspen 节点路径: 初值}。fixed 模式：每次都写入。
+        inherit 模式：首次运行（无历史值）的回退初值。
+    read_paths:
+        inherit 模式专用。仿真成功后从这些路径读取收敛值，
+        存为 _last_values 供下次使用。若为空则 inherit 退化为 fixed。
+    _last_values:
+        内部运行状态，不应由用户直接设置。记录上一次成功工况读取的节点值。
+    """
+    mode: str = "fixed"
+    init_values: dict[str, float] = field(default_factory=dict)
+    read_paths: list[str] = field(default_factory=list)
+    # 运行时状态（internal），不写入 YAML
+    _last_values: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    def get_init_values(self) -> dict[str, Any]:
+        """
+        返回本次运行应注入的初值字典。
+
+        inherit 模式：优先使用 _last_values（上次成功工况的收敛值），
+        无历史值时回退到 init_values。
+        fixed 模式：始终返回 init_values。
+        """
+        if self.mode == "inherit" and self._last_values:
+            return dict(self._last_values)
+        return dict(self.init_values)
+
+    def update_from_driver(self, driver: Any) -> None:
+        """
+        inherit 模式：从 Aspen 读取 read_paths 的当前值，更新 _last_values。
+        读取失败的路径只记 WARNING，不阻断。
+        应在仿真成功后调用。
+        """
+        if self.mode != "inherit" or not self.read_paths:
+            return
+        new_vals: dict[str, Any] = {}
+        for path in self.read_paths:
+            try:
+                new_vals[path] = driver.get_value(path)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("recycle_warmstart inherit：读取 %s 失败：%s", path, exc)
+        if new_vals:
+            self._last_values = new_vals
+            _log.debug(
+                "recycle_warmstart inherit：已更新 %d 个循环初值：%s",
+                len(new_vals), list(new_vals.keys()),
+            )
+
+
 class _ExtractionResult(NamedTuple):
     """block/stream 提取的结果，含失败诊断信息。"""
     data: dict          # dict[str, BlockResult] 或 dict[str, StreamResult]
@@ -154,6 +230,12 @@ class RunCaseConfig:
     write_node_values: bool = True
     # manifest invalid 时是否阻止优化（True=阻止，False=降级为 full 模式）
     strict_manifest: bool = True
+    # ------------------------------------------------------------------ #
+    # 循环流程热启动（可选，默认 None = 不启用）
+    # ------------------------------------------------------------------ #
+    # 含再循环流程时，可配置 RecycleWarmstartConfig 减少循环收敛迭代次数。
+    # 详见 RecycleWarmstartConfig 文档。
+    recycle_warmstart: "RecycleWarmstartConfig | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +290,17 @@ def run_case(
     log_run_config_summary(_log, config)
 
     # 1. 运行仿真
+    # 计算循环热启动的额外初始化值（reinit 后注入）
+    _extra_init: dict[str, Any] | None = None
+    if config.recycle_warmstart is not None:
+        _ws_vals = config.recycle_warmstart.get_init_values()
+        if _ws_vals:
+            _extra_init = _ws_vals
+            _log.debug(
+                "run_case: recycle_warmstart 已准备 %d 个循环初值（mode=%s）",
+                len(_extra_init), config.recycle_warmstart.mode,
+            )
+
     sim_result = runner.run_case(
         inputs=design_vars,
         output_paths=config.output_paths,
@@ -216,7 +309,12 @@ def run_case(
         verify_inputs=config.verify_inputs,
         input_rtol=config.input_rtol,
         check_status_paths=config.check_status_paths,
+        extra_init_values=_extra_init,
     )
+
+    # inherit 模式：仿真成功后读取收敛值，供下次运行使用
+    if sim_result.success and config.recycle_warmstart is not None:
+        config.recycle_warmstart.update_from_driver(driver)
 
     if not sim_result.success and sim_result.error:
         _log.warning("仿真失败 [iter=%d, status=%s]：%s", iteration, sim_result.status.value, sim_result.error)

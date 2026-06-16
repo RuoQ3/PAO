@@ -218,8 +218,24 @@ def build_chat_model(cfg: LLMConfig):
     raise RuntimeError(f"不支持的 provider：{cfg.provider!r}")
 
 
+def _is_reasoning_model(cfg: LLMConfig) -> bool:
+    """判断当前模型是否为推理模型（不支持 system 消息）。
+
+    deepseek 推理系列（deepseek-v4-pro、deepseek-reasoner 等）不接受
+    SystemMessage，传入时会返回空内容。需要把 system 内容合并进 user 消息。
+    """
+    if cfg.provider != "deepseek":
+        return False
+    m = cfg.model.lower()
+    # deepseek-v4-pro、deepseek-reasoner、deepseek-r1 等推理模型
+    return "reasoner" in m or "v4" in m or "-r1" in m or "r1-" in m
+
+
 def chat(cfg: LLMConfig, system: str, user: str) -> str:
     """单轮对话：发送 system + user 消息，返回纯文本回复。
+
+    对 deepseek 推理模型（v4-pro/reasoner/r1 等），自动把 system 内容
+    合并进 user 消息，因为这类模型不支持 SystemMessage（传入会返回空）。
 
     Raises:
         RuntimeError: 未配置 / 构造失败 / 调用失败（由上层降级处理）。
@@ -227,8 +243,16 @@ def chat(cfg: LLMConfig, system: str, user: str) -> str:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     model = build_chat_model(cfg)
+
+    # 推理模型不支持 system 消息：合并进 user
+    if _is_reasoning_model(cfg) and system:
+        merged_user = f"[系统指令]\n{system}\n\n[用户消息]\n{user}"
+        messages = [HumanMessage(content=merged_user)]
+    else:
+        messages = [SystemMessage(content=system), HumanMessage(content=user)]
+
     try:
-        resp = model.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+        resp = model.invoke(messages)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             f"大模型调用失败 [{type(exc).__name__}] — {exc}"

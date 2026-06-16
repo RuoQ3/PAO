@@ -805,11 +805,13 @@ def generate_summary_report(
     db_path: str,
     config_path: str | None = None,
     session_id: str | None = None,
+    intent: Any | None = None,
+    baseline: dict[str, float] | None = None,
 ) -> str:
     """
     生成完整的优化结果综合分析报告。
 
-    串联 C1-1 ~ C1-4 及优化总览，输出完整 Markdown 报告（5 个章节）。
+    串联目标达成总览（第 0 章）和 C1-1 ~ C1-4 及优化总览，输出完整 Markdown 报告（6 个章节）。
 
     Parameters
     ----------
@@ -819,6 +821,12 @@ def generate_summary_report(
         优化配置 YAML 路径（可选，用于在报告头部显示配置文件名）。
     session_id:
         会话过滤；None 时使用全部数据。
+    intent:
+        OptimizationIntent 对象（可选）；提供时生成第 0 章目标达成总览；
+        缺失时该章节降级为"未提供优化意图"说明，不报错。
+    baseline:
+        外部传入的基线值 {目标名: 值}，来自优化前初始单跑结果（可选）。
+        缺失时报告标注"无真实基线，改善幅度不可计算"，不报错。
 
     Returns
     -------
@@ -833,6 +841,25 @@ def generate_summary_report(
     session_note = f"  会话：`{session_id}`" if session_id else ""
     lines.append(f"# PAO 优化结果综合分析报告")
     lines.append(f"> {cfg_note}{db_note}{session_note}")
+    lines.append("")
+
+    # ------------------------------------------------------------------ #
+    # 第 0 章：目标达成总览（H2）
+    # ------------------------------------------------------------------ #
+    lines.append("## 0. 目标达成总览")
+    lines.append("")
+    try:
+        from src.reporting.goal_attainment import generate_goal_attainment_section
+        lines.append(generate_goal_attainment_section(
+            intent=intent,
+            db_path=db_path,
+            config_path=config_path,
+            session_id=session_id,
+            baseline=baseline,
+        ))
+    except Exception as exc:
+        _log.warning("目标达成总览生成失败：%s", exc)
+        lines.append(f"> ⚠ 目标达成总览生成失败：{exc}")
     lines.append("")
 
     # ------------------------------------------------------------------ #

@@ -165,6 +165,55 @@ def _build_run_config(cfg: dict) -> Any:
         build_manifest_if_missing = bool(ext.get("build_manifest_if_missing", True)),
         write_node_values  = bool(ext.get("write_node_values", True)),
         strict_manifest    = bool(ext.get("strict_manifest", True)),
+        recycle_warmstart  = _parse_recycle_warmstart(sim),
+    )
+
+
+def _parse_recycle_warmstart(sim: dict) -> Any:
+    """
+    解析 simulator.recycle_warmstart 节，构建 RecycleWarmstartConfig。
+
+    YAML 示例：
+        simulator:
+          recycle_warmstart:
+            enabled: true
+            mode: inherit          # fixed | inherit
+            init_values:           # 固定初值 / inherit 模式的首次回退值
+              \\Data\\Streams\\RECYCLE1\\Input\\TOTFLOW\\MIXED: 200.0
+              \\Data\\Streams\\RECYCLE1\\Input\\TEMP\\MIXED: 350.0
+            read_paths:            # inherit 模式：成功后从这些路径读取收敛值
+              - \\Data\\Streams\\RECYCLE1\\Output\\TOTFLOW\\MIXED
+              - \\Data\\Streams\\RECYCLE1\\Output\\TEMP\\MIXED
+
+    未配置或 enabled=false 时返回 None，不影响现有工况行为。
+    """
+    rw_raw = sim.get("recycle_warmstart") or {}
+    if not rw_raw.get("enabled", False):
+        return None
+
+    from ..workflows.run_case import RecycleWarmstartConfig
+
+    mode = str(rw_raw.get("mode", "fixed"))
+    if mode not in ("fixed", "inherit"):
+        _log.warning(
+            "recycle_warmstart.mode='%s' 不合法（仅支持 fixed/inherit），已回退为 fixed。",
+            mode,
+        )
+        mode = "fixed"
+
+    raw_init = rw_raw.get("init_values") or {}
+    init_values = {str(k): float(v) for k, v in raw_init.items()}
+
+    read_paths = [str(p) for p in (rw_raw.get("read_paths") or [])]
+
+    _log.info(
+        "recycle_warmstart 已启用：mode=%s，init_values=%d 个，read_paths=%d 个。",
+        mode, len(init_values), len(read_paths),
+    )
+    return RecycleWarmstartConfig(
+        mode=mode,
+        init_values=init_values,
+        read_paths=read_paths,
     )
 
 
@@ -274,6 +323,60 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     n_bo         = int(opt.get("n_iterations", 30))
     n_iterations = n_initial + n_bo
 
+    # 单目标也支持 feasibility_search（复用多目标解析逻辑）
+    fs_raw = cfg.get("feasibility_search") or {}
+    feasibility_search_single = None
+    if fs_raw.get("enabled", False):
+        from ..workflows.optimize_pareto_case import FeasibilitySearchConfig
+        initial_point_raw: dict = {}
+        for dv in cfg.get("design_variables", []):
+            dv_type = dv.get("type", "continuous")
+            if dv_type in ("continuous", "integer"):
+                path = dv.get("aspen_path")
+                iv   = dv.get("initial_value")
+                if path and iv is not None:
+                    try:
+                        initial_point_raw[path] = float(iv)
+                    except (TypeError, ValueError):
+                        pass
+            elif dv_type == "derived":
+                frac_path = dv.get("name")
+                lo_frac   = dv.get("lo_frac")
+                hi_frac   = dv.get("hi_frac")
+                iv        = dv.get("initial_value")
+                if frac_path:
+                    try:
+                        if iv is not None:
+                            initial_point_raw[str(frac_path)] = float(iv)
+                        elif lo_frac is not None and hi_frac is not None:
+                            mid = (float(lo_frac) + float(hi_frac)) / 2.0
+                            initial_point_raw[str(frac_path)] = mid
+                            _log.debug(
+                                "Phase 0：derived 变量 '%s' 未设置 initial_value，"
+                                "使用中点 %.3f（建议在 YAML 中填写反算值）。",
+                                frac_path, mid,
+                            )
+                    except (TypeError, ValueError):
+                        pass
+        radii_raw = fs_raw.get("local_search_radii")
+        local_radii = (
+            [float(r) for r in radii_raw] if isinstance(radii_raw, list)
+            else [0.2, 0.5]
+        )
+        feasibility_search_single = FeasibilitySearchConfig(
+            enabled=True,
+            n_trials=int(fs_raw.get("n_trials", 20)),
+            stop_after_feasible=int(fs_raw.get("stop_after_feasible", 3)),
+            abort_if_none_found=bool(fs_raw.get("abort_if_none_found", False)),  # 单目标默认不终止
+            initial_point=initial_point_raw or None,
+            local_search_radii=local_radii,
+        )
+        _log.info(
+            "单目标 Phase 0 可行性搜索已启用：n_trials=%d，local_search_radii=%s。",
+            feasibility_search_single.n_trials,
+            feasibility_search_single.local_search_radii,
+        )
+
     return OptimizeCaseConfig(
         param_bounds    = param_bounds,
         fixed_vars      = fixed_vars,
@@ -289,6 +392,7 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         derived_var_specs  = derived_var_specs,
         feasibility_filter = _parse_feasibility_filter(opt.get("feasibility_filter")),
         early_stopping     = _parse_early_stopping(opt.get("early_stopping")),
+        feasibility_search = feasibility_search_single,
     )
 
 
@@ -382,15 +486,130 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     feasibility_search = None
     if fs_raw.get("enabled", False):
         from ..workflows.optimize_pareto_case import FeasibilitySearchConfig
+
+        # 从设计变量的 initial_value 提取初始点（来自已收敛的 .bkp 文件）
+        # continuous / integer 变量使用 aspen_path 为键，取 initial_value
+        # derived 变量使用 name 为键（frac 路径），取 (lo_frac + hi_frac) / 2 作为初始 frac
+        initial_point: dict | None = None
+        initial_point_raw: dict = {}
+        for dv in cfg.get("design_variables", []):
+            dv_type = dv.get("type", "continuous")
+            if dv_type in ("continuous", "integer"):
+                path = dv.get("aspen_path")
+                iv   = dv.get("initial_value")
+                if path and iv is not None:
+                    try:
+                        initial_point_raw[path] = float(iv)
+                    except (TypeError, ValueError):
+                        pass
+            elif dv_type == "derived":
+                # derived 变量搜索的是 frac 值
+                # 优先使用 initial_value（需在 YAML 中显式填写，如 FEED_STAGE/NSTAGE 的反算值）
+                # 找不到 initial_value 时才退化为 (lo_frac + hi_frac) / 2 中点（不推荐，进料板可能偏差很大）
+                frac_path = dv.get("name")
+                lo_frac   = dv.get("lo_frac")
+                hi_frac   = dv.get("hi_frac")
+                iv        = dv.get("initial_value")
+                if frac_path:
+                    try:
+                        if iv is not None:
+                            initial_point_raw[str(frac_path)] = float(iv)
+                        elif lo_frac is not None and hi_frac is not None:
+                            mid = (float(lo_frac) + float(hi_frac)) / 2.0
+                            initial_point_raw[str(frac_path)] = mid
+                            _log.debug(
+                                "Phase 0：derived 变量 '%s' 未设置 initial_value，"
+                                "使用中点 %.3f 作为初始 frac（建议在 YAML 中反算填写）。",
+                                frac_path, mid,
+                            )
+                    except (TypeError, ValueError):
+                        pass
+        if initial_point_raw:
+            initial_point = initial_point_raw
+            _log.info(
+                "Phase 0：已从 initial_value 提取 %d 个变量的初始收敛解，"
+                "将作为第一个候选点注入。",
+                len(initial_point_raw),
+            )
+
+        # 解析自适应局部扩张半径
+        radii_raw = fs_raw.get("local_search_radii")
+        if radii_raw is None:
+            local_search_radii = [0.2, 0.5]   # 默认：先 ±20%，再 ±50%
+        elif isinstance(radii_raw, list):
+            local_search_radii = [float(r) for r in radii_raw]
+        else:
+            local_search_radii = [0.2, 0.5]
+
         feasibility_search = FeasibilitySearchConfig(
             enabled=True,
             n_trials=int(fs_raw.get("n_trials", 20)),
             stop_after_feasible=int(fs_raw.get("stop_after_feasible", 3)),
+            abort_if_none_found=bool(fs_raw.get("abort_if_none_found", True)),
+            initial_point=initial_point,
+            local_search_radii=local_search_radii,
         )
         _log.info(
-            "Phase 0 可行性搜索已启用：n_trials=%d，stop_after_feasible=%d。",
-            feasibility_search.n_trials, feasibility_search.stop_after_feasible,
+            "Phase 0 可行性搜索已启用：n_trials=%d，stop_after_feasible=%d，"
+            "abort_if_none_found=%s，local_search_radii=%s。",
+            feasibility_search.n_trials,
+            feasibility_search.stop_after_feasible,
+            feasibility_search.abort_if_none_found,
+            feasibility_search.local_search_radii,
         )
+
+    # 解析 trust_region 配置
+    tr_raw = cfg.get("trust_region") or {}
+    trust_region_cfg = None
+    if tr_raw.get("enabled", False):
+        from ..optimization.trust_region import TrustRegionConfig
+        trust_region_cfg = TrustRegionConfig(
+            initial_radius=float(tr_raw.get("initial_radius", 0.5)),
+            min_radius=float(tr_raw.get("min_radius", 0.05)),
+            max_radius=float(tr_raw.get("max_radius", 1.0)),
+            gamma_expand=float(tr_raw.get("gamma_expand", 1.5)),
+            gamma_shrink=float(tr_raw.get("gamma_shrink", 0.7)),
+            eta_success=float(tr_raw.get("eta_success", 0.05)),
+            failure_tolerance=int(tr_raw.get("failure_tolerance", 5)),
+        )
+        _log.info(
+            "Trust Region 已启用：initial_radius=%.2f, failure_tolerance=%d",
+            trust_region_cfg.initial_radius, trust_region_cfg.failure_tolerance,
+        )
+
+    # 解析 reference_values（飞行前检查的参考工况，来自设计变量 initial_value）
+    # continuous/integer 用 aspen_path 为键；derived 用 name(frac) 为键。
+    # 这是任何能跑的 .bkp 都自带的"已知可行解"锚点。
+    reference_values: dict[str, float] = {}
+    for dv in cfg.get("design_variables", []):
+        dv_type = dv.get("type", "continuous")
+        iv = dv.get("initial_value")
+        if iv is None:
+            continue
+        if dv_type in ("continuous", "integer"):
+            path = dv.get("aspen_path")
+            if path:
+                try:
+                    reference_values[str(path)] = float(iv)
+                except (TypeError, ValueError):
+                    pass
+        elif dv_type == "derived":
+            frac_path = dv.get("name")
+            if frac_path:
+                try:
+                    reference_values[str(frac_path)] = float(iv)
+                except (TypeError, ValueError):
+                    pass
+
+    preflight_cfg = _parse_preflight(cfg.get("preflight"))
+    boundary_refine_cfg = _parse_boundary_refine(cfg.get("boundary_refine"))
+    _br_interval = 20
+    _br_raw = cfg.get("boundary_refine") or {}
+    if isinstance(_br_raw, dict) and _br_raw.get("interval") is not None:
+        try:
+            _br_interval = max(1, int(_br_raw["interval"]))
+        except (TypeError, ValueError):
+            _br_interval = 20
 
     return ParetoOptimizeCaseConfig(
         param_bounds    = param_bounds,
@@ -415,6 +634,14 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         feasibility_search = feasibility_search,
         feasibility_filter = _parse_feasibility_filter(opt.get("feasibility_filter")),
         early_stopping     = _parse_early_stopping(opt.get("early_stopping")),
+        trust_region       = trust_region_cfg,
+        sensitivity_probe  = _parse_sensitivity_probe(cfg.get("sensitivity_probe")),
+        preflight          = preflight_cfg,
+        reference_values   = reference_values,
+        boundary_refine    = boundary_refine_cfg,
+        boundary_refine_interval = _br_interval,
+        # 从 YAML optimizer.session_id 恢复 API 会话 ID
+        **( {"session_id": str(opt["session_id"])} if opt.get("session_id") else {} ),
     )
 
 
@@ -458,6 +685,8 @@ def _make_objective_fn(obj_cfg: dict) -> Any:
         return _make_tac_fn(obj_cfg)
     if obj_type == "emissions":
         return _make_emissions_fn(obj_cfg)
+    if obj_type == "custom_module":
+        return _make_custom_module_fn(obj_cfg)
 
     # 原有 aspen_path 逻辑
     from ..models.process_case import ObjectiveValue
@@ -684,6 +913,72 @@ def _make_emissions_fn(obj_cfg: dict) -> Any:
     return emissions_fn
 
 
+def _make_custom_module_fn(obj_cfg: dict) -> Any:
+    """
+    从 YAML objective 条目（type: custom_module）构建自定义目标函数。
+
+    YAML 参数：
+      module:   Python 文件路径（相对项目根目录或绝对路径），如
+                "cases/demo_case_2/epsd_objectives.py"
+      function: 工厂函数名，无参调用后返回 ObjectiveFn，如 "make_epsd_opex_objective"
+
+    用法示例：
+      - name: OPEX
+        type: custom_module
+        module: cases/demo_case_2/epsd_objectives.py
+        function: make_epsd_opex_objective
+        minimize: true
+        unit: "RMB/yr"
+    """
+    import importlib.util
+
+    module_path = obj_cfg["module"]
+    func_name   = obj_cfg["function"]
+
+    spec = importlib.util.spec_from_file_location("_custom_objective_module", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载自定义目标函数模块：{module_path!r}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+    factory = getattr(mod, func_name, None)
+    if factory is None:
+        raise AttributeError(
+            f"模块 {module_path!r} 中未找到函数 {func_name!r}"
+        )
+
+    objective_fn = factory()
+
+    # 支持在 YAML 中覆盖 name/minimize/unit（工厂函数内部的设置为默认值）
+    yaml_name     = obj_cfg.get("name")
+    yaml_minimize = obj_cfg.get("minimize")
+    yaml_unit     = obj_cfg.get("unit")
+
+    if yaml_name is not None or yaml_minimize is not None or yaml_unit is not None:
+        # 包装一层，将 YAML 元数据覆盖到返回的 ObjectiveValue 上
+        from ..models.process_case import ObjectiveValue
+
+        inner_fn  = objective_fn
+        ov_name   = yaml_name     if yaml_name     is not None else inner_fn.__name__
+        ov_min    = bool(yaml_minimize) if yaml_minimize is not None else True
+        ov_unit   = str(yaml_unit)      if yaml_unit     is not None else ""
+
+        def wrapper_fn(case: Any) -> ObjectiveValue:
+            result = inner_fn(case)
+            return ObjectiveValue(
+                name=ov_name,
+                value=result.value,
+                unit=ov_unit if ov_unit else result.unit,
+                minimize=ov_min,
+                error=result.error,
+            )
+
+        wrapper_fn.__name__ = ov_name
+        return wrapper_fn
+
+    return objective_fn
+
+
 def _make_constraint_fn(con_cfg: dict) -> Any:
     """
     从 YAML constraint 条目生成 ConstraintFn。
@@ -736,7 +1031,7 @@ def _make_constraint_fn(con_cfg: dict) -> Any:
 # 代理模型解析
 # ---------------------------------------------------------------------------
 
-_VALID_SURROGATE_UPPER = {"GP", "RF", "ET", "GBRT", "RANDOM"}
+_VALID_SURROGATE_UPPER = {"GP", "RF", "ET", "GBRT", "RANDOM", "QEHVI", "NEHVI"}
 
 
 def _parse_surrogate_model(opt: dict) -> str:
@@ -752,9 +1047,13 @@ def _parse_surrogate_model(opt: dict) -> str:
     if upper not in _VALID_SURROGATE_UPPER:
         raise ValueError(
             f"surrogate_model {raw!r} 不合法，"
-            f"支持值：GP / RF / ET / GBRT / RANDOM（大小写不敏感）。"
+            f"支持值：GP / RF / ET / GBRT / RANDOM / qEHVI / NEHVI（大小写不敏感）。"
         )
-    return "random" if upper == "RANDOM" else upper
+    if upper == "RANDOM":
+        return "random"
+    if upper == "QEHVI":
+        return "qEHVI"
+    return upper
 
 
 # ---------------------------------------------------------------------------
@@ -975,3 +1274,262 @@ def _parse_early_stopping(raw: dict[str, Any] | None) -> Any:
         check_hypervolume=check_hv,
         check_first_front=check_ff,
     )
+
+
+# ---------------------------------------------------------------------------
+# sensitivity_probe 解析
+# ---------------------------------------------------------------------------
+
+def _parse_sensitivity_probe(raw: dict[str, Any] | None) -> Any:
+    """
+    从顶层 sensitivity_probe 节解析 SensitivityProbeConfig。
+
+    如果节不存在或 enabled=false，返回 None（不启用探针）。
+
+    支持字段
+    --------
+    enabled                : bool，默认 false
+    n_perturbations        : int，每个变量扰动次数，默认 3
+    perturbation_radius    : float (0,1]，扰动幅度占全局范围比例，默认 0.20
+    min_doe_radius         : float (0,1]，高敏感变量 DOE 半径下限，默认 0.10
+    correlation_threshold  : float [0,1]，强相关判断阈值，默认 0.70
+    margin_weight          : float [0,1]，约束 margin 敏感度在综合敏感度中的权重，默认 0.5
+                             0.0 = 纯收敛敏感度（旧行为）；1.0 = 纯约束 margin 敏感度
+    thaw_hv_stall_patience : int，HV 停滞多少轮触发解冻，默认 10
+    thaw_step_radius       : float，每步解冻半径扩大量，默认 0.10
+    refreeze_fail_window   : int，失败率检测窗口，默认 5
+    refreeze_fail_threshold: float，失败率超过此值则重冻，默认 0.60
+    tags                   : list[str]，探针工况标签，默认 ["sensitivity_probe"]
+    """
+    if raw is None or raw == {}:
+        return None
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"sensitivity_probe 必须是 dict，收到 {type(raw).__name__!r}：{raw!r}。"
+        )
+
+    enabled_raw = raw.get("enabled", False)
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    elif isinstance(enabled_raw, int) and enabled_raw in (0, 1):
+        enabled = bool(enabled_raw)
+    elif isinstance(enabled_raw, str):
+        enabled = enabled_raw.strip().lower() == "true"
+    else:
+        enabled = False
+
+    if not enabled:
+        return None
+
+    from ..optimization.sensitivity_probe import SensitivityProbeConfig
+
+    try:
+        n_perturbations = int(raw.get("n_perturbations", 3))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.n_perturbations 无法转为整数：{exc}") from exc
+
+    try:
+        perturbation_radius = float(raw.get("perturbation_radius", 0.20))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.perturbation_radius 无法转为浮点数：{exc}") from exc
+
+    try:
+        min_doe_radius = float(raw.get("min_doe_radius", 0.10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.min_doe_radius 无法转为浮点数：{exc}") from exc
+
+    try:
+        correlation_threshold = float(raw.get("correlation_threshold", 0.70))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.correlation_threshold 无法转为浮点数：{exc}") from exc
+
+    try:
+        margin_weight = float(raw.get("margin_weight", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.margin_weight 无法转为浮点数：{exc}") from exc
+
+    try:
+        thaw_hv_stall_patience = int(raw.get("thaw_hv_stall_patience", 10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.thaw_hv_stall_patience 无法转为整数：{exc}") from exc
+
+    try:
+        thaw_step_radius = float(raw.get("thaw_step_radius", 0.10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.thaw_step_radius 无法转为浮点数：{exc}") from exc
+
+    try:
+        refreeze_fail_window = int(raw.get("refreeze_fail_window", 5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.refreeze_fail_window 无法转为整数：{exc}") from exc
+
+    try:
+        refreeze_fail_threshold = float(raw.get("refreeze_fail_threshold", 0.60))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sensitivity_probe.refreeze_fail_threshold 无法转为浮点数：{exc}") from exc
+
+    tags_raw = raw.get("tags")
+    tags = list(tags_raw) if isinstance(tags_raw, list) else ["sensitivity_probe"]
+
+    cfg = SensitivityProbeConfig(
+        enabled=True,
+        n_perturbations=n_perturbations,
+        perturbation_radius=perturbation_radius,
+        min_doe_radius=min_doe_radius,
+        correlation_threshold=correlation_threshold,
+        margin_weight=margin_weight,
+        thaw_hv_stall_patience=thaw_hv_stall_patience,
+        thaw_step_radius=thaw_step_radius,
+        refreeze_fail_window=refreeze_fail_window,
+        refreeze_fail_threshold=refreeze_fail_threshold,
+        tags=tags,
+    )
+    _log.info(
+        "敏感度探针已启用：n_perturbations=%d，perturbation_radius=%.2f，"
+        "min_doe_radius=%.2f，margin_weight=%.2f，thaw_patience=%d。",
+        cfg.n_perturbations, cfg.perturbation_radius,
+        cfg.min_doe_radius, cfg.margin_weight, cfg.thaw_hv_stall_patience,
+    )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# preflight 解析（飞行前检查）
+# ---------------------------------------------------------------------------
+
+def _parse_preflight(raw: dict[str, Any] | None) -> Any:
+    """
+    从顶层 preflight 节解析 PreflightConfig。
+
+    节不存在或 enabled=false 时返回 None（不启用飞行前检查）。
+
+    支持字段
+    --------
+    enabled                : bool，默认 false
+    max_deviation_factor   : float>0 或省略，候选值相对初始收敛解的最大归一化偏离倍数。
+                             建议 3~5。省略时不做偏离检查（仅做依赖/计算量检查）。
+    check_var_dependencies : bool，默认 true，是否检查 var_dependencies。
+    cost_proxy_groups      : list，每项 {name, var_paths:[...], max_ratio:float}，
+                             用于拦截"计算量代理乘积放大过多"的地狱工况，默认空。
+    """
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"preflight 必须是 dict，收到 {type(raw).__name__!r}：{raw!r}。")
+
+    enabled_raw = raw.get("enabled", False)
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    elif isinstance(enabled_raw, int) and enabled_raw in (0, 1):
+        enabled = bool(enabled_raw)
+    elif isinstance(enabled_raw, str):
+        enabled = enabled_raw.strip().lower() == "true"
+    else:
+        enabled = False
+    if not enabled:
+        return None
+
+    from ..optimization.preflight import PreflightConfig, CostProxyGroup
+
+    max_dev: float | None = None
+    if raw.get("max_deviation_factor") is not None:
+        try:
+            max_dev = float(raw["max_deviation_factor"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"preflight.max_deviation_factor 无法转为浮点数：{exc}") from exc
+
+    check_deps = bool(raw.get("check_var_dependencies", True))
+
+    groups: list = []
+    for g in (raw.get("cost_proxy_groups") or []):
+        if not isinstance(g, dict):
+            continue
+        var_paths = [str(p) for p in (g.get("var_paths") or [])]
+        if not var_paths:
+            continue
+        try:
+            max_ratio = float(g.get("max_ratio", 3.0))
+        except (TypeError, ValueError):
+            max_ratio = 3.0
+        groups.append(CostProxyGroup(
+            name=str(g.get("name", "cost_proxy")),
+            var_paths=var_paths,
+            max_ratio=max_ratio,
+        ))
+
+    cfg = PreflightConfig(
+        enabled=True,
+        max_deviation_factor=max_dev,
+        cost_proxy_groups=groups,
+        check_var_dependencies=check_deps,
+    )
+    _log.info(
+        "飞行前检查已启用：max_deviation_factor=%s，cost_proxy_groups=%d，check_var_dependencies=%s。",
+        max_dev, len(groups), check_deps,
+    )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# boundary_refine 解析（数据驱动边界收缩）
+# ---------------------------------------------------------------------------
+
+def _parse_boundary_refine(raw: dict[str, Any] | None) -> Any:
+    """
+    从顶层 boundary_refine 节解析 BoundaryRefineConfig。
+
+    节不存在或 enabled=false 时返回 None（不启用数据驱动收缩）。
+
+    支持字段
+    --------
+    enabled         : bool，默认 false
+    min_feasible    : int，触发收缩的最少可行样本数，默认 15
+    margin_frac     : float，可行点范围两侧裕量比例，默认 0.25
+    max_shrink_frac : float，单次收缩后宽度相对原宽度的下限，默认 0.1
+    only_shrink     : bool，是否只收不放(与原边界取交集)，默认 true
+    interval        : int，每隔多少轮 BO 重估一次（由调用方读取，不入 config）
+    """
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"boundary_refine 必须是 dict，收到 {type(raw).__name__!r}：{raw!r}。")
+
+    enabled_raw = raw.get("enabled", False)
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    elif isinstance(enabled_raw, int) and enabled_raw in (0, 1):
+        enabled = bool(enabled_raw)
+    elif isinstance(enabled_raw, str):
+        enabled = enabled_raw.strip().lower() == "true"
+    else:
+        enabled = False
+    if not enabled:
+        return None
+
+    from ..optimization.boundary_refine import BoundaryRefineConfig
+
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(raw.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"boundary_refine.{name} 无法转为浮点数：{exc}") from exc
+
+    def _i(name: str, default: int) -> int:
+        try:
+            return int(raw.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"boundary_refine.{name} 无法转为整数：{exc}") from exc
+
+    cfg = BoundaryRefineConfig(
+        enabled=True,
+        min_feasible=_i("min_feasible", 15),
+        margin_frac=_f("margin_frac", 0.25),
+        max_shrink_frac=_f("max_shrink_frac", 0.1),
+        only_shrink=bool(raw.get("only_shrink", True)),
+    )
+    _log.info(
+        "数据驱动边界收缩已启用：min_feasible=%d，margin_frac=%.2f，max_shrink_frac=%.2f。",
+        cfg.min_feasible, cfg.margin_frac, cfg.max_shrink_frac,
+    )
+    return cfg

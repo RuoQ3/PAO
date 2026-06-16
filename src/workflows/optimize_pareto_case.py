@@ -90,16 +90,34 @@ class FeasibilitySearchConfig:
     enabled:
         是否启用 Phase 0，默认 True。
     n_trials:
-        Phase 0 最多运行的工况数，默认 20。
+        Phase 0 最多运行的工况数，默认 20。此计数包含 initial_point（若提供）。
+        局部扩张模式下，每个半径最多使用 n_trials 次，但总次数仍受此限制。
     stop_after_feasible:
         找到此数量的可行点后提前停止，默认 3。
         设为 0 表示不提前停止，跑完全部 n_trials。
+    abort_if_none_found:
+        True（默认）：n_trials 结束后仍未找到任何可行点，直接终止优化并抛出 RuntimeError。
+        False：即使 Phase 0 全部失败，仍继续 Phase 1/2（代理模型降级为随机采样）。
+    initial_point:
+        从 YAML initial_value 提取的初始点 {Aspen路径: 值}。
+        若不为 None，Phase 0 的第一个候选点强制使用此值，而非随机采样。
+        此点来自用户上传的已收敛 .bkp 文件，大概率可行，可显著提升 Phase 0 成功率。
+    local_search_radii:
+        自适应局部扩张半径列表，默认 [0.2, 0.5]。
+        需同时提供 initial_point 才会生效。
+        Phase 0 先在 initial_point ± radius[0] 范围内 LHS 采样；
+        若可行率为 0，自动扩展到 radius[1]，依此类推。
+        所有半径都失败后，用全局 bounds 兜底一轮。
+        设为 [] 跳过局部搜索，退化为原有全局随机采样。
     tags:
         Phase 0 工况的额外标签，默认 ["feasibility_search"]。
     """
     enabled: bool = True
     n_trials: int = 20
     stop_after_feasible: int = 3
+    abort_if_none_found: bool = True
+    initial_point: dict | None = None
+    local_search_radii: list[float] = field(default_factory=lambda: [0.2, 0.5])
     tags: list[str] = field(default_factory=lambda: ["feasibility_search"])
 
 
@@ -179,7 +197,7 @@ class ParetoOptimizeCaseConfig:
     on_case_complete: Callable[[ProcessCase, int, int], None] | None = None
     db_path: Path | str | None = None
     random_seed: int | None = None
-    surrogate_model: Literal["GP", "RF", "ET", "GBRT", "random"] = "GP"
+    surrogate_model: Literal["GP", "RF", "ET", "GBRT", "random", "qEHVI", "NEHVI"] = "GP"
     warm_start_cases: list[ProcessCase] = field(default_factory=list)
     # integer 变量路径集合（BO 提出连续值后 round/clamp）
     integer_var_paths: set[str] = field(default_factory=set)
@@ -195,6 +213,19 @@ class ParetoOptimizeCaseConfig:
     feasibility_filter: FeasibilityConfig = field(default_factory=FeasibilityConfig)
     # 早停配置；enabled=False（默认）时完全不影响原有流程
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
+    # Trust Region 配置；None 表示不启用（使用全局 bounds 采样）
+    trust_region: Any = None
+    # 敏感度探针配置；None 表示不启用
+    sensitivity_probe: Any = None
+    # 飞行前检查配置；None 表示不启用(提交 Aspen 前拦截荒谬工况)
+    preflight: Any = None
+    # 飞行前检查的参考工况值 {Aspen路径: 值},通常是初始收敛解;
+    # None/空 时偏离检查与计算量代理检查自动跳过(不影响依赖检查)
+    reference_values: dict[str, float] = field(default_factory=dict)
+    # 数据驱动边界收缩配置；None 表示不启用(用实际可行样本周期性收紧边界)
+    boundary_refine: Any = None
+    # 每隔多少轮 BO 触发一次 boundary_refine 重估,默认 20
+    boundary_refine_interval: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +412,207 @@ def optimize_pareto_case(
     phase0_offset = len(phase0_cases)
 
     # ------------------------------------------------------------------
-    # Phase 1：初始 DOE（拉丁超立方采样）
+    # Phase 0.5（可选）：敏感度探针
     # ------------------------------------------------------------------
-    initial_points = _lhs_sample(bounds, config.n_initial, config.random_seed)
+    probe_result = None
+    thaw_scheduler = None
+    doe_bounds = bounds  # 默认使用全局 bounds，探针成功后覆盖
+
+    if (
+        config.sensitivity_probe is not None
+        and config.sensitivity_probe.enabled
+        and not driver_dead
+    ):
+        from ..optimization.sensitivity_probe import (
+            SensitivityResult,
+            ThawScheduler,
+            adaptive_doe_bounds,
+            run_sensitivity_probe,
+        )
+
+        # 找 Phase 0 找到的第一个可行点作为探针中心
+        first_feasible = next((c for c in cases if c.success), None)
+        if first_feasible is not None:
+            # center_dict 以搜索空间路径（paths）为键构建。
+            # 优先级：
+            #   1. first_feasible.design_vars（展开后的 Aspen 路径，覆盖 continuous/integer）
+            #   2. feasibility_search.initial_point（含 derived var 的 frac 初值）
+            #   3. 全局 bounds 中点（兜底，不应依赖）
+            _initial_point_fracs: dict[str, float] = {}
+            if (
+                config.feasibility_search is not None
+                and config.feasibility_search.initial_point
+            ):
+                _initial_point_fracs = {
+                    str(k): float(v)
+                    for k, v in config.feasibility_search.initial_point.items()
+                }
+
+            center_dict: dict[str, float] = {}
+            for i, p in enumerate(paths):
+                if p in first_feasible.design_vars:
+                    # continuous / integer：直接用 design_vars 里的已收敛值
+                    center_dict[p] = float(first_feasible.design_vars[p])
+                elif p in _initial_point_fracs:
+                    # derived（frac 路径）：用 YAML initial_value 反算的 frac
+                    center_dict[p] = _initial_point_fracs[p]
+                else:
+                    # 兜底：bounds 中点
+                    center_dict[p] = (bounds[i][0] + bounds[i][1]) / 2.0
+            integer_idx_set: set[int] = {
+                i for i, p in enumerate(paths) if p in config.integer_var_paths
+            }
+
+            # 提取 center 点的约束 margin，供 run_sensitivity_probe 计算相对下降量。
+            # margin = -ConstraintValue.value（value = threshold - actual，margin > 0 表示满足）
+            _center_margins: dict[str, float] = {}
+            if first_feasible.constraints:
+                for _c in first_feasible.constraints:
+                    if _c.available and _c.value is not None:
+                        _center_margins[_c.name] = -_c.value
+
+            probe_rng = _random.Random(
+                (config.random_seed or 0) + 31337
+            )
+
+            def _probe_run_fn(
+                candidate_vars: dict[str, float],
+            ) -> "tuple[bool, dict[str, float]]":
+                """将探针候选点发给 Aspen，返回 (收敛成功, 约束 margin 字典)。
+
+                margin = actual_value - threshold = -ConstraintValue.value（>0 表示满足）。
+                不收敛时返回 (False, {})；收敛但无约束时返回 (True, {})。
+                热启动模式下由 warmup_fn 预先建立收敛状态，本函数直接在该状态上运行。
+                """
+                import uuid as _uuid
+                import dataclasses as _dc
+
+                _no_reinit_cfg = _dc.replace(config.run_config, reinit=False)
+
+                def _run_once_noreinit(dvars: dict[str, float]) -> "ProcessCase":
+                    _dv_rep, _ = repair_design_vars(
+                        {**config.fixed_vars, **dvars},
+                        config.integer_var_paths,
+                        config.param_bounds,
+                        config.var_dependencies,
+                    )
+                    _dv_full, _ = apply_derived_vars(
+                        _dv_rep, config.derived_var_specs
+                    )
+                    return run_case(
+                        driver=driver,
+                        design_vars=_dv_full,
+                        config=_no_reinit_cfg,
+                        iteration=-1,
+                        tags=list(config.sensitivity_probe.tags),
+                        run_id=str(_uuid.uuid4()),
+                    )
+
+                try:
+                    _probe_case = _run_once_noreinit(candidate_vars)
+                    _save_case(db, _probe_case, config.session_id)
+                    converged = bool(_probe_case.simulation_valid)
+                    # 提取约束 margin：margin = -ConstraintValue.value（value=threshold-actual）
+                    margins: dict[str, float] = {}
+                    if converged and _probe_case.constraints:
+                        for _c in _probe_case.constraints:
+                            if _c.available and _c.value is not None:
+                                margins[_c.name] = -_c.value
+                    return converged, margins
+                except Exception as exc:
+                    _log.warning("敏感度探针 run_fn 异常：%s", exc)
+                    return False, {}
+
+            def _probe_warmup_fn(warmup_vars: dict[str, float]) -> bool:
+                """热启动函数：用 center 点（reinit=False）预热 Aspen 内部状态。
+
+                在每次扰动前调用，让 Aspen 从 center 的已收敛状态出发，
+                解决孤岛问题（.bkp 的热启动依赖）。
+                热启动结果不保存到 DB，不计入统计。
+                """
+                import uuid as _uuid
+                import dataclasses as _dc
+
+                _no_reinit_cfg = _dc.replace(config.run_config, reinit=False)
+                try:
+                    _dv_rep, _ = repair_design_vars(
+                        {**config.fixed_vars, **warmup_vars},
+                        config.integer_var_paths,
+                        config.param_bounds,
+                        config.var_dependencies,
+                    )
+                    _dv_full, _ = apply_derived_vars(
+                        _dv_rep, config.derived_var_specs
+                    )
+                    _case = run_case(
+                        driver=driver,
+                        design_vars=_dv_full,
+                        config=_no_reinit_cfg,
+                        iteration=-1,
+                        tags=["probe_warmup"],
+                        run_id=str(_uuid.uuid4()),
+                    )
+                    return bool(_case.success)
+                except Exception as exc:
+                    _log.warning("探针热启动异常：%s", exc)
+                    return False
+
+            probe_result = run_sensitivity_probe(
+                center=center_dict,
+                bounds=bounds,
+                paths=paths,
+                config=config.sensitivity_probe,
+                run_fn=_probe_run_fn,
+                integer_indices=integer_idx_set,
+                rng=probe_rng,
+                warmup_fn=_probe_warmup_fn,
+                center_margins=_center_margins if _center_margins else None,
+            )
+
+            doe_bounds = adaptive_doe_bounds(
+                center=center_dict,
+                global_bounds=bounds,
+                paths=paths,
+                probe_result=probe_result,
+            )
+
+            # 初始化解冻调度器（Phase 2 使用）
+            thaw_scheduler = ThawScheduler(
+                probe_result=probe_result,
+                config=config.sensitivity_probe,
+                global_bounds=bounds,
+                paths=paths,
+                center=center_dict,
+            )
+
+            _log.info(
+                "Phase 0.5 探针完成：%d 次仿真，约束 %d 个，自适应 DOE bounds 已就绪。"
+                "综合敏感度 top4：%s",
+                probe_result.n_probes_run,
+                len(probe_result.constraint_names),
+                [(p.split("\\")[-1], round(probe_result.sensitivity[p], 2))
+                 for p in probe_result.sensitivity_rank[:4]],
+            )
+            if probe_result.constraint_names:
+                _margin_rank = sorted(
+                    probe_result.margin_sensitivity,
+                    key=lambda p: probe_result.margin_sensitivity[p],
+                    reverse=True,
+                )
+                _log.info(
+                    "  margin 敏感度 top4：%s",
+                    [(p.split("\\")[-1], round(probe_result.margin_sensitivity[p], 2))
+                     for p in _margin_rank[:4]],
+                )
+        else:
+            _log.warning(
+                "Phase 0.5：Phase 0 未找到可行点，跳过敏感度探针，使用全局 bounds DOE。"
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 1：初始 DOE（自适应宽度拉丁超立方采样）
+    # ------------------------------------------------------------------
+    initial_points = _lhs_sample(doe_bounds, config.n_initial, config.random_seed)
 
     for idx, point in enumerate(initial_points):
         if driver_dead:
@@ -414,6 +643,23 @@ def optimize_pareto_case(
             {_short_var_name(k): round(v, 4) for k, v in design_vars_repaired.items()
              if k in config.param_bounds},
         )
+
+        # 飞行前检查：被拦截则直接判 infeasible,不提交 Aspen(零成本)
+        _pf_reason = _preflight_blocked(design_vars, config)
+        if _pf_reason is not None:
+            _log.info("  → 飞行前拦截(infeasible,未提交 Aspen)：%s", _pf_reason)
+            case = ProcessCase(
+                iteration=iteration, status=CaseStatus.INFEASIBLE,
+                design_vars=design_vars, tags=tags,
+                notes=f"飞行前检查拦截：{_pf_reason}",
+            )
+            cases.append(case)
+            case_xs.append(x_eval)
+            _save_case(db, case, config.session_id)
+            _fire_callback(config.on_case_complete, case, idx, n_total)
+            _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
+            hv_history.append(hv)
+            continue
 
         try:
             run_id = str(uuid.uuid4())
@@ -458,6 +704,10 @@ def optimize_pareto_case(
         hv_history.append(hv)
         _log.info("  → status=%s, success=%s, run_time=%.1fs",
                   case.status.value, case.success, case.run_time)
+        # COM 自愈：本点若触发超时/COM 异常,重建连接后再跑下一点
+        if not _maybe_recover_driver(driver, f"初始 DOE [{idx + 1}/{config.n_initial}]"):
+            driver_dead = True
+            break
         if case.status == CaseStatus.OBJECTIVE_ERROR:
             for obj in (case.objectives or []):
                 if getattr(obj, "error", None):
@@ -473,7 +723,10 @@ def optimize_pareto_case(
 
         for c, x in zip(cases, case_xs):
             y_vec = _extract_all_objectives(c, config)
-            optimizer.tell(x, y_vec, is_success=y_vec is not None)
+            _tell_optimizer(
+                optimizer, x, y_vec, is_success=y_vec is not None,
+                c_vec=_extract_constraint_margins(c),
+            )
 
         # warm_start_cases：注入 Phase 1 数据，不重新运行，不计入统计
         n_warm = 0
@@ -482,10 +735,32 @@ def optimize_pareto_case(
             if None in x:
                 continue
             y_vec = _extract_all_objectives(c, config)
-            optimizer.tell(x, y_vec, is_success=y_vec is not None)
+            _tell_optimizer(
+                optimizer, x, y_vec, is_success=y_vec is not None,
+                c_vec=_extract_constraint_margins(c),
+            )
             n_warm += 1
         if n_warm > 0:
             _log.info("warm_start：已注入 %d 个 Phase 1 样本到代理模型。", n_warm)
+
+        # ------------------------------------------------------------------
+        # Trust Region 初始化（若启用）
+        # ------------------------------------------------------------------
+        tr = None
+        if config.trust_region is not None:
+            from ..optimization.trust_region import TrustRegion
+            first_feasible = next((c for c in cases if c.success), None)
+            if first_feasible is not None:
+                center = [float(first_feasible.design_vars.get(p, (bounds[i][0] + bounds[i][1]) / 2))
+                          for i, p in enumerate(paths)]
+                tr = TrustRegion(center, config.trust_region.initial_radius, bounds)
+                _log.info(
+                    "Trust Region 初始化：r=%.4f，中心=%s",
+                    tr.radius,
+                    {_short_var_name(paths[i]): round(center[i], 4) for i in range(min(4, len(paths)))},
+                )
+            else:
+                _log.warning("Trust Region 启用但 Phase 0/1 无可行点，跳过 TR 初始化（使用全局 bounds）。")
 
         n_success_so_far = sum(
             1 for c in cases if _extract_all_objectives(c, config) is not None
@@ -513,13 +788,68 @@ def optimize_pareto_case(
         # 从已有数据中计算当前第一前沿 fingerprint
         prev_front_fps: set[tuple] = _current_front_fps(cases, config)
 
+        # 数据驱动边界收缩：周期性用可行样本重估,与 bounds 取交集(只收不放)。
+        # refined_overlay[path] = (lo, hi),None 表示尚未收缩。
+        refined_overlay: dict[str, tuple[float, float]] = {}
+        _br_cfg = getattr(config, "boundary_refine", None)
+        _br_interval = max(1, int(getattr(config, "boundary_refine_interval", 20)))
+
         for bo_idx in range(n_bo):
             if driver_dead or early_stopped:
                 break
 
             idx = config.n_initial + bo_idx
+
+            # 数据驱动边界收缩：每 _br_interval 轮用可行样本重估一次 overlay
+            if _br_cfg is not None and getattr(_br_cfg, "enabled", False) \
+                    and bo_idx > 0 and bo_idx % _br_interval == 0:
+                refined_overlay = _compute_refined_overlay(cases, paths, config, _br_cfg)
+
+            def _apply_overlay(bnds: list[tuple[float, float]]) -> list[tuple[float, float]]:
+                """把 refined_overlay 与给定 bounds 取交集(只收不放)。"""
+                if not refined_overlay:
+                    return bnds
+                out: list[tuple[float, float]] = []
+                for i, (lo, hi) in enumerate(bnds):
+                    ov = refined_overlay.get(paths[i])
+                    if ov is None:
+                        out.append((lo, hi)); continue
+                    nlo, nhi = max(lo, ov[0]), min(hi, ov[1])
+                    out.append((nlo, nhi) if nlo < nhi else (lo, hi))
+                return out
+
+            # Trust Region + ThawScheduler：在本次迭代开始前确定有效 bounds
+            if tr is not None and thaw_scheduler is not None:
+                # 两者都启用：取 TR 局部 bounds 与 Thaw bounds 的交集（更紧的约束）
+                tr_local = tr.compute_local_bounds()
+                thaw_local = thaw_scheduler.effective_bounds()
+                combined = [
+                    (max(tr_lo, th_lo), min(tr_hi, th_hi))
+                    for (tr_lo, tr_hi), (th_lo, th_hi) in zip(tr_local, thaw_local)
+                ]
+                # 退化保护：若交集为空则退回 TR bounds
+                combined = [
+                    (lo, hi) if lo < hi else tr_b
+                    for (lo, hi), tr_b in zip(combined, tr_local)
+                ]
+                optimizer.set_effective_bounds(_apply_overlay(combined))
+            elif tr is not None:
+                optimizer.set_effective_bounds(_apply_overlay(tr.compute_local_bounds()))
+            elif thaw_scheduler is not None:
+                optimizer.set_effective_bounds(_apply_overlay(thaw_scheduler.effective_bounds()))
+            elif refined_overlay:
+                optimizer.set_effective_bounds(_apply_overlay(list(bounds)))
             iteration = start_iteration + phase0_offset + idx
             tags = list(config.tags) + ["bayesian_opt", "pareto_opt"]
+
+            # 确定本次迭代候选池使用的 bounds
+            # 优先级：thaw_scheduler(动态) > probe_result(静态 doe_bounds) > 全局 bounds
+            # 再与数据驱动 refined_overlay 取交集(只收不放)
+            current_doe_bounds = _apply_overlay(
+                thaw_scheduler.effective_bounds()
+                if thaw_scheduler is not None
+                else list(doe_bounds)
+            )
 
             # ----------------------------------------------------------
             # 候选点选取（含去重保护 + 可选可行性过滤）
@@ -553,7 +883,7 @@ def optimize_pareto_case(
                         else iter_seed + retry * 7919
                     )
                     raw_candidates = _generate_candidate_points(
-                        optimizer, bounds, fc.candidate_pool_size, retry_seed,
+                        optimizer, current_doe_bounds, fc.candidate_pool_size, retry_seed,
                     )
                     screen_inputs: list[dict[str, Any]] = []
                     full_candidates: list[dict[str, Any]] = []
@@ -639,7 +969,7 @@ def optimize_pareto_case(
                         None if iter_seed is None
                         else iter_seed + retry * 7919
                     )
-                    raw_xs = _generate_candidate_points(optimizer, bounds, max(2, max_retries), retry_seed)
+                    raw_xs = _generate_candidate_points(optimizer, current_doe_bounds, max(2, max_retries), retry_seed)
                     for x_raw in raw_xs:
                         dv_raw = {**config.fixed_vars, **dict(zip(paths, x_raw))}
                         dv_rep, rep_notes = repair_design_vars(
@@ -699,16 +1029,28 @@ def optimize_pareto_case(
                 {_short_var_name(p): round(x_eval[i], 4) for i, p in enumerate(paths)},
             )
 
+            # 飞行前检查：被拦截则构造 infeasible 工况,跳过 Aspen 调用,
+            # 但仍走后续 tell/hv/thaw/早停逻辑(infeasible 点对代理模型有训练价值)
+            _pf_reason = _preflight_blocked(design_vars, config)
+
             try:
-                run_id = str(uuid.uuid4())
-                case = run_case(
-                    driver=driver,
-                    design_vars=design_vars,
-                    config=config.run_config,
-                    iteration=iteration,
-                    tags=tags,
-                    run_id=run_id,
-                )
+                if _pf_reason is not None:
+                    _log.info("  → 飞行前拦截(infeasible,未提交 Aspen)：%s", _pf_reason)
+                    case = ProcessCase(
+                        iteration=iteration, status=CaseStatus.INFEASIBLE,
+                        design_vars=design_vars, tags=tags,
+                        notes=f"飞行前检查拦截：{_pf_reason}",
+                    )
+                else:
+                    run_id = str(uuid.uuid4())
+                    case = run_case(
+                        driver=driver,
+                        design_vars=design_vars,
+                        config=config.run_config,
+                        iteration=iteration,
+                        tags=tags,
+                        run_id=run_id,
+                    )
             except AspenConnectionError as exc:
                 _log.error("贝叶斯优化 [%d/%d]：driver 连接断开，终止优化。原因：%s",
                            idx + 1, n_total, exc)
@@ -740,9 +1082,48 @@ def optimize_pareto_case(
             _fire_callback(config.on_case_complete, case, idx, n_total)
 
             y_vec = _extract_all_objectives(case, config)
-            optimizer.tell(x_eval, y_vec, is_success=y_vec is not None)
+            _tell_optimizer(
+                optimizer, x_eval, y_vec, is_success=y_vec is not None,
+                c_vec=_extract_constraint_margins(case),
+            )
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
             hv_history.append(hv)
+
+            # Trust Region 更新
+            if tr is not None:
+                prev_hv = next((h for h in reversed(hv_history[:-1]) if h is not None), None)
+                action = tr.update(prev_hv, hv, config.trust_region)
+                _log.info("  TR r=%.4f (%s)", tr.radius, action)
+                # 若本轮产生了成功的可行点，将信任域中心移向该点
+                if case.success:
+                    new_center = [
+                        float(case.design_vars.get(p, tr.center[i]))
+                        for i, p in enumerate(paths)
+                    ]
+                    tr.move_center(new_center)
+
+            # ThawScheduler 更新（敏感度三阶段解冻）
+            if thaw_scheduler is not None:
+                prev_hv_ts = next((h for h in reversed(hv_history[:-1]) if h is not None), None)
+                hv_improved_ts = (
+                    hv is not None
+                    and prev_hv_ts is not None
+                    and (hv - prev_hv_ts) / max(abs(prev_hv_ts), 1e-10)
+                    > config.sensitivity_probe.thaw_hv_stall_patience * 0  # 任意正改进
+                )
+                # 更新中心（与 TR 同步）
+                new_thaw_center: dict[str, float] | None = None
+                if case.success:
+                    new_thaw_center = {
+                        p: float(case.design_vars.get(p, thaw_scheduler._center.get(p, bounds[i][0])))
+                        for i, p in enumerate(paths)
+                    }
+                new_stage = thaw_scheduler.step(
+                    hv_improved=hv_improved_ts,
+                    case_success=bool(case.success),
+                    new_center=new_thaw_center,
+                )
+                _log.debug("  ThawScheduler: stage=%s", new_stage.value)
 
             _log.info("  → status=%s, success=%s, run_time=%.1fs",
                       case.status.value, case.success, case.run_time)
@@ -750,6 +1131,11 @@ def optimize_pareto_case(
                 for obj in (case.objectives or []):
                     if getattr(obj, "error", None):
                         _log.info("    [%s] error: %s", obj.name, obj.error)
+
+            # COM 自愈：本点若触发超时/COM 异常,重建连接后再跑下一点
+            if not _maybe_recover_driver(driver, f"贝叶斯优化 [{idx + 1}/{n_total}]"):
+                driver_dead = True
+                break
 
             # ---- 多目标早停判断 ----
             if es.enabled and idx + 1 >= es.min_iterations:
@@ -896,7 +1282,7 @@ def _validate_config(config: ParetoOptimizeCaseConfig) -> None:
             f"acquisition 必须为 'EI'、'UCB' 或 'PI'，收到：{config.acquisition!r}。"
         )
 
-    _VALID_SURROGATE = {"GP", "RF", "ET", "GBRT", "random"}
+    _VALID_SURROGATE = {"GP", "RF", "ET", "GBRT", "random", "qEHVI", "NEHVI"}
     if config.surrogate_model not in _VALID_SURROGATE:
         raise ValueError(
             f"surrogate_model={config.surrogate_model!r} 不合法，"
@@ -1001,6 +1387,36 @@ def _short_var_name(path: str) -> str:
     return parts[-1] if parts else path
 
 
+def _local_bounds(
+    bounds: list[tuple[float, float]],
+    initial_point_vals: list[float],
+    radius: float,
+) -> list[tuple[float, float]]:
+    """
+    以 initial_point_vals 为中心、radius 比例构造局部搜索边界，裁剪不超出全局 bounds。
+
+    对每一维：
+      local_lo = max(global_lo, init_val * (1 - radius))
+      local_hi = min(global_hi, init_val * (1 + radius))
+    特殊情况：init_val == 0 时用 (global_hi - global_lo) * radius 作为绝对偏移，
+              避免局部范围退化为单点。
+    """
+    local: list[tuple[float, float]] = []
+    for (glo, ghi), val in zip(bounds, initial_point_vals):
+        if val == 0.0:
+            half = (ghi - glo) * radius
+            lo = max(glo, -half)
+            hi = min(ghi, half)
+        else:
+            lo = max(glo, val * (1.0 - radius))
+            hi = min(ghi, val * (1.0 + radius))
+        # 保证 lo < hi（极端情况下 init_val 在边界时可能相等）
+        if lo >= hi:
+            lo, hi = glo, ghi
+        local.append((lo, hi))
+    return local
+
+
 # ---------------------------------------------------------------------------
 # Phase 0：可行性搜索
 # ---------------------------------------------------------------------------
@@ -1032,90 +1448,185 @@ def _feasibility_search(
         n_trials, stop_after,
     )
 
-    points = _lhs_sample(bounds, n_trials, config.random_seed)
+    # 从 initial_point 提取初始值向量（按 paths 顺序）
+    initial_point_vals: list[float] | None = None
+    if fs_cfg.initial_point:
+        try:
+            initial_point_vals = [float(fs_cfg.initial_point[p]) for p in paths]
+        except (KeyError, TypeError, ValueError) as exc:
+            _log.warning("Phase 0：初始点提取失败，退化为全局随机采样：%s", exc)
+            initial_point_vals = None
+
+    # 构建采样轮次列表：(描述, 采样点列表)
+    # 策略：初始点 → 局部 LHS（按 radii 依序扩张）→ 全局 LHS 兜底
+    sampling_rounds: list[tuple[str, list[list[float]]]] = []
+
+    if initial_point_vals is not None:
+        # 第一轮：初始收敛解本身（1 个点）
+        sampling_rounds.append(("初始收敛解", [initial_point_vals]))
+        remaining = n_trials - 1
+
+        radii = [r for r in (fs_cfg.local_search_radii or []) if 0 < r <= 1.0]
+        if radii and remaining > 0:
+            # 按半径分配采样次数：每个半径平均分配，最后一个取余
+            n_per_radius = max(1, remaining // len(radii))
+            for i, radius in enumerate(radii):
+                n_this = remaining if i == len(radii) - 1 else n_per_radius
+                n_this = min(n_this, remaining)
+                if n_this <= 0:
+                    break
+                lb = _local_bounds(bounds, initial_point_vals, radius)
+                pts = _lhs_sample(lb, n_this, config.random_seed)
+                sampling_rounds.append((f"局部 LHS（±{int(radius*100)}%）", pts))
+                remaining -= n_this
+        else:
+            # 无 radii 配置：剩余次数全部全局随机
+            if remaining > 0:
+                sampling_rounds.append(("全局 LHS", _lhs_sample(bounds, remaining, config.random_seed)))
+    else:
+        # 无初始点：全局 LHS
+        sampling_rounds.append(("全局 LHS", _lhs_sample(bounds, n_trials, config.random_seed)))
+
     cases: list[ProcessCase] = []
     case_xs: list[list[float]] = []
     n_feasible = 0
     driver_dead = False
+    global_iter = 0  # 跨轮次的绝对迭代编号（用于 iteration 字段）
 
-    for idx, point in enumerate(points):
+    for round_name, round_points in sampling_rounds:
         if driver_dead:
             break
         if stop_after > 0 and n_feasible >= stop_after:
-            _log.info("Phase 0：已找到 %d 个可行点，提前停止。", n_feasible)
+            break
+        # 只有在新的半径轮次开始时（不是第一轮初始点），才在可行数 > 0 时停止扩张
+        if round_name.startswith("局部 LHS") and n_feasible > 0:
+            _log.info(
+                "Phase 0：已找到 %d 个可行点（在更小范围内），不继续扩张半径。",
+                n_feasible,
+            )
             break
 
-        design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
-        design_vars_repaired, repair_notes = repair_design_vars(
-            design_vars_raw,
-            config.integer_var_paths,
-            config.param_bounds,
-            config.var_dependencies,
-        )
-        design_vars, derived_notes = apply_derived_vars(
-            design_vars_repaired, config.derived_var_specs,
-        )
-        x_eval = [design_vars_repaired.get(p, point[i]) for i, p in enumerate(paths)]
-        if repair_notes:
-            _log.debug("Phase 0 repair [%d/%d]: %s", idx + 1, n_trials, repair_notes)
-        if derived_notes:
-            _log.debug("Phase 0 derived [%d/%d]: %s", idx + 1, n_trials, derived_notes)
+        if round_points:
+            _log.info("Phase 0：开始 %s，共 %d 个候选点。", round_name, len(round_points))
 
-        iteration = start_iteration + idx
-        _log.info(
-            "Phase 0 [%d/%d]：%s",
-            idx + 1, n_trials,
-            {_short_var_name(k): round(v, 4) for k, v in design_vars_repaired.items()
-             if k in config.param_bounds},
-        )
+        for point in round_points:
+            if driver_dead:
+                break
+            if stop_after > 0 and n_feasible >= stop_after:
+                _log.info("Phase 0：已找到 %d 个可行点，提前停止。", n_feasible)
+                break
 
-        try:
-            run_id = str(uuid.uuid4())
-            case = run_case(
-                driver=driver,
-                design_vars=design_vars,
-                config=config.run_config,
-                iteration=iteration,
-                tags=tags,
-                run_id=run_id,
+            design_vars_raw = {**config.fixed_vars, **dict(zip(paths, point))}
+            design_vars_repaired, repair_notes = repair_design_vars(
+                design_vars_raw,
+                config.integer_var_paths,
+                config.param_bounds,
+                config.var_dependencies,
             )
-        except AspenConnectionError as exc:
-            _log.error("Phase 0 [%d/%d]：driver 连接断开。原因：%s", idx + 1, n_trials, exc)
-            driver_dead = True
-            case = ProcessCase(
-                iteration=iteration, status=CaseStatus.SIM_FAILED,
-                design_vars=design_vars, tags=tags,
-                notes=f"driver 连接断开：{exc}",
+            design_vars, derived_notes = apply_derived_vars(
+                design_vars_repaired, config.derived_var_specs,
             )
+            x_eval = [design_vars_repaired.get(p, point[i]) for i, p in enumerate(paths)]
+            if repair_notes:
+                _log.debug("Phase 0 repair [%d]: %s", global_iter + 1, repair_notes)
+            if derived_notes:
+                _log.debug("Phase 0 derived [%d]: %s", global_iter + 1, derived_notes)
+
+            iteration = start_iteration + global_iter
+            _log.info(
+                "Phase 0 [%d/%d]：%s",
+                global_iter + 1, n_trials,
+                {_short_var_name(k): round(v, 4) for k, v in design_vars_repaired.items()
+                 if k in config.param_bounds},
+            )
+
+            # 飞行前检查：拦截则记为 infeasible,不提交 Aspen
+            _pf_reason = _preflight_blocked(design_vars, config)
+            if _pf_reason is not None:
+                _log.info("  → 飞行前拦截(infeasible,未提交 Aspen)：%s", _pf_reason)
+                case = ProcessCase(
+                    iteration=iteration, status=CaseStatus.INFEASIBLE,
+                    design_vars=design_vars, tags=tags,
+                    notes=f"飞行前检查拦截：{_pf_reason}",
+                )
+                cases.append(case)
+                case_xs.append(x_eval)
+                _save_case(db, case, config.session_id)
+                global_iter += 1
+                continue
+
+            try:
+                run_id = str(uuid.uuid4())
+                case = run_case(
+                    driver=driver,
+                    design_vars=design_vars,
+                    config=config.run_config,
+                    iteration=iteration,
+                    tags=tags,
+                    run_id=run_id,
+                )
+            except AspenConnectionError as exc:
+                _log.error("Phase 0 [%d/%d]：driver 连接断开。原因：%s", global_iter + 1, n_trials, exc)
+                driver_dead = True
+                case = ProcessCase(
+                    iteration=iteration, status=CaseStatus.SIM_FAILED,
+                    design_vars=design_vars, tags=tags,
+                    notes=f"driver 连接断开：{exc}",
+                )
+                cases.append(case)
+                case_xs.append(x_eval)
+                _save_case(db, case, config.session_id)
+                global_iter += 1
+                break
+            except Exception as exc:
+                _log.warning("Phase 0 [%d/%d]：run_case() 意外异常：%s", global_iter + 1, n_trials, exc)
+                case = ProcessCase(
+                    iteration=iteration, status=CaseStatus.SIM_FAILED,
+                    design_vars=design_vars, tags=tags,
+                    notes=f"run_case() 意外异常：{exc}",
+                )
+
             cases.append(case)
             case_xs.append(x_eval)
             _save_case(db, case, config.session_id)
-            break
-        except Exception as exc:
-            _log.warning("Phase 0 [%d/%d]：run_case() 意外异常：%s", idx + 1, n_trials, exc)
-            case = ProcessCase(
-                iteration=iteration, status=CaseStatus.SIM_FAILED,
-                design_vars=design_vars, tags=tags,
-                notes=f"run_case() 意外异常：{exc}",
-            )
+            global_iter += 1
 
-        cases.append(case)
-        case_xs.append(x_eval)
-        _save_case(db, case, config.session_id)
-
-        if case.feasible is True:
-            n_feasible += 1
-            _log.info("  → 可行点 #%d（status=%s）", n_feasible, case.status.value)
-        else:
-            _log.info(
-                "  → 不可行（status=%s, feasible=%s）",
-                case.status.value, case.feasible,
+            is_phase0_feasible = (
+                case.feasible is True
+                or (not case.has_constraints and case.success)
             )
+            if is_phase0_feasible:
+                n_feasible += 1
+                _log.info("  → 可行点 #%d（status=%s）", n_feasible, case.status.value)
+            else:
+                _log.info(
+                    "  → 不可行（status=%s, feasible=%s）",
+                    case.status.value, case.feasible,
+                )
+
+            # COM 自愈：本点若触发超时/COM 异常,重建连接后再跑下一点
+            if not _maybe_recover_driver(driver, f"Phase 0 [{global_iter}/{n_trials}]"):
+                driver_dead = True
+                break
 
     _log.info(
         "Phase 0 完成：运行 %d 次，找到 %d 个可行点。",
         len(cases), n_feasible,
     )
+
+    # 失败门槛：若启用 abort_if_none_found 且全部未找到可行点，直接终止
+    if n_feasible == 0 and fs_cfg.abort_if_none_found and not driver_dead:
+        raise RuntimeError(
+            f"Phase 0 可行性搜索在 {len(cases)} 次随机采样中未找到任何可行点，优化终止。\n"
+            "建议：\n"
+            "  1. 检查约束设置是否过严（如纯度 >= 0.999 在宽松搜索范围下难以满足）\n"
+            "  2. 缩小设计变量搜索范围，使其更贴近已知可行域\n"
+            "  3. 确认 initial_value 已在 YAML 中正确填写（用于注入初始收敛解）\n"
+            "  4. 增大 feasibility_search.n_trials 给随机探索更多机会\n"
+            "  5. 若希望即使 Phase 0 全部失败也继续运行，"
+            "设置 feasibility_search.abort_if_none_found: false"
+        )
+
     return cases, driver_dead, case_xs
 
 
@@ -1176,15 +1687,46 @@ class _MultiObjectiveBayesianOptimizer:
         self._kappa = config.kappa
         self._surrogate_model = config.surrogate_model
         self._rng = _random.Random(config.random_seed)
-        # 将 integer_var_paths（Aspen 路径集合）转换为 bounds 的下标集合，
-        # 供 make_surrogate_optimizer 构建混合整数搜索空间。
         self._integer_indices: set[int] = {
             i for i, p in enumerate(paths) if p in config.integer_var_paths
         }
         # 成功观测：(x, y_vec_min_direction)
         self._observations: list[tuple[list[float], list[float]]] = []
-        # 失败观测：只存 x，penalty 在 ask() 时用当前权重动态计算
+        # 失败观测：只存 x
         self._failed_xs: list[list[float]] = []
+        # Trust Region 覆盖的局部 bounds（None = 使用全局 bounds）
+        self._effective_bounds: list[tuple[float, float]] | None = None
+
+        # BoTorch 路径：预先创建持久化优化器（避免每次 ask 重建）。
+        # 若 BoTorch 未安装，make_surrogate_optimizer 会返回 skopt GP fallback；
+        # 此时不能继续按 BoTorch 接口传 y_vec，应退回本类下方的 ParEGO/skopt 路径。
+        self._is_botorch = config.surrogate_model in ("qEHVI", "NEHVI")
+        if self._is_botorch:
+            surrogate_cfg = SurrogateConfig(
+                model=config.surrogate_model,
+                acquisition=config.acquisition,
+                xi=config.xi,
+                kappa=config.kappa,
+                n_initial_min=config.n_initial_min,
+                random_seed=config.random_seed,
+            )
+            botorch_candidate = make_surrogate_optimizer(
+                bounds, surrogate_cfg, self._integer_indices,
+                n_objectives=self._n_obj,
+            )
+            if botorch_candidate.__class__.__name__ == "BoTorchMOOptimizer":
+                self._botorch_opt = botorch_candidate
+            else:
+                self._botorch_opt = None
+                self._is_botorch = False
+                self._surrogate_model = "GP"
+                _log.warning(
+                    "%s 不可用，_MultiObjectiveBayesianOptimizer 已切换到 "
+                    "ParEGO/skopt GP fallback。",
+                    config.surrogate_model,
+                )
+        else:
+            self._botorch_opt = None
 
     def tell(
         self,
@@ -1192,25 +1734,55 @@ class _MultiObjectiveBayesianOptimizer:
         y_vec: list[float] | None,
         *,
         is_success: bool,
-        penalty: float = 1e10,  # 保留参数签名兼容性，实际不使用
+        penalty: float = 1e10,
+        c_vec: "dict[str, float] | None" = None,
     ) -> None:
         """
         提交一次观测。
 
-        成功样本存入 _observations 参与 GP 拟合。
-        失败样本只存 x，penalty 在 ask() 时用当前权重动态计算，
-        保证失败区域的惩罚信号与成功样本在同一标量化体系下，可复现。
+        skopt 路径：成功样本存入 _observations，失败样本存入 _failed_xs。
+        BoTorch 路径：同时转发给 _botorch_opt.tell()，传入完整 y_vec 和 c_vec。
+
+        Parameters
+        ----------
+        c_vec:
+            约束 margin 字典 {约束名: margin}。
+            margin = actual_value - threshold（>= 0 表示满足约束）。
+            None 时该点不参与约束 GP 训练（目标 GP 不受影响）。
         """
         if is_success and y_vec is not None:
             self._observations.append((list(x), list(y_vec)))
         else:
             self._failed_xs.append(list(x))
+        # BoTorch 路径同步：透传 c_vec 给约束感知后端
+        if self._botorch_opt is not None:
+            self._botorch_opt.tell(
+                x, 0.0, is_success=is_success, y_vec=y_vec, c_vec=c_vec
+            )
+
+    def set_effective_bounds(self, bounds: list[tuple[float, float]]) -> None:
+        """设置本次 ask() 使用的局部 bounds（Trust Region 调用）。"""
+        self._effective_bounds = bounds
+        if self._botorch_opt is not None:
+            self._botorch_opt.set_effective_bounds(bounds)
 
     def ask(self) -> list[float]:
         """推荐下一个候选点。成功观测不足 n_initial_min 时返回随机点。"""
-        if len(self._observations) < self._n_initial_min:
-            return [lo + self._rng.random() * (hi - lo) for lo, hi in self._bounds]
+        active_bounds = self._effective_bounds if self._effective_bounds else self._bounds
+        # 每次 ask 后清除临时局部 bounds（下次迭代由 Phase 2 循环重新设置）
+        self._effective_bounds = None
+        if self._botorch_opt is not None:
+            self._botorch_opt._effective_bounds = None
 
+        if len(self._observations) < self._n_initial_min:
+            return [lo + self._rng.random() * (hi - lo) for lo, hi in active_bounds]
+
+        # BoTorch 路径：qEHVI/qNEHVI
+        if self._botorch_opt is not None:
+            self._botorch_opt.set_effective_bounds(active_bounds)
+            return self._botorch_opt.ask()
+
+        # skopt 路径：ParEGO 随机标量化
         weights = _dirichlet_sample(self._n_obj, self._rng)
         scalarized = [
             _scalarize(y_vec, weights, self._scalarization, self._observations)
@@ -1232,7 +1804,7 @@ class _MultiObjectiveBayesianOptimizer:
                 n_initial_min=0,
                 random_seed=self._rng.randint(0, 2 ** 31),
             )
-            opt = make_surrogate_optimizer(self._bounds, surrogate_cfg, self._integer_indices)
+            opt = make_surrogate_optimizer(active_bounds, surrogate_cfg, self._integer_indices)
             for (x, _), s in zip(self._observations, scalarized):
                 opt.tell(x, s, is_success=True)
             for x in self._failed_xs:
@@ -1268,6 +1840,30 @@ def _extract_all_objectives(
             return None
         result.append(val if obj.minimize else -val)
     return result
+
+
+def _extract_constraint_margins(case: "ProcessCase") -> "dict[str, float] | None":
+    """
+    从 ProcessCase 提取约束 margin 字典。
+
+    margin = actual_value - threshold = -ConstraintValue.value
+    （>= 0 表示约束满足，< 0 表示违反）。
+
+    仅在仿真收敛（simulation_valid=True）且所有约束均可用时返回字典；
+    否则返回 None，调用方传 c_vec=None 给 optimizer.tell()，
+    使该点不参与约束 GP 训练（目标 GP 不受影响）。
+    """
+    if not case.simulation_valid:
+        return None
+    if not case.constraints:
+        return None
+    margins: dict[str, float] = {}
+    for c in case.constraints:
+        if not c.available or c.value is None:
+            return None  # 任意约束不可用则放弃整个点
+        margins[c.name] = -c.value  # value = threshold - actual → margin = -value
+    return margins if margins else None
+
 
 
 def _normalize_objectives(
@@ -1426,6 +2022,105 @@ def _log_infeasible_diagnosis(
             "  #%d iter=%d 总违反=%.4f | %s | vars=%s",
             rank, c.iteration, viol, " | ".join(con_parts), dv_short,
         )
+
+
+def _tell_optimizer(optimizer: Any, x: Any, y_vec: Any, *, is_success: bool, c_vec: Any = None) -> None:
+    """向 optimizer.tell 提交观测,兼容不接受 c_vec 的旧/桩 optimizer。
+
+    优先带 c_vec 调用(约束感知后端用得到);若该 optimizer.tell 不接受
+    c_vec 关键字,回退到不带 c_vec 的调用。两种签名都能工作。
+    """
+    try:
+        optimizer.tell(x, y_vec, is_success=is_success, c_vec=c_vec)
+    except TypeError:
+        optimizer.tell(x, y_vec, is_success=is_success)
+
+
+def _compute_refined_overlay(
+    cases: list[Any],
+    paths: list[str],
+    config: Any,
+    br_cfg: Any,
+) -> dict[str, tuple[float, float]]:
+    """用已有可行样本重估边界 overlay,返回 {path: (lo, hi)}。
+
+    失败/样本不足时返回空字典(不影响优化)。与具体工艺无关。
+    """
+    try:
+        from ..optimization.boundary_refine import extract_feasible_points, refine_bounds
+        feasible = extract_feasible_points(cases, paths)
+        current = {p: config.param_bounds[p] for p in paths if p in config.param_bounds}
+        _new_bounds, results = refine_bounds(feasible, current, br_cfg)
+        overlay = {r.path: r.new_bounds for r in results if r.shrunk}
+        if overlay:
+            _log.info(
+                "boundary_refine：已基于 %d 个可行样本收紧 %d 个变量边界。",
+                len(feasible), len(overlay),
+            )
+        return overlay
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("boundary_refine 重估异常(已忽略)：%s", exc)
+        return {}
+
+
+def _preflight_blocked(design_vars: dict[str, Any], config: Any) -> str | None:
+    """对候选点做飞行前检查, 被拦截返回原因字符串, 通过返回 None。
+
+    config.preflight 为 None / 未启用时永远放行。预检本身异常也放行(不拦优化)。
+    与具体工艺无关。
+    """
+    pf = getattr(config, "preflight", None)
+    if pf is None:
+        return None
+    try:
+        from ..optimization.preflight import check_preflight
+        passed, reason = check_preflight(
+            design_vars=design_vars,
+            reference_values=getattr(config, "reference_values", {}) or {},
+            global_bounds=config.param_bounds,
+            config=pf,
+            var_dependencies=config.var_dependencies,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("飞行前检查异常(已放行该点)：%s", exc)
+        return None
+    return None if passed else reason
+
+
+def _maybe_recover_driver(driver: Any, where: str) -> bool:
+    """若 driver 标记了 needs_recovery, 尝试 COM 自愈重建连接。
+
+    在每次 run_case 之后调用。超时/COM 崩溃后 driver.needs_recovery 为 True,
+    此时重建连接,避免后续工况连锁失败(DISP_E_EXCEPTION 秒崩)。
+
+    Parameters
+    ----------
+    driver:
+        AspenDriver 实例(可能是测试桩,无 needs_recovery 属性时直接返回 True)。
+    where:
+        调用位置标签,用于日志。
+
+    Returns
+    -------
+    bool
+        True  无需恢复,或恢复成功 → 可继续。
+        False 恢复失败 → 调用方应置 driver_dead 并终止本轮。
+    """
+    needs = getattr(driver, "needs_recovery", False)
+    if not needs:
+        return True
+    recover = getattr(driver, "recover", None)
+    if not callable(recover):
+        # 测试桩或不支持自愈的 driver:清不掉标志,保守视为不可继续
+        _log.warning("%s：driver 标记需恢复但不支持 recover(),无法自愈。", where)
+        return False
+    _log.warning("%s：仿真超时/COM 异常,尝试重建 Aspen 连接……", where)
+    ok = bool(recover())
+    if ok:
+        _log.info("%s：Aspen 连接已自愈,继续后续工况。", where)
+    else:
+        _log.error("%s：Aspen 连接自愈失败,终止本轮优化。", where)
+    return ok
 
 
 def _save_case(db: Any, case: ProcessCase, session_id: str = "") -> None:

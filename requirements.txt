@@ -8,11 +8,26 @@
 # ------------------------------------------------------------------------------
 pywin32==311                  # Aspen Plus COM 自动化 (pythoncom, win32com.client)
 numpy==2.2.6                  # 数值计算、LHS 拉丁超立方采样加速
-scikit-optimize==0.10.2       # 贝叶斯优化代理模型 (GP / RF / ET / GBRT)
+scikit-optimize==0.10.2       # 贝叶斯优化代理模型 (GP / RF / ET / GBRT)，qEHVI 路径的 fallback
 scikit-learn==1.7.2           # 机器学习算法（scikit-optimize 依赖）
 scipy==1.15.3                 # 科学计算（scikit-optimize / Pareto 超体积计算依赖）
+
+# BoTorch 多目标 BO 后端（可选加速，不安装时自动退化为 skopt GP）
+# 安装：pip install torch botorch gpytorch
+# 不安装时 surrogate_model: qEHVI/NEHVI 将退化为 GP（skopt）
+torch>=2.0.0                  # PyTorch，BoTorch 依赖，自动检测 CUDA
+botorch>=0.10.0               # qEHVI / qNEHVI / FuRBO Trust Region
+gpytorch>=1.11.0              # BoTorch 依赖的高斯过程库
 PyYAML==6.0.3                 # YAML 配置文件解析
 python-dotenv==1.0.0          # 从 .env 文件加载环境变量（LLM key 管理）
+
+# ------------------------------------------------------------------------------
+# Web API 后端（H4-1）
+# ------------------------------------------------------------------------------
+fastapi==0.115.6              # HTTP API 框架
+uvicorn==0.32.1               # ASGI 服务器（backend/server.py 启动入口）
+sse-starlette==2.1.3          # Server-Sent Events 支持（/api/session/{id}/stream）
+python-multipart==0.0.18      # FastAPI 表单/文件上传依赖
 
 # ------------------------------------------------------------------------------
 # 可视化（仅脚本工具 scripts/ 使用，主流程可选）

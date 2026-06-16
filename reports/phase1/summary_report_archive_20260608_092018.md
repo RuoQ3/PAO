@@ -1,34 +1,9 @@
 # PAO 优化结果综合分析报告
-> 配置文件：`draft_8c80ba62.yaml`  数据库：`simulation.db`  会话：`bcd34243-68de-4adb-827e-a76876c974a5`
+> 配置文件：`draft_2096340c.yaml`  数据库：`simulation.db`  会话：`b440f711-c5c8-4670-bf78-5b3e7ab8e55b`
 
 ## 0. 目标达成总览
 
-> *数据来源：基于 Pareto 第一前沿（6 个解）*
-
-> **总判定：1/1 约束满足；无真实基线，改善幅度不可计算**
-
-### 硬约束达成情况
-
-| 约束名 | 阈值（原始） | 标准化约束值 | 状态 |
-|--------|------------|-------------|------|
-| purity_min | 0.9 | -0.05924 (≤0=满足) | ✅ 满足 |
-
-### 优化目标达成情况
-
-| 目标名 | 方向 | 最优值 | 基线 |
-|--------|------|--------|------|
-| ADN_FLOW | 最大化 ↑ | 2.21e+04 | 无真实基线 |
-| REB_DUTY | 最小化 ↓ | 1.445e+05 | 无真实基线 |
-
-<details>
-<summary>详细匹配说明</summary>
-
-- **purity_min**：从 DB constraints 字段读取，匹配 6/6 个前沿工况
-- **ADN_FLOW**：精确匹配 objectives['ADN_FLOW']，共 6 个有效点；无真实基线（未提供优化前初始单跑结果），改善幅度不可计算
-- **REB_DUTY**：精确匹配 objectives['REB_DUTY']，共 6 个有效点；无真实基线（未提供优化前初始单跑结果），改善幅度不可计算
-
-</details>
-
+> ℹ 未提供优化意图，无法评估达成度。
 
 ## 1. 优化总览
 
@@ -53,12 +28,12 @@
 
 | 工况 | 蒸汽/热源排放 (t CO₂/yr) | 电力排放 (t CO₂/yr) | Scope 1 (t CO₂/yr) | 合计 (t CO₂/yr) | 完整性 |
 |------|-------------------------:|--------------------:|-------------------:|----------------:|--------|
-| a86612f2 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
-| 88b57682 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
-| bf272d23 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
-| 94fbdf59 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
-| 35dce44b | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
-| 6a8860cb | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
+| 5e3ac3ac | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
+| 9bb98f01 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
+| c11953c0 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
+| 86191604 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
+| f2ca2a13 | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
+| 255ec22b | 0.00 | 0.00 | 0.00 | —（无法计算） | ⚠ PARTIAL（无设备快照） |
 
 > 所有工况均为 PARTIAL（存在 skipped blocks/streams），拒绝最优/最差排序。
 
@@ -105,14 +80,14 @@
 
 **逐工况诊断建议：**
 
-- `5da94b0f` (iter=7, sim_failed):
+- `c01a5bc3` (iter=7, sim_failed):
   - 仿真未收敛（block/stream 存在错误标志（errors））：具体错误：以下 block/stream 有错误：['T0302']
-  - Aspen history diagnostics: _0012xlp.his: *** SEVERE ERROR WHILE EXECUTING UNIT OPERATIONS BLOCK: "T0302" (MODEL: | _0012xlp.his: "RADFRAC")                                               (UDL3ZR.3) | _0012xlp.his: MATERIAL AND ENERGY BALANCES FAILED TO CONVERGE: CHECK COL-SPECS | _0012xlp.his: OR SUPPLY BETTER TEMPERATURE AND COMPOSITION ESTIMATES.。由于仿真未收敛，block/stream 快照未入库，无法进行单元级详细诊断。建议：（a）查看 Aspen .his 文件获取具体错误；（b）调整初值或收敛参数后重跑；（c）使用 query_node_db_tool(mode='recurring_errors') 排查结构性失败路径。
-- `0e4ab09b` (iter=8, sim_failed):
+  - Aspen history diagnostics: _1019awp.his: *** SEVERE ERROR WHILE EXECUTING UNIT OPERATIONS BLOCK: "T0302" (MODEL: | _1019awp.his: "RADFRAC")                                               (UDL3ZR.3) | _1019awp.his: MATERIAL AND ENERGY BALANCES FAILED TO CONVERGE: CHECK COL-SPECS | _1019awp.his: OR SUPPLY BETTER TEMPERATURE AND COMPOSITION ESTIMATES.。由于仿真未收敛，block/stream 快照未入库，无法进行单元级详细诊断。建议：（a）查看 Aspen .his 文件获取具体错误；（b）调整初值或收敛参数后重跑；（c）使用 query_node_db_tool(mode='recurring_errors') 排查结构性失败路径。
+- `febf46cd` (iter=8, sim_failed):
   - 仿真未收敛（block/stream 存在错误标志（errors））：具体错误：以下 block/stream 有错误：['T0302']。由于仿真未收敛，block/stream 快照未入库，无法进行单元级详细诊断。建议：（a）查看 Aspen .his 文件获取具体错误；（b）调整初值或收敛参数后重跑；（c）使用 query_node_db_tool(mode='recurring_errors') 排查结构性失败路径。
-- `15604eec` (iter=18, sim_failed):
+- `c7f51f54` (iter=18, sim_failed):
   - 仿真未收敛（block/stream 存在错误标志（errors））：具体错误：以下 block/stream 有错误：['T0302']。由于仿真未收敛，block/stream 快照未入库，无法进行单元级详细诊断。建议：（a）查看 Aspen .his 文件获取具体错误；（b）调整初值或收敛参数后重跑；（c）使用 query_node_db_tool(mode='recurring_errors') 排查结构性失败路径。
-- `f83280da` (iter=25, sim_failed):
+- `7a3a9b99` (iter=25, sim_failed):
   - 仿真未收敛（block/stream 存在错误标志（errors））：具体错误：以下 block/stream 有错误：['T0302']。由于仿真未收敛，block/stream 快照未入库，无法进行单元级详细诊断。建议：（a）查看 Aspen .his 文件获取具体错误；（b）调整初值或收敛参数后重跑；（c）使用 query_node_db_tool(mode='recurring_errors') 排查结构性失败路径。
-- `4e79c998` (iter=26, sim_failed):
+- `36d2d1da` (iter=26, sim_failed):
   - 仿真未收敛（block/stream 存在错误标志（errors））：具体错误：以下 block/stream 有错误：['T0302']。由于仿真未收敛，block/stream 快照未入库，无法进行单元级详细诊断。建议：（a）查看 Aspen .his 文件获取具体错误；（b）调整初值或收敛参数后重跑；（c）使用 query_node_db_tool(mode='recurring_errors') 排查结构性失败路径。

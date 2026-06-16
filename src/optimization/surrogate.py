@@ -37,7 +37,7 @@ except ImportError:
 # 配置
 # ---------------------------------------------------------------------------
 
-_VALID_MODELS = {"GP", "RF", "ET", "GBRT", "random"}
+_VALID_MODELS = {"GP", "RF", "ET", "GBRT", "random", "qEHVI", "NEHVI"}
 
 
 @dataclass
@@ -228,11 +228,16 @@ class SurrogateOptimizer:
 
 def make_surrogate_optimizer(
     bounds: list[tuple[float, float]],
-    config: SurrogateConfig,
+    config: "SurrogateConfig",
     integer_indices: set[int] | None = None,
-) -> SurrogateOptimizer:
+    n_objectives: int = 1,
+) -> "SurrogateOptimizer":
     """
-    创建 SurrogateOptimizer 实例。
+    创建代理模型优化器实例。
+
+    model="qEHVI"/"NEHVI" 时返回 BoTorchMOOptimizer；
+    其余 model 值返回 SurrogateOptimizer（skopt 后端）。
+    BoTorch 不可用时自动退化为 GP（skopt），并写 WARNING 日志。
 
     Parameters
     ----------
@@ -244,9 +249,29 @@ def make_surrogate_optimizer(
         整数维度的索引集合（对应 bounds 的下标）。
         这些维度使用 skopt.space.Integer，采集函数在整数格点上采样。
         None 或空集合表示全部为连续维度，行为与旧版本一致。
+    n_objectives:
+        目标函数数量，仅 BoTorch 路径使用（qEHVI/NEHVI）。
 
     Returns
     -------
     SurrogateOptimizer
     """
+    if config.model in ("qEHVI", "NEHVI"):
+        try:
+            from .botorch_backend import BoTorchMOOptimizer, _check_botorch
+            if _check_botorch():
+                return BoTorchMOOptimizer(bounds, n_objectives, integer_indices or set(), config)
+            _log.warning("BoTorch 未安装，%s 退化为 skopt GP。", config.model)
+        except Exception as exc:
+            _log.warning("BoTorchMOOptimizer 初始化失败，退化为 skopt GP：%s", exc)
+        # 退化：创建 GP 配置
+        fallback_cfg = SurrogateConfig(
+            model="GP",
+            acquisition=config.acquisition,
+            xi=config.xi,
+            kappa=config.kappa,
+            n_initial_min=config.n_initial_min,
+            random_seed=config.random_seed,
+        )
+        return SurrogateOptimizer(bounds, fallback_cfg, integer_indices)
     return SurrogateOptimizer(bounds, config, integer_indices)
