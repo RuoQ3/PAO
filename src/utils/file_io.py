@@ -390,8 +390,12 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         random_seed     = opt.get("random_seed"),
         integer_var_paths  = integer_paths,
         derived_var_specs  = derived_var_specs,
-        feasibility_filter = _parse_feasibility_filter(opt.get("feasibility_filter")),
-        early_stopping     = _parse_early_stopping(opt.get("early_stopping")),
+        feasibility_filter = _parse_feasibility_filter(
+            cfg.get("feasibility_filter") or opt.get("feasibility_filter")
+        ),
+        early_stopping     = _parse_early_stopping(
+            cfg.get("early_stopping") or opt.get("early_stopping")
+        ),
         feasibility_search = feasibility_search_single,
     )
 
@@ -632,8 +636,12 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         derived_var_specs  = derived_var_specs,
         var_dependencies   = var_dependencies,
         feasibility_search = feasibility_search,
-        feasibility_filter = _parse_feasibility_filter(opt.get("feasibility_filter")),
-        early_stopping     = _parse_early_stopping(opt.get("early_stopping")),
+        feasibility_filter = _parse_feasibility_filter(
+            cfg.get("feasibility_filter") or opt.get("feasibility_filter")
+        ),
+        early_stopping     = _parse_early_stopping(
+            cfg.get("early_stopping") or opt.get("early_stopping")
+        ),
         trust_region       = trust_region_cfg,
         sensitivity_probe  = _parse_sensitivity_probe(cfg.get("sensitivity_probe")),
         preflight          = preflight_cfg,

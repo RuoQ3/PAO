@@ -170,9 +170,12 @@ class AspenNode:
     @property
     def value_type(self) -> ValueType:
         """返回节点的 ValueType（手册 38-10）。"""
-        com_node = self._raw_com_node()
         try:
-            return ValueType(int(com_node.ValueType))
+            return self._driver.submit_on_node(
+                self._path, lambda n: ValueType(int(n.ValueType))
+            )
+        except AspenNodeError:
+            raise
         except Exception as exc:
             raise AspenNodeError(
                 f"读取节点 '{self._path}' 的 ValueType 失败：{exc}"
@@ -187,10 +190,11 @@ class AspenNode:
         返回节点的工程单位字符串（IHNode.UnitString，手册 38-14/38-41）。
         若节点无单位则返回空字符串。
         """
-        com_node = self._raw_com_node()
         try:
-            unit = com_node.UnitString
-            return str(unit) if unit is not None else ""
+            return self._driver.submit_on_node(
+                self._path,
+                lambda n: str(n.UnitString) if n.UnitString is not None else "",
+            )
         except Exception:
             return ""
 
@@ -208,9 +212,12 @@ class AspenNode:
             HAPAttributeNumber 整数编号。
             使用 driver.hap_constants["HAP_OUTVAR"] 等方式获取已验证的编号。
         """
-        com_node = self._raw_com_node()
         try:
-            return com_node.AttributeValue(attr_number)
+            return self._driver.submit_on_node(
+                self._path, lambda n: n.AttributeValue(attr_number)
+            )
+        except AspenNodeError:
+            raise
         except Exception as exc:
             raise AspenNodeError(
                 f"读取节点 '{self._path}' 属性编号 {attr_number} 失败：{exc}"
@@ -218,9 +225,10 @@ class AspenNode:
 
     def has_attribute(self, attr_number: int) -> bool:
         """检查节点是否支持指定属性（IHNode.HasAttribute，手册 38-40）。"""
-        com_node = self._raw_com_node()
         try:
-            return bool(com_node.HasAttribute(attr_number))
+            return self._driver.submit_on_node(
+                self._path, lambda n: bool(n.HasAttribute(attr_number))
+            )
         except Exception:
             return False
 
@@ -230,9 +238,12 @@ class AspenNode:
         返回节点的 Dimension（手册 38-8/38-39）。
         0 = 标量叶节点；>0 = 多维变量节点，值为维度数。
         """
-        com_node = self._raw_com_node()
         try:
-            return int(com_node.Dimension)
+            return self._driver.submit_on_node(
+                self._path, lambda n: int(n.Dimension)
+            )
+        except AspenNodeError:
+            raise
         except Exception as exc:
             raise AspenNodeError(
                 f"读取节点 '{self._path}' 的 Dimension 失败：{exc}"
@@ -253,48 +264,78 @@ class AspenNode:
                 "运行 scripts/verify_hap_constants.py 诊断。"
             )
 
-        com_node = self._raw_com_node()
+        # 将所有 COM 读取打包为一次 STA 提交，避免 RPC_E_WRONG_THREAD
+        def _read_on_sta(com_node: Any) -> dict:
+            def _attr(name: str, default: Any = None) -> Any:
+                num = hap.get(name)
+                if num is None:
+                    return default
+                try:
+                    return com_node.AttributeValue(num)
+                except Exception:
+                    return default
 
-        def _attr(name: str, default: Any = None) -> Any:
-            num = hap.get(name)
-            if num is None:
-                return default
             try:
-                return com_node.AttributeValue(num)
+                unit = com_node.UnitString
+                unit_str = str(unit) if unit is not None else ""
             except Exception:
-                return default
+                unit_str = ""
 
-        def _unit() -> str:
             try:
-                u = com_node.UnitString
-                return str(u) if u is not None else ""
+                vtype = int(com_node.ValueType)
             except Exception:
-                return ""
+                vtype = 0
 
-        def _vtype() -> int:
             try:
-                return int(com_node.ValueType)
+                dim = int(com_node.Dimension)
             except Exception:
-                return 0
+                dim = 0
 
-        def _dim() -> int:
-            try:
-                return int(com_node.Dimension)
-            except Exception:
-                return 0
+            child_names: list[str] = []
+            if dim != 0:
+                try:
+                    elements = com_node.Elements
+                    if elements is not None:
+                        try:
+                            child_names = [e.Name for e in elements]
+                        except Exception:
+                            try:
+                                count = int(elements.Count)
+                                child_names = [str(elements.Item(i).Name) for i in range(count)]
+                            except Exception:
+                                try:
+                                    count = int(elements.RowCount(0))
+                                    child_names = [str(elements.ItemName(i, 0)) for i in range(count)]
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+            return {
+                "unit_str": unit_str,
+                "vtype": vtype,
+                "dim": dim,
+                "is_output": bool(_attr("HAP_OUTVAR", False)),
+                "is_enterable": bool(_attr("HAP_ENTERABLE", False)),
+                "record_type": str(_attr("HAP_RECORDTYPE", "") or ""),
+                "has_children": bool(_attr("HAP_HASCHILDREN", False)),
+                "child_names": child_names,
+            }
+
+        meta = self._driver.submit_on_node(self._path, _read_on_sta)
 
         return NodeInfo(
             path=self._path,
             name=self.name,
             value=self.value,
-            unit_string=_unit(),
-            value_type=_vtype(),
-            dimension=_dim(),
-            is_output=bool(_attr("HAP_OUTVAR", False)),
-            is_enterable=bool(_attr("HAP_ENTERABLE", False)),
-            record_type=str(_attr("HAP_RECORDTYPE", "") or ""),
-            has_children=bool(_attr("HAP_HASCHILDREN", False)),
-            children=self.child_names(),
+            unit_string=meta["unit_str"],
+            value_type=meta["vtype"],
+            dimension=meta["dim"],
+            is_output=meta["is_output"],
+            is_enterable=meta["is_enterable"],
+            record_type=meta["record_type"],
+            has_children=meta["has_children"],
+            children=meta["child_names"],
         )
 
     # ------------------------------------------------------------------ #
@@ -314,48 +355,50 @@ class AspenNode:
           3. RowCount(0) + ItemName(i, 0)（多维集合接口）
 
         三层均失败时抛出 AspenNodeError，不静默返回空列表。
+        所有 COM 调用在 STA 线程内原子执行，避免 RPC_E_WRONG_THREAD。
         """
-        com_node = self._raw_com_node()
+        def _do(com_node: Any) -> list[str]:
+            # Dimension=0：标量叶节点，无子节点，不能调 Elements
+            try:
+                if int(com_node.Dimension) == 0:
+                    return []
+            except Exception:
+                pass  # Dimension 读取失败时继续尝试 Elements
 
-        # Dimension=0：标量叶节点，无子节点，不能调 Elements
-        try:
-            if int(com_node.Dimension) == 0:
+            try:
+                elements = com_node.Elements
+            except Exception as exc:
+                raise AspenNodeError(
+                    f"获取节点 '{self._path}' 的 Elements 失败：{exc}"
+                ) from exc
+
+            if elements is None:
                 return []
-        except Exception:
-            pass  # Dimension 读取失败时继续尝试 Elements
 
-        try:
-            elements = com_node.Elements
-        except Exception as exc:
-            raise AspenNodeError(
-                f"获取节点 '{self._path}' 的 Elements 失败：{exc}"
-            ) from exc
+            # 层 1：COM For Each 枚举
+            try:
+                return [e.Name for e in elements]
+            except Exception:
+                pass
 
-        if elements is None:
-            return []
+            # 层 2：Count + Item(index).Name（手册 38-41）
+            try:
+                count = int(elements.Count)
+                return [str(elements.Item(i).Name) for i in range(count)]
+            except Exception:
+                pass
 
-        # 层 1：COM For Each 枚举
-        try:
-            return [e.Name for e in elements]
-        except Exception:
-            pass
+            # 层 3：RowCount(0) + ItemName(i, 0)（手册 38-42，多维集合）
+            try:
+                count = int(elements.RowCount(0))
+                return [str(elements.ItemName(i, 0)) for i in range(count)]
+            except Exception as exc:
+                raise AspenNodeError(
+                    f"枚举节点 '{self._path}' 的子节点失败"
+                    f"（For Each、Count/Item、RowCount/ItemName 均不可用）：{exc}"
+                ) from exc
 
-        # 层 2：Count + Item(index).Name（手册 38-41）
-        try:
-            count = int(elements.Count)
-            return [str(elements.Item(i).Name) for i in range(count)]
-        except Exception:
-            pass
-
-        # 层 3：RowCount(0) + ItemName(i, 0)（手册 38-42，多维集合）
-        try:
-            count = int(elements.RowCount(0))
-            return [str(elements.ItemName(i, 0)) for i in range(count)]
-        except Exception as exc:
-            raise AspenNodeError(
-                f"枚举节点 '{self._path}' 的子节点失败"
-                f"（For Each、Count/Item、RowCount/ItemName 均不可用）：{exc}"
-            ) from exc
+        return self._driver.submit_on_node(self._path, _do)
 
     def children(self) -> list[AspenNode]:
         """返回所有直接子节点的 AspenNode 列表。"""
@@ -375,18 +418,27 @@ class AspenNode:
 
         优先通过 Elements.Item(name) 获取（手册 38-8/38-41），
         避免仅靠路径拼接而跳过 COM 验证。
+        所有 COM 调用在 STA 线程内执行，避免 RPC_E_WRONG_THREAD。
         """
-        com_node = self._raw_com_node()
-        try:
-            elements = com_node.Elements
-            if elements is not None:
-                child_com = elements.Item(name)
-                if child_com is not None:
-                    return AspenNode(self._driver, f"{self._path}\\{name}")
-        except Exception:
-            pass
-
         child_path = f"{self._path}\\{name}"
+
+        def _check(com_node: Any) -> bool:
+            try:
+                elements = com_node.Elements
+                if elements is not None:
+                    return elements.Item(name) is not None
+            except Exception:
+                pass
+            return False
+
+        try:
+            found = self._driver.submit_on_node(self._path, _check)
+        except Exception:
+            found = False
+
+        if found:
+            return AspenNode(self._driver, child_path)
+
         if not self._driver.node_exists(child_path):
             raise AspenNodeError(f"子节点不存在：'{child_path}'")
         return AspenNode(self._driver, child_path)

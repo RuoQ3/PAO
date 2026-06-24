@@ -55,8 +55,8 @@ design_variables:
     description: T0301 塔底采出比（主要控制 ADN 产量）
     aspen_path: \Data\Blocks\T0301\Input\B:F
     type: continuous            # 连续变量，参与 BO 搜索
-    lower_bound: 0.3
-    upper_bound: 0.9
+    lower_bound: 0.599964
+    upper_bound: 0.600036
     initial_value: 0.6
     unit: "-"
 
@@ -73,8 +73,8 @@ design_variables:
     description: T0301 回流比（主要控制分离效果和能耗）
     aspen_path: \Data\Blocks\T0301\Input\BASIS_RR
     type: continuous            # 连续变量，参与 BO 搜索
-    lower_bound: 1.0
-    upper_bound: 3.0
+    lower_bound: 1.53846
+    upper_bound: 2.6
     initial_value: 2.0
     unit: "-"
 
@@ -172,43 +172,43 @@ trust_region:
   eta_success: 0.05               # HV 相对改进 5% 以上视为成功
   failure_tolerance: 5            # 连续 5 次无 HV 改进后重置到初始半径
 
-  # ML-assisted feasibility filtering（运行时生效）
-  # 作用：用历史仿真数据库中的成功/失败标签训练可行性分类器，在 BO 阶段先生成候选池，
-  #      再过滤掉预测不可行的候选点，以减少明显失败的 Aspen 调用。
-  # 注意：第一次运行或历史样本不足时，分类器会自动跳过训练，优化仍按原流程执行。
-  # 对照：若要做 baseline 对照实验，将 enabled 改为 false 后运行同一配置。
-  feasibility_filter:
-    enabled: true                 # 是否启用候选池可行性过滤；false=完全不使用分类器过滤
-    model: extra_trees            # 分类器模型：extra_trees / random_forest / random
-    min_samples: 20               # 训练分类器所需的最少历史样本数；不足时自动跳过过滤
-    threshold: 0.40               # 可行概率阈值；越高越激进，越可能错杀可行点；demo 采用偏保守值
-    candidate_pool_size: 200      # 每轮 BO 先生成的候选池大小，再从中筛选高可行概率点
-    random_seed: 42               # 分类器随机种子，保证本地重复实验可复现
+# ML-assisted feasibility filtering（运行时生效）
+# 作用：用历史仿真数据库中的成功/失败标签训练可行性分类器，在 BO 阶段先生成候选池，
+#      再过滤掉预测不可行的候选点，以减少明显失败的 Aspen 调用。
+# 注意：第一次运行或历史样本不足时，分类器会自动跳过训练，优化仍按原流程执行。
+# 对照：若要做 baseline 对照实验，将 enabled 改为 false 后运行同一配置。
+feasibility_filter:
+  enabled: true                 # 是否启用候选池可行性过滤；false=完全不使用分类器过滤
+  model: extra_trees            # 分类器模型：extra_trees / random_forest / random
+  min_samples: 20               # 训练分类器所需的最少历史样本数；不足时自动跳过过滤
+  threshold: 0.40               # 可行概率阈值；越高越激进，越可能错杀可行点；demo 采用偏保守值
+  candidate_pool_size: 200      # 每轮 BO 先生成的候选池大小，再从中筛选高可行概率点
+  random_seed: 42               # 分类器随机种子，保证本地重复实验可复现
 
-  # 自动早停与重复候选保护（任务 8 新增）
-  # 作用：
-  #   1. 当 Pareto front 或 hypervolume 连续多轮不再改善，自动停止优化，节省 Aspen 调用。
-  #   2. 每轮选候选前检查是否已经运行过该点（fingerprint 去重），
-  #      全部重复时跳过本轮而非强制重跑，避免污染数据库。
-  #   3. min_iterations 保证在正式判断早停前已有足够探索。
-  # 注意：
-  #   - enabled=false 时完全不影响旧流程，所有 BO 轮次照常执行。
-  #   - 早停不代表找到全局最优，只说明在当前搜索策略下继续改进概率较低。
-  #   - 候选去重在 enabled=true 和 false 时都会生效（去重是保护机制，与早停无关）。
-  early_stopping:
-    enabled: true                    # 是否启用早停判断；false=跑满 n_iterations，去重仍生效
-    min_iterations: 30               # 至少完成多少次总迭代后才允许触发早停
-                                     # 设为 n_initial_points + 20，确保 BO 至少探索 20 轮再判断
-    patience: 10                     # 连续多少轮无有效改善后停止；越大越宽松，允许更长停滞期
-    min_delta: 1.0e-6                # hypervolume 改善量必须 > min_delta 才算有效改善；
-                                     # 设置过大会导致过早停止，设置过小则收敛判断太松
-    relative_delta: null             # 相对改善阈值（相对于当前最优值的比例）；null=不启用
-                                     # 例如 1.0e-4 表示改善不足 0.01% 就算停滞
-    max_duplicate_suggestions: 3     # 候选池连续几次全部重复后触发 no_unique_candidate 早停；
-                                     # 通常是搜索空间探索完毕或 LHS 精度不足时触发
-    check_hypervolume: true          # 多目标：是否用 hypervolume 改善作为早停判据
-    check_first_front: true          # 多目标：是否检查 Pareto 第一前沿的变化作为早停判据
-                                     # 两个检查都不改善才累计 no_improvement_count
+# 自动早停与重复候选保护
+# 作用：
+#   1. 当 Pareto front 或 hypervolume 连续多轮不再改善，自动停止优化，节省 Aspen 调用。
+#   2. 每轮选候选前检查是否已经运行过该点（fingerprint 去重），
+#      全部重复时跳过本轮而非强制重跑，避免污染数据库。
+#   3. min_iterations 保证在正式判断早停前已有足够探索。
+# 注意：
+#   - enabled=false 时完全不影响旧流程，所有 BO 轮次照常执行。
+#   - 早停不代表找到全局最优，只说明在当前搜索策略下继续改进概率较低。
+#   - 候选去重在 enabled=true 和 false 时都会生效（去重是保护机制，与早停无关）。
+early_stopping:
+  enabled: true                    # 是否启用早停判断；false=跑满 n_iterations，去重仍生效
+  min_iterations: 30               # 至少完成多少次总迭代后才允许触发早停
+                                   # 设为 n_initial_points + 20，确保 BO 至少探索 20 轮再判断
+  patience: 10                     # 连续多少轮无有效改善后停止；越大越宽松，允许更长停滞期
+  min_delta: 1.0e-6                # hypervolume 改善量必须 > min_delta 才算有效改善；
+                                   # 设置过大会导致过早停止，设置过小则收敛判断太松
+  relative_delta: null             # 相对改善阈值（相对于当前最优值的比例）；null=不启用
+                                   # 例如 1.0e-4 表示改善不足 0.01% 就算停滞
+  max_duplicate_suggestions: 3     # 候选池连续几次全部重复后触发 no_unique_candidate 早停；
+                                   # 通常是搜索空间探索完毕或 LHS 精度不足时触发
+  check_hypervolume: true          # 多目标：是否用 hypervolume 改善作为早停判据
+  check_first_front: true          # 多目标：是否检查 Pareto 第一前沿的变化作为早停判据
+                                   # 两个检查都不改善才累计 no_improvement_count
 
 # ---------------------------------------------------------------------------
 # 离线可行性评估配置（人工运行前使用；当前优化器不会自动读取）

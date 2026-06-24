@@ -115,3 +115,23 @@ USER_TEMPLATE = """\
 设计变量清单：
 {variables_block}
 """
+
+# ---------------------------------------------------------------------------
+# 收敛失败模式摘要：模块加载时一次性生成，注入 SYSTEM_PROMPT
+# 让 LLM 在推荐搜索边界时感知高风险变量类型，对相关参数取更保守的 k 值。
+# try/except 确保 convergence_kb 不可用时 SYSTEM_PROMPT 保持原样，不影响功能。
+# ---------------------------------------------------------------------------
+try:
+    from src.optimization.convergence_kb import format_kb_summary as _fmt_kb
+
+    _KB_SECTION = (
+        "\n\n========================= 历史收敛失败模式（参考） ========================="
+        "\nPAO 系统积累了以下 7 种常见 Aspen Plus 收敛失败原因，推荐边界时请参考："
+        f"\n{_fmt_kb()}"
+        "\n\n��关键提示】如果被优化变量涉及上述高风险类型"
+        "（如精馏塔规格参数、循环流股流量、物性敏感温度），"
+        "请额外保守取 k 值，宁小勿大——收敛失败的代价远大于搜索范围偏窄。"
+    )
+    SYSTEM_PROMPT = SYSTEM_PROMPT + _KB_SECTION
+except Exception:
+    pass  # KB 不可用时 SYSTEM_PROMPT 保持不变

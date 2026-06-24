@@ -85,8 +85,8 @@ design_variables:
   - name: T1_FEED_F1_FRAC
     description: T1 主进料 F1 归一化位置（range [0,1]，映射为 FEED_STAGE\F1）
     type: derived
-    lo_frac: 0.4535
-    hi_frac: 0.6335
+    lo_frac: 0.5335
+    hi_frac: 0.5535
     initial_value: 0.5435  # 反算：(FEED_STAGE=28 - frac_lo=3) / (NSTAGE=50 - frac_lo=3 - 1) = 25/46
     target_path: \Data\Blocks\T1\Input\FEED_STAGE\F1
     depends_on: \Data\Blocks\T1\Input\NSTAGE
@@ -97,7 +97,7 @@ design_variables:
     description: T1 萃取剂 S1 归一化进料位置（range [0,1]，映射为 FEED_STAGE\S1）
     type: derived
     lo_frac: 0
-    hi_frac: 0.00115694
+    hi_frac: 8.03431e-06
     initial_value: 0.0     # 反算：(FEED_STAGE=3 - frac_lo=3) / (NSTAGE=50 - frac_lo=3 - 1) = 0/46 = 0（萃取剂靠近塔顶）
     target_path: \Data\Blocks\T1\Input\FEED_STAGE\S1
     depends_on: \Data\Blocks\T1\Input\NSTAGE
@@ -118,16 +118,16 @@ design_variables:
     description: T2 回流比（boundary_advisor 锚定初值 0.23,极低回流比高敏感）
     aspen_path: \Data\Blocks\T2\Input\BASIS_RR
     type: continuous
-    lower_bound: 0.214272
-    upper_bound: 0.245728
+    lower_bound: 0.229563
+    upper_bound: 0.230437
     initial_value: 0.230
     unit: "-"
 
   - name: T2_FEED_F2_FRAC
     description: T2 主进料 F2 归一化位置（range [0,1]，映射为 FEED_STAGE\F2）
     type: derived
-    lo_frac: 0.894246
-    hi_frac: 0.947954
+    lo_frac: 0.919608
+    hi_frac: 0.922592
     initial_value: 0.9211  # 反算：(FEED_STAGE=108 - frac_lo=3) / (NSTAGE=118 - frac_lo=3 - 1) = 105/114
     target_path: \Data\Blocks\T2\Input\FEED_STAGE\F2
     depends_on: \Data\Blocks\T2\Input\NSTAGE
@@ -137,8 +137,8 @@ design_variables:
   - name: T2_FEED_S2_FRAC
     description: T2 萃取剂 S2 归一化进料位置（range [0,1]，映射为 FEED_STAGE\S2）
     type: derived
-    lo_frac: 0.0031875
-    hi_frac: 0.0670125
+    lo_frac: 0.0271219
+    hi_frac: 0.0430781
     initial_value: 0.0351  # 反算：(FEED_STAGE=7 - frac_lo=3) / (NSTAGE=118 - frac_lo=3 - 1) = 4/114（萃取剂靠近塔顶）
     target_path: \Data\Blocks\T2\Input\FEED_STAGE\S2
     depends_on: \Data\Blocks\T2\Input\NSTAGE
@@ -167,8 +167,8 @@ design_variables:
   - name: T3_FEED_F3_FRAC
     description: T3 主进料 F3 归一化位置（range [0,1]，映射为 FEED_STAGE\F3）
     type: derived
-    lo_frac: 0.21
-    hi_frac: 0.39
+    lo_frac: 0.285
+    hi_frac: 0.315
     initial_value: 0.3     # 反算：(FEED_STAGE=6 - frac_lo=3) / (NSTAGE=14 - frac_lo=3 - 1) = 3/10
     target_path: \Data\Blocks\T3\Input\FEED_STAGE\F3
     depends_on: \Data\Blocks\T3\Input\NSTAGE
@@ -199,8 +199,8 @@ design_variables:
     description: T1 塔顶操作压力（真空操作,锚定初值 0.0576 atm）
     aspen_path: \Data\Blocks\T1\Input\PRES1
     type: continuous
-    lower_bound: 0.042048
-    upper_bound: 0.073152
+    lower_bound: 0.055872
+    upper_bound: 0.059328
     initial_value: 0.0576
     unit: "atm"
 
@@ -208,8 +208,8 @@ design_variables:
     description: T2 塔顶操作压力（真空操作,锚定初值 0.183 atm）
     aspen_path: \Data\Blocks\T2\Input\PRES1
     type: continuous
-    lower_bound: 0.13359
-    upper_bound: 0.23241
+    lower_bound: 0.17751
+    upper_bound: 0.18849
     initial_value: 0.183
     unit: "atm"
 
@@ -217,8 +217,8 @@ design_variables:
     description: T3 塔顶操作压力（真空操作,锚定初值 0.0598 atm）
     aspen_path: \Data\Blocks\T3\Input\PRES1
     type: continuous
-    lower_bound: 0.043654
-    upper_bound: 0.075946
+    lower_bound: 0.058006
+    upper_bound: 0.061594
     initial_value: 0.0598
     unit: "atm"
 

@@ -287,6 +287,76 @@ def plot_pareto_scatter(
 
 
 # ---------------------------------------------------------------------------
+# 图 1b：仅可行解的 Pareto 散点图
+# ---------------------------------------------------------------------------
+
+def plot_pareto_scatter_feasible_only(
+    cases: list[dict],
+    out_dir: Path,
+    *,
+    obj_x: str = "obj_x",
+    obj_y: str = "obj_y",
+    x_minimize: bool = True,
+    y_minimize: bool = True,
+    x_unit: str = "",
+    y_unit: str = "",
+) -> Path | None:
+    """仅用可行解绘制 Pareto 散点图，坐标轴范围不受 infeasible 极值干扰。"""
+    feasible = [c for c in cases if c["feasible"]]
+    if not feasible:
+        log.info("无可行工况，跳过 feasible-only 散点图。")
+        return None
+
+    front = _pareto_front(cases, x_minimize=x_minimize, y_minimize=y_minimize)
+
+    x_vals = [c["obj_x"] for c in feasible if c["obj_x"] is not None]
+    if x_vals and max(abs(v) for v in x_vals) > 1e5:
+        x_scale, x_prefix = 1e6, "M"
+    else:
+        x_scale, x_prefix = 1.0, ""
+
+    x_unit_str = f"{x_prefix}{x_unit}" if x_unit else x_prefix
+    x_dir = "↓min" if x_minimize else "↑max"
+    y_dir = "↓min" if y_minimize else "↑max"
+    x_label = f"{obj_x} ({x_unit_str}) {x_dir}" if x_unit_str else f"{obj_x} {x_dir}"
+    y_label = f"{obj_y} ({y_unit}) {y_dir}"      if y_unit      else f"{obj_y} {y_dir}"
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    iters = [c["iteration"] for c in feasible]
+    sc = ax.scatter(
+        [c["obj_x"] / x_scale for c in feasible],
+        [c["obj_y"]           for c in feasible],
+        c=iters, cmap="viridis_r", s=60, alpha=0.85,
+        label=f"Feasible ({len(feasible)})", zorder=3,
+    )
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label("Iteration", fontsize=10)
+
+    if front:
+        ax.plot(
+            [c["obj_x"] / x_scale for c in front],
+            [c["obj_y"]           for c in front],
+            "r-o", ms=8, lw=1.5, zorder=4,
+            label=f"Pareto Front ({len(front)})",
+        )
+
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12)
+    ax.set_title(f"Pareto Front (Feasible Only) — {obj_x} vs {obj_y}", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+
+    fig.tight_layout()
+    out = out_dir / "pareto_scatter_feasible.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    log.info("已保存：%s", out)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 图 2：超体积收敛曲线
 # ---------------------------------------------------------------------------
 
@@ -311,7 +381,12 @@ def _compute_hv_history(
     x_minimize: bool = True,
     y_minimize: bool = True,
 ) -> list[tuple[int, float]]:
-    """按迭代顺序逐步计算超体积（统一转换到最小化空间）。"""
+    """按迭代顺序逐步计算超体积（统一转换到最小化空间）。
+
+    参考点在首次有 >=2 个可行样本时从当时的最差值推断并锁定，
+    后续所有迭代复用同一参考点，保证 HV 值单调可比。
+    （旧实现用全量点的 max*1.1 作为参考点，导致早期 HV 已接近最终值，曲线呈水平线。）
+    """
     feasible = sorted(
         [c for c in cases if c["feasible"]],
         key=lambda c: c["iteration"],
@@ -325,17 +400,36 @@ def _compute_hv_history(
             c["obj_y"] if y_minimize else -c["obj_y"],
         )
 
-    pts_min = [to_min(c) for c in feasible]
-    ref = (max(p[0] for p in pts_min) * 1.1,
-           max(p[1] for p in pts_min) * 1.1)
-
     history: list[tuple[int, float]] = []
     seen: list[dict] = []
+    fixed_ref: tuple[float, float] | None = None
+
     for c in feasible:
         seen.append(c)
+
+        # 参考点：在首次累计样本 >=2 时从当时的最差值锁定，之后不变
+        # 用 max + 0.1*(max-min) 而非 max*1.1，避免 maximize 目标取负后变负数
+        # 导致 max*1.1 更负、参考点比所有点还小、_hv2d 过滤掉全部点返回 0
+        if fixed_ref is None and len(seen) >= 2:
+            pts_so_far = [to_min(s) for s in seen]
+            xs = [p[0] for p in pts_so_far]
+            ys = [p[1] for p in pts_so_far]
+            margin = 0.1
+            span_x = max(xs) - min(xs)
+            span_y = max(ys) - min(ys)
+            ref_x = max(xs) + margin * (span_x if span_x > 0 else abs(max(xs)) + 1.0)
+            ref_y = max(ys) + margin * (span_y if span_y > 0 else abs(max(ys)) + 1.0)
+            fixed_ref = (ref_x, ref_y)
+
+        if fixed_ref is None:
+            # 样本不足 2 个，无法计算 HV
+            history.append((c["iteration"], 0.0))
+            continue
+
         front = _pareto_front(seen, x_minimize=x_minimize, y_minimize=y_minimize)
-        hv = _hv2d([to_min(p) for p in front], ref)
+        hv = _hv2d([to_min(p) for p in front], fixed_ref)
         history.append((c["iteration"], hv))
+
     return history
 
 
@@ -524,6 +618,12 @@ def generate_pareto_report(
         return
 
     plot_pareto_scatter(
+        cases, out_dir,
+        obj_x=data["obj_x"],      obj_y=data["obj_y"],
+        x_minimize=data["x_minimize"], y_minimize=data["y_minimize"],
+        x_unit=data["x_unit"],    y_unit=data["y_unit"],
+    )
+    plot_pareto_scatter_feasible_only(
         cases, out_dir,
         obj_x=data["obj_x"],      obj_y=data["obj_y"],
         x_minimize=data["x_minimize"], y_minimize=data["y_minimize"],

@@ -288,6 +288,15 @@ class SimulationRunner:
             all_warnings.extend(history_diagnostics)
             history_text = "Aspen history diagnostics: " + " | ".join(history_diagnostics)
             status_error = f"{status_error}\n{history_text}" if status_error else history_text
+            # 收敛知识库：对原始错误文本做模式匹配，追加结构化中文诊断建议
+            try:
+                from src.optimization.convergence_kb import match_failure_patterns
+                for _diag in match_failure_patterns(history_diagnostics, max_patterns=2):
+                    _kb_msg = f"[收敛KB] {_diag.description} → {_diag.fixes[0]}"
+                    all_warnings.append(_kb_msg)
+                    _log.warning("runner.run_case: %s", _kb_msg)
+            except Exception:
+                pass  # KB 匹配失败不影响主流程
 
         # 输入不一致时，将 SUCCESS 降级为 WARNINGS
         if input_warnings and overall_status == RunStatus.SUCCESS:

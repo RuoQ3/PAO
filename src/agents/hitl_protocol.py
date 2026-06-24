@@ -482,7 +482,6 @@ def _build_hitl_prompt(state_values: dict, next_node: str) -> "HitlPrompt":
             options=["confirm"],
             topology=state_values.get("process_topology") or {},
         )
-        )
 
     # ── deciding 阶段：展示 Pareto 分析，让用户决策 ─────────────────────────────
     db_path: str | None = state_values.get("db_path")

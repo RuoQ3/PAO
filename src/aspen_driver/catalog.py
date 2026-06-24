@@ -395,12 +395,12 @@ class CatalogScanner:
     def _get_block_type(self, block_root: str) -> str:
         """尝试从 HAP_RECORDTYPE 读取 block 类型，失败时返回 ""。"""
         try:
-            node = AspenNode(self._driver, block_root)
             hap = self._driver.hap_constants
             if hap is None:
                 return ""
-            com_node = node._raw_com_node()
-            rt = com_node.AttributeValue(hap.get("HAP_RECORDTYPE", -1))
+            attr_num = hap.get("HAP_RECORDTYPE", -1)
+            node = AspenNode(self._driver, block_root)
+            rt = node.get_attribute(attr_num)
             return str(rt) if rt else ""
         except Exception:
             return ""
