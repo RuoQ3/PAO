@@ -84,6 +84,28 @@ agent_loop:
 - skopt 模型用全局坐标学习历史，在当前软区域内对候选池计算采集函数。改变局部范围不会再导致旧观测因越界被拒绝。
 - 每个观测分别保存 `optimizer_inputs` 与真正的 Aspen 输入，恢复时不会丢掉 derived 的虚拟变量。
 
+## 确定性分析技能
+
+闭环每次构造决策快照时，`src.agents.closed_loop.analysis.build_analysis_report()` 会从当前
+`ProcessCase` 历史生成版本化的 `analysis_report`。分析代码不调用 LLM，也不连接 Aspen，
+因此恢复 checkpoint 或离线重放时可以得到同样的证据。报告包括：
+
+- `data_quality`、`convergence`：样本数、状态分布、近期收敛率和连续失败数；
+- `objectives`、`constraints`：目标趋势、最优工况、约束违反率、最大违反和裕量；
+- `pareto`、`metrics`：可行 Pareto 前沿、超体积、近期可行率和收敛率；
+- `sensitivity`、`failures`：变量敏感性排序、有效样本数、可靠性标记和失败模式。
+
+每个决策保存 `before_analysis`；动作完成后保存 `after_analysis` 与
+`analysis_effect`。后者只报告观察到的指标变化，并明确标记为相关性证据，不把一次动作
+自动解释成因果结论。敏感性结果在样本不足时会标记 `reliable: false`，主 Agent 不应将
+该分数当作经过验证的物理规律。
+
+通用 Agent 或离线审查还可以调用 `analyze_closed_loop_tool`：它从 SimulationDB 按会话、
+迭代范围或 tags 过滤历史工况，返回同一结构化 JSON，不需要 Aspen COM。该工具已经通过
+`get_agent_tools()` 和 `RealToolRunner.analyze_closed_loop()` 注册；它是数据分析工具，不是
+另一个自主决策 Agent。默认只把可行工况用于正式 Pareto，`include_infeasible=true` 仅用于
+约束松弛/可行域诊断。
+
 BoTorch 联合模型目前仍要求目标向量完整才能接收该条约束向量；仅有部分目标/约束的数据保留在证据中，但不会被伪造或补零用于联合训练。Aspen 未收敛的输出不进入目标回归模型。
 
 ## 知识和经验

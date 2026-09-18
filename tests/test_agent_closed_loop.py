@@ -4,13 +4,24 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.agents.closed_loop.analysis import (
+    build_analysis_report,
+    compare_analysis_reports,
+)
 from src.agents.closed_loop.contracts import ActionPlan, LoopConfig, validate_plan
 from src.agents.closed_loop.journal import SessionJournal
-from src.models.process_case import CaseStatus, ConstraintValue, ObjectiveValue, ProcessCase
+from src.models.process_case import (
+    CaseStatus,
+    ConstraintValue,
+    ObjectiveValue,
+    ProcessCase,
+)
 from src.models.simulation_result import RunStatus, SimulationResult
 from src.workflows.agent_optimize import optimize_agent_case
 from src.workflows.optimize_pareto_case import (
-    ParetoOptimizeCaseConfig, _extract_all_objectives, _extract_constraint_margins,
+    ParetoOptimizeCaseConfig,
+    _extract_all_objectives,
+    _extract_constraint_margins,
 )
 
 
@@ -256,8 +267,9 @@ def test_cli_dry_run_does_not_import_com_or_mutate_config(tmp_path):
 
 
 def test_search_region_is_independent_from_hard_bounds(tmp_path):
-    from src.utils.file_io import load_optimize_config
     import yaml
+
+    from src.utils.file_io import load_optimize_config
     raw = yaml.safe_load(Path("cases/demo_case_2/pareto_config_epsd_aligned.yaml").read_text())
     raw["search_region"] = {"T1_RR": [0.7, 1.0]}
     file = tmp_path / "config.yaml"
@@ -266,3 +278,76 @@ def test_search_region_is_independent_from_hard_bounds(tmp_path):
     path = next(p for p in cfg.param_bounds if "T1" in p and "BASIS_RR" in p)
     assert cfg.param_bounds[path] == (0.416, 2.08)
     assert cfg.search_region[path] == (0.7, 1.0)
+
+
+def test_analysis_report_contains_structured_evidence_and_reliability():
+    cases = [evaluation(None, {"x": x}, None, i, []) for i, x in enumerate((0.4, 0.5, 0.6, 0.9))]
+    report = build_analysis_report(
+        cases,
+        objective_names=["cost", "energy"],
+        param_paths=["x"],
+        optimizer_inputs=[case.design_vars for case in cases],
+        recent_window=3,
+    )
+
+    assert report["report_version"] == 1
+    assert report["data_quality"]["n_total"] == 4
+    assert report["data_quality"]["n_recent"] == 3
+    assert report["metrics"]["feasible_rate"] < 1.0
+    assert report["pareto"]["front_size"] >= 1
+    assert report["constraints"]["quality"]["violation_rate"] > 0
+    sensitivity = report["sensitivity"]
+    assert sensitivity["available"]
+    assert sensitivity["ranked_variables"][0]["path"] == "x"
+    assert sensitivity["ranked_variables"][0]["reliable"]
+
+
+def test_analysis_report_marks_insufficient_sensitivity_evidence():
+    cases = [evaluation(None, {"x": 0.5}, None, 0, [])]
+    report = build_analysis_report(
+        cases,
+        objective_names=["cost", "energy"],
+        param_paths=["x"],
+        optimizer_inputs=[{"x": 0.5}],
+    )
+    assert not report["data_quality"]["sufficient_for_sensitivity"]
+    assert report["sensitivity"]["available"]
+    assert not report["sensitivity"]["ranked_variables"][0]["reliable"]
+    assert report["sensitivity"]["warnings"]
+
+
+def test_action_effect_comparison_is_explicitly_non_causal():
+    cases_before = [evaluation(None, {"x": 0.4}, None, 0, [])]
+    cases_after = cases_before + [evaluation(None, {"x": 0.5}, None, 1, [])]
+    before = build_analysis_report(
+        cases_before,
+        objective_names=["cost", "energy"],
+        param_paths=["x"],
+        optimizer_inputs=[{"x": 0.4}],
+    )
+    after = build_analysis_report(
+        cases_after,
+        objective_names=["cost", "energy"],
+        param_paths=["x"],
+        optimizer_inputs=[{"x": 0.4}, {"x": 0.5}],
+    )
+    effect = compare_analysis_reports(before, after, expected_effect="feasibility")
+    assert "feasible_rate_delta" in effect
+    assert effect["interpretation"].startswith("Observed association")
+
+
+def test_closed_loop_persists_analysis_before_and_after_action(tmp_path):
+    agent = ScriptedAgent()
+    state = run(tmp_path, agent=agent)
+    assert agent.snapshots[0]["analysis_report"]["report_version"] == 1
+    decision = state["decisions"][0]
+    assert decision["before_analysis"]["data_quality"]["n_total"] == 0
+    assert "after_analysis" in decision["outcome"]
+    assert "analysis_effect" in decision["outcome"]
+    assert decision["outcome"]["analysis_effect"]["interpretation"].startswith(
+        "Observed association"
+    )
+
+    with SessionJournal(tmp_path / "checkpoint.db") as journal:
+        payload = journal.load()
+    assert payload["decisions"][0]["before_analysis"]["report_version"] == 1
