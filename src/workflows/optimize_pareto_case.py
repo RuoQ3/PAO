@@ -50,7 +50,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from ..aspen_driver.driver import AspenDriver
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
 from ..optimization.feasibility import FeasibilityClassifier, FeasibilityConfig
@@ -226,6 +229,14 @@ class ParetoOptimizeCaseConfig:
     boundary_refine: Any = None
     # 每隔多少轮 BO 触发一次 boundary_refine 重估,默认 20
     boundary_refine_interval: int = 20
+    # Agent loop is opt-in; hard param_bounds are never rewritten by its decisions.
+    search_region: dict[str, tuple[float, float]] = field(default_factory=dict)
+    agent_loop: dict[str, Any] = field(default_factory=dict)
+    agent_context: dict[str, Any] = field(default_factory=dict)
+    agent_knowledge: list[dict[str, Any]] = field(default_factory=list)
+    agent_checkpoint_path: str | None = None
+    agent_resume: bool = False
+    agent_llm_config: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +372,10 @@ def optimize_pareto_case(
     -------
     ParetoOptimizeResult
     """
+    if config.agent_loop.get("enabled", False):
+        from .agent_entry import run_configured_agent
+        return run_configured_agent(driver, config)
+
     _validate_config(config)
 
     paths = list(config.param_bounds.keys())
@@ -722,9 +737,9 @@ def optimize_pareto_case(
         optimizer = _MultiObjectiveBayesianOptimizer(bounds, config, paths)
 
         for c, x in zip(cases, case_xs):
-            y_vec = _extract_all_objectives(c, config)
+            y_vec = _extract_all_objectives(c, config, allow_infeasible=True)
             _tell_optimizer(
-                optimizer, x, y_vec, is_success=y_vec is not None,
+                optimizer, x, y_vec, is_success=c.success and y_vec is not None,
                 c_vec=_extract_constraint_margins(c),
             )
 
@@ -734,9 +749,9 @@ def optimize_pareto_case(
             x = [c.design_vars.get(p) for p in paths]
             if None in x:
                 continue
-            y_vec = _extract_all_objectives(c, config)
+            y_vec = _extract_all_objectives(c, config, allow_infeasible=True)
             _tell_optimizer(
-                optimizer, x, y_vec, is_success=y_vec is not None,
+                optimizer, x, y_vec, is_success=c.success and y_vec is not None,
                 c_vec=_extract_constraint_margins(c),
             )
             n_warm += 1
@@ -1081,9 +1096,9 @@ def optimize_pareto_case(
             _save_case(db, case, config.session_id)
             _fire_callback(config.on_case_complete, case, idx, n_total)
 
-            y_vec = _extract_all_objectives(case, config)
+            y_vec = _extract_all_objectives(case, config, allow_infeasible=True)
             _tell_optimizer(
-                optimizer, x_eval, y_vec, is_success=y_vec is not None,
+                optimizer, x_eval, y_vec, is_success=case.success and y_vec is not None,
                 c_vec=_extract_constraint_margins(case),
             )
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
@@ -1774,7 +1789,7 @@ class _MultiObjectiveBayesianOptimizer:
         if self._botorch_opt is not None:
             self._botorch_opt._effective_bounds = None
 
-        if len(self._observations) < self._n_initial_min:
+        if self._botorch_opt is None and len(self._observations) < self._n_initial_min:
             return [lo + self._rng.random() * (hi - lo) for lo, hi in active_bounds]
 
         # BoTorch 路径：qEHVI/qNEHVI
@@ -1804,15 +1819,15 @@ class _MultiObjectiveBayesianOptimizer:
                 n_initial_min=0,
                 random_seed=self._rng.randint(0, 2 ** 31),
             )
-            opt = make_surrogate_optimizer(active_bounds, surrogate_cfg, self._integer_indices)
+            opt = make_surrogate_optimizer(self._bounds, surrogate_cfg, self._integer_indices)
             for (x, _), s in zip(self._observations, scalarized):
                 opt.tell(x, s, is_success=True)
             for x in self._failed_xs:
                 opt.tell(x, penalty, is_success=False)
-            return opt.ask()
+            return opt.ask(active_bounds=active_bounds)
         except Exception as exc:
             _log.warning("代理模型多目标优化失败，回退到随机采样：%s", exc)
-            return [lo + self._rng.random() * (hi - lo) for lo, hi in self._bounds]
+            return [lo + self._rng.random() * (hi - lo) for lo, hi in active_bounds]
 
 
 # ---------------------------------------------------------------------------
@@ -1822,13 +1837,15 @@ class _MultiObjectiveBayesianOptimizer:
 def _extract_all_objectives(
     case: ProcessCase,
     config: ParetoOptimizeCaseConfig,
+    *, allow_infeasible: bool = False,
 ) -> list[float] | None:
     """
     从 ProcessCase 提取所有目标值（统一转为最小化方向）。
 
     任意目标不可用、或值为 NaN/Inf 时返回 None，不参与代理模型拟合。
     """
-    if not case.success:
+    # Training may use converged constraint violations; Pareto/statistics remain feasible-only.
+    if not (case.simulation_valid if allow_infeasible else case.success):
         return None
     result: list[float] = []
     for name in config.objective_names:
@@ -1861,6 +1878,8 @@ def _extract_constraint_margins(case: "ProcessCase") -> "dict[str, float] | None
     for c in case.constraints:
         if not c.available or c.value is None:
             return None  # 任意约束不可用则放弃整个点
+        if not math.isfinite(float(c.value)):
+            return None
         margins[c.name] = -c.value  # value = threshold - actual → margin = -value
     return margins if margins else None
 

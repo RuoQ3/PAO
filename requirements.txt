@@ -67,3 +67,7 @@ typing_extensions==4.15.0
 # 2. scikit-optimize 为可选降级：若未安装，代码自动回退到随机采样
 # 3. numpy 为可选加速：若未安装，LHS 采样回退到随机网格
 # 4. 安装命令：pip install -r requirements.txt
+
+# Agent orchestration (already used by graph.py and tool adapters)
+langgraph>=0.2,<2
+langchain-core>=0.3,<2

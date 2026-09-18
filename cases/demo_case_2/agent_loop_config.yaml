@@ -1,0 +1,343 @@
+# Agent 闭环示例：由 pareto_config_epsd_aligned.yaml 派生，原约束/目标/硬边界保持不变。
+# 40 次总预算包含最终复验；未指定目标阈值时按预算/停滞停止，不宣称达到指定目标。
+# 首次运行前可使用 --dry-run；中断后使用 --resume。
+simulator:
+  filepath: cases/demo_case_2/2epsd.bkp
+  visible: false
+  suppress_dialogs: true
+  require_type_library: true
+  timeout: 300
+  reinit: true
+  verify_inputs: true
+  input_rtol: 1.0e-06
+design_variables:
+- name: T1_NSTAGE
+  description: T1 理论板数（boundary_advisor 锚定初值 50,真空塔板数较迟钝）
+  aspen_path: \Data\Blocks\T1\Input\NSTAGE
+  type: integer
+  lower_bound: 17
+  upper_bound: 150
+  initial_value: 50
+  unit: '-'
+- name: T1_RR
+  description: T1 回流比（boundary_advisor 锚定初值 0.832,低回流比敏感）
+  aspen_path: \Data\Blocks\T1\Input\BASIS_RR
+  type: continuous
+  lower_bound: 0.416
+  upper_bound: 2.08
+  initial_value: 0.832
+  unit: '-'
+- name: T1_FEED_F1_FRAC
+  description: T1 主进料 F1 归一化位置（range [0,1]，映射为 FEED_STAGE\F1）
+  type: derived
+  lo_frac: 0.5335
+  hi_frac: 0.5535
+  initial_value: 0.5435
+  target_path: \Data\Blocks\T1\Input\FEED_STAGE\F1
+  depends_on: \Data\Blocks\T1\Input\NSTAGE
+  frac_lo: 3
+  unit: '-'
+- name: T1_FEED_S1_FRAC
+  description: T1 萃取剂 S1 归一化进料位置（range [0,1]，映射为 FEED_STAGE\S1）
+  type: derived
+  lo_frac: 0
+  hi_frac: 8.03431e-06
+  initial_value: 0.0
+  target_path: \Data\Blocks\T1\Input\FEED_STAGE\S1
+  depends_on: \Data\Blocks\T1\Input\NSTAGE
+  frac_lo: 3
+  unit: '-'
+- name: T2_NSTAGE
+  description: T2 理论板数（boundary_advisor 锚定初值 118）
+  aspen_path: \Data\Blocks\T2\Input\NSTAGE
+  type: integer
+  lower_bound: 39
+  upper_bound: 200
+  initial_value: 118
+  unit: '-'
+- name: T2_RR
+  description: T2 回流比（boundary_advisor 锚定初值 0.23,极低回流比高敏感）
+  aspen_path: \Data\Blocks\T2\Input\BASIS_RR
+  type: continuous
+  lower_bound: 0.229563
+  upper_bound: 0.230437
+  initial_value: 0.23
+  unit: '-'
+- name: T2_FEED_F2_FRAC
+  description: T2 主进料 F2 归一化位置（range [0,1]，映射为 FEED_STAGE\F2）
+  type: derived
+  lo_frac: 0.919608
+  hi_frac: 0.922592
+  initial_value: 0.9211
+  target_path: \Data\Blocks\T2\Input\FEED_STAGE\F2
+  depends_on: \Data\Blocks\T2\Input\NSTAGE
+  frac_lo: 3
+  unit: '-'
+- name: T2_FEED_S2_FRAC
+  description: T2 萃取剂 S2 归一化进料位置（range [0,1]，映射为 FEED_STAGE\S2）
+  type: derived
+  lo_frac: 0.0271219
+  hi_frac: 0.0430781
+  initial_value: 0.0351
+  target_path: \Data\Blocks\T2\Input\FEED_STAGE\S2
+  depends_on: \Data\Blocks\T2\Input\NSTAGE
+  frac_lo: 3
+  unit: '-'
+- name: T3_NSTAGE
+  description: T3 理论板数（boundary_advisor 锚定初值 14）
+  aspen_path: \Data\Blocks\T3\Input\NSTAGE
+  type: integer
+  lower_bound: 6
+  upper_bound: 35
+  initial_value: 14
+  unit: '-'
+- name: T3_RR
+  description: T3 回流比（boundary_advisor 锚定初值 1.769）
+  aspen_path: \Data\Blocks\T3\Input\BASIS_RR
+  type: continuous
+  lower_bound: 0.8845
+  upper_bound: 4.4225
+  initial_value: 1.769
+  unit: '-'
+- name: T3_FEED_F3_FRAC
+  description: T3 主进料 F3 归一化位置（range [0,1]，映射为 FEED_STAGE\F3）
+  type: derived
+  lo_frac: 0.285
+  hi_frac: 0.315
+  initial_value: 0.3
+  target_path: \Data\Blocks\T3\Input\FEED_STAGE\F3
+  depends_on: \Data\Blocks\T3\Input\NSTAGE
+  frac_lo: 3
+  unit: '-'
+- name: SOL1_FLOW
+  description: 萃取剂 S1 总摩尔流量（锚定初值 69 kmol/hr,杠杆变量,收窄范围）
+  aspen_path: \Data\Streams\S1\Input\TOTFLOW\MIXED
+  type: integer
+  lower_bound: 35
+  upper_bound: 138
+  initial_value: 69
+  unit: kmol/hr
+- name: SOL2_FLOW
+  description: 萃取剂 S2 总摩尔流量（锚定初值 231 kmol/hr,杠杆变量,收窄范围）
+  aspen_path: \Data\Streams\S2\Input\TOTFLOW\MIXED
+  type: integer
+  lower_bound: 116
+  upper_bound: 462
+  initial_value: 231
+  unit: kmol/hr
+- name: T1_PRES
+  description: T1 塔顶操作压力（真空操作,锚定初值 0.0576 atm）
+  aspen_path: \Data\Blocks\T1\Input\PRES1
+  type: continuous
+  lower_bound: 0.055872
+  upper_bound: 0.059328
+  initial_value: 0.0576
+  unit: atm
+- name: T2_PRES
+  description: T2 塔顶操作压力（真空操作,锚定初值 0.183 atm）
+  aspen_path: \Data\Blocks\T2\Input\PRES1
+  type: continuous
+  lower_bound: 0.17751
+  upper_bound: 0.18849
+  initial_value: 0.183
+  unit: atm
+- name: T3_PRES
+  description: T3 塔顶操作压力（真空操作,锚定初值 0.0598 atm）
+  aspen_path: \Data\Blocks\T3\Input\PRES1
+  type: continuous
+  lower_bound: 0.058006
+  upper_bound: 0.061594
+  initial_value: 0.0598
+  unit: atm
+output_paths:
+- \Data\Streams\D1\Output\MOLEFRAC\MIXED\PF
+- \Data\Streams\D2\Output\MOLEFRAC\MIXED\NPA
+- \Data\Streams\D3\Output\MOLEFRAC\MIXED\WATER
+- \Data\Blocks\T1\Output\REB_DUTY
+- \Data\Blocks\T2\Output\REB_DUTY
+- \Data\Blocks\T3\Output\REB_DUTY
+- \Data\Blocks\T1\Output\COND_DUTY
+- \Data\Blocks\T1\Output\TOP_TEMP
+- \Data\Blocks\T1\Output\BOTTOM_TEMP
+- \Data\Blocks\T1\Input\NSTAGE
+- \Data\Blocks\T1\Input\PRES1
+- \Data\Blocks\T1\Output\CA_DIAM6
+- \Data\Blocks\T2\Output\COND_DUTY
+- \Data\Blocks\T2\Output\TOP_TEMP
+- \Data\Blocks\T2\Output\BOTTOM_TEMP
+- \Data\Blocks\T2\Input\NSTAGE
+- \Data\Blocks\T2\Input\PRES1
+- \Data\Blocks\T2\Output\CA_DIAM6
+- \Data\Blocks\T3\Output\COND_DUTY
+- \Data\Blocks\T3\Output\TOP_TEMP
+- \Data\Blocks\T3\Output\BOTTOM_TEMP
+- \Data\Blocks\T3\Input\NSTAGE
+- \Data\Blocks\T3\Input\PRES1
+- \Data\Blocks\T3\Output\CA_DIAM6
+- \Data\Blocks\H\Output\QCALC
+- \Data\Streams\W3\Output\TEMP_OUT\MIXED
+objectives:
+- name: CAPEX
+  type: custom_module
+  module: cases/demo_case_2/epsd_objectives.py
+  function: make_epsd_capex_objective
+  minimize: true
+  unit: tonne/yr
+- name: OPEX
+  type: custom_module
+  module: cases/demo_case_2/epsd_objectives.py
+  function: make_epsd_opex_objective
+  minimize: true
+  unit: RMB/yr
+constraints:
+- name: D1_PF_purity
+  description: D1 塔顶产品 PF 摩尔分率 >= 0.999（Aspen 组分名 PF，MATLAB 称 PROH）
+  aspen_path: \Data\Streams\D1\Output\MOLEFRAC\MIXED\PF
+  operator: '>='
+  threshold: 0.999
+- name: D2_NPA_purity
+  description: D2 塔顶产品 NPA 摩尔分率 >= 0.999（Aspen 组分名 NPA，MATLAB 称 BUAC）
+  aspen_path: \Data\Streams\D2\Output\MOLEFRAC\MIXED\NPA
+  operator: '>='
+  threshold: 0.999
+- name: D3_WATER_purity
+  description: D3 塔顶产品 WATER 摩尔分率 >= 0.999
+  aspen_path: \Data\Streams\D3\Output\MOLEFRAC\MIXED\WATER
+  operator: '>='
+  threshold: 0.999
+extraction:
+  check_status_paths:
+  - \Data\Blocks\T1
+  - \Data\Blocks\T2
+  - \Data\Blocks\T3
+  - \Data\Streams\D1
+  - \Data\Streams\D2
+  - \Data\Streams\D3
+  blocks:
+  - T1
+  - T2
+  - T3
+  streams:
+  - D1
+  - D2
+  - D3
+  block_max_depth: 2
+  stream_max_depth: 3
+  stream_output_subtree: Output\STR_MAIN
+  strict_extraction: false
+  mode: manifest
+  catalog_db: cases/demo_case_2/output/node.db
+  manifest_id: auto
+  semantic_rules_dir: configs/aspen_semantics
+  build_manifest_if_missing: true
+  write_node_values: true
+  strict_manifest: false
+optimizer:
+  type: pareto_bayesian
+  n_initial_points: 60
+  n_iterations: 40
+  surrogate_model: qEHVI
+  scalarization: chebyshev
+  acquisition_function: EI
+  random_seed: 42
+  n_initial_min: 5
+  hv_margin: 0.1
+  trust_region:
+    enabled: true
+    initial_radius: 0.4
+    min_radius: 0.05
+    max_radius: 1.0
+    gamma_expand: 1.5
+    gamma_shrink: 0.7
+    eta_success: 0.05
+    failure_tolerance: 5
+  feasibility_filter:
+    enabled: true
+    model: extra_trees
+    min_samples: 50
+    threshold: 0.3
+    candidate_pool_size: 500
+    random_seed: 42
+  early_stopping:
+    enabled: true
+    min_iterations: 80
+    patience: 15
+    min_delta: 1.0e-06
+    relative_delta: 0.0001
+    max_duplicate_suggestions: 3
+    check_hypervolume: true
+    check_first_front: true
+  n_initial: 5
+feasibility_evaluation:
+  test_size: 0.25
+  random_seed: 42
+  threshold: 0.3
+  min_samples: 50
+  model: extra_trees
+feasibility_gate:
+  enabled: true
+  min_samples: 50
+  min_recall: 0.9
+  max_false_negative_rate: 0.08
+  max_false_negative_count: 2
+  min_precision: null
+  min_f1: null
+  require_no_warnings: false
+  allow_single_class: false
+var_dependencies:
+  \Data\Blocks\T1\Input\FEED_STAGE\S1:
+    lt: \Data\Blocks\T1\Input\NSTAGE
+  \Data\Blocks\T2\Input\FEED_STAGE\S2:
+    lt: \Data\Blocks\T2\Input\NSTAGE
+preflight:
+  enabled: true
+  max_deviation_factor: 5.0
+  check_var_dependencies: true
+  cost_proxy_groups:
+  - name: T1_cost
+    var_paths:
+    - \Data\Blocks\T1\Input\NSTAGE
+    - \Data\Blocks\T1\Input\BASIS_RR
+    max_ratio: 4.0
+  - name: T2_cost
+    var_paths:
+    - \Data\Blocks\T2\Input\NSTAGE
+    - \Data\Blocks\T2\Input\BASIS_RR
+    max_ratio: 4.0
+  - name: T3_cost
+    var_paths:
+    - \Data\Blocks\T3\Input\NSTAGE
+    - \Data\Blocks\T3\Input\BASIS_RR
+    max_ratio: 4.0
+agent_loop:
+  enabled: true
+  max_evaluations: 40
+  batch_size: 5
+  failure_trigger: 3
+  max_decisions: 12
+  max_step_fraction: 0.1
+  verification_repeats: 1
+  verification_rtol: 0.02
+  checkpoint_path: output/agent_epsd.db
+  objective_targets: {}
+  process_facts:
+    case: demo_case_2 / 2epsd.bkp
+    equipment:
+    - T1
+    - T2
+    - T3
+    objective_meanings:
+      CAPEX: 沿用原配置命名：年排放指标，tonne/yr
+      OPEX: 沿用原配置命名：年化经济指标，RMB/yr
+    product_constraints: 沿用源配置三个产品纯度 >= 0.999；Agent 不得放宽
+    boundary_provenance: 硬边界完整继承 pareto_config_epsd_aligned.yaml；不是重新认证的设备极限
+    unknown_facts:
+    - 物性方法及其适用性需结合实际模型确认
+    - 设备实际允许的更宽边界尚未提供
+search_region:
+  T1_RR:
+  - 0.7
+  - 1.0
+  T1_NSTAGE:
+  - 40
+  - 60

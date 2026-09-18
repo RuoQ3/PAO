@@ -85,8 +85,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-file", default=None, metavar="PATH",
                         help="日志文件路径（默认：与数据库同目录的 run.log）")
     parser.add_argument("--dry-run",  action="store_true", help="只打印配置摘要，不运行仿真")
+    parser.add_argument("--checkpoint", default=None, help="Agent 闭环 checkpoint 数据库路径")
+    parser.add_argument("--resume", action="store_true", help="恢复同配置的 Agent 闭环")
     parser.add_argument("--agent",    action="store_true",
-                        help="启用 AI Agent 协作模式（LLM 扫描变量 + 终端 HITL 交互）")
+                        help="启用自主实验闭环（YAML）；裸 Aspen 文件仍走接入向导")
     parser.add_argument("--intent",   default="",
                         help="优化意图自然语言描述（--agent 模式使用；传入 Aspen 文件时"
                              "作为 Coordinator 的自由文本请求，决定路由到哪个子 agent）")
@@ -251,139 +253,24 @@ def _run_agent_mode(
     driver_kwargs: dict,
     db_path: Path,
 ) -> int:
-    """
-    终端版 Agent 协作模式。
-
-    流程
-    ----
-    1. 从 YAML 读取已有设计变量（16 个，不扫描 Aspen 全量节点）
-    2. 调用 boundary_advisor（LLM）为每个变量推荐搜索边界
-    3. 终端展示推荐报告，询问是否写回 YAML
-    4. 写回 YAML 后自动运行 Pareto 优化
-    5. 打印优化结果摘要
-
-    完全复用 run_boundary_advisor.py 的逻辑，加上第 4/5 步的优化触发。
-    """
-    from src.agents.boundary_advisor import recommend_boundaries_agent, format_boundary_report
-    from src.agents.boundary_advisor.tools import plan_yaml_edits, apply_yaml_edits
-
-    # ── 1. 读取变量 ──────────────────────────────────────────────────────────
-    _sep()
-    print("🤖  PAO Agent 模式")
-    print(f"    配置文件：{yaml_path}")
-    print(f"    优化意图：{intent_text or '（未指定，LLM 自动判断工艺类型）'}")
-    _sep()
-
-    variables, var_types, integer_names = _load_var_metas(yaml_path)
-    if not variables:
-        log.error("未从 design_variables 读到任何变量，请检查 YAML 配置。")
+    """YAML Agent entry: bounded autonomous loop, using the same optimizer tool path."""
+    from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig, optimize_pareto_case
+    if not isinstance(opt_cfg, ParetoOptimizeCaseConfig):
+        log.error("Agent 闭环需要 optimizer.type: pareto_bayesian")
         return 1
-    print(f"\n已从 YAML 读取 {len(variables)} 个设计变量，正在调用 boundary_advisor 推荐搜索边界…\n")
-
-    # ── 2. 调用 boundary_advisor ─────────────────────────────────────────────
-    try:
-        report = recommend_boundaries_agent(variables, context=intent_text)
-    except Exception as exc:
-        log.error("boundary_advisor 调用失败：%s", exc, exc_info=True)
-        return 1
-
-    # ── 3. 展示报告 ──────────────────────────────────────────────────────────
-    _sep()
-    print("【boundary_advisor 推荐报告】")
-    _sep()
-    print(format_boundary_report(report))
-
-    # 规划写回改动
-    yaml_text = yaml_path.read_text(encoding="utf-8")
-    bounds_by_name = {r.name: (r.lower, r.upper) for r in report.recommendations}
-    edits = plan_yaml_edits(yaml_text, bounds_by_name, var_types, integer_names)
-
-    _sep()
-    print("将要写回 YAML 的边界改动：")
-    _sep()
-    any_change = False
-    for e in edits:
-        loc_lo = f"L{e.line_lo}" if e.line_lo else "未找到"
-        loc_hi = f"L{e.line_hi}" if e.line_hi else "未找到"
-        print(f"  {e.name}")
-        print(f"    {e.field_lo}: {e.old_lo} -> {e.new_lo}  ({loc_lo})")
-        print(f"    {e.field_hi}: {e.old_hi} -> {e.new_hi}  ({loc_hi})")
-        if e.line_lo or e.line_hi:
-            any_change = True
-
-    if not any_change:
-        print("\n⚠ 未找到任何可写回的边界行（YAML 中未定义 lower_bound/upper_bound 字段）。")
-        print("  将使用 YAML 中的原有边界直接运行优化。")
-    else:
-        # ── 询问是否写回 ──────────────────────────────────────────────────────
-        try:
-            ans = input("\n确认将推荐边界写回 YAML 并启动优化？(y/N): ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
-
-        if ans in ("y", "yes"):
-            backup = yaml_path.with_suffix(yaml_path.suffix + ".bak")
-            backup.write_text(yaml_text, encoding="utf-8")
-            new_text, skipped = apply_yaml_edits(yaml_text, edits)
-            yaml_path.write_text(new_text, encoding="utf-8")
-            print(f"\n✅ 边界已写回：{yaml_path.name}")
-            print(f"   原文件已备份：{backup.name}")
-            if skipped:
-                print(f"   跳过（未找到对应行）：{skipped}")
-
-            # 重新加载配置（边界已更新），并补回 db_path
-            from src.utils.file_io import load_optimize_config
-            try:
-                opt_cfg, sim_filepath, driver_kwargs = load_optimize_config(str(yaml_path))
-                opt_cfg.db_path = db_path
-            except Exception as exc:
-                log.error("重新加载配置失败：%s", exc)
-                return 1
-        else:
-            print("  已取消写回，使用 YAML 原有边界直接运行优化。")
-
-    # ── 4. 询问是否启动优化 ──────────────────────────────────────────────────
-    try:
-        ans2 = input("\n是否立即启动 Pareto 优化？(Y/n): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        ans2 = "y"
-
-    if ans2 in ("n", "no"):
-        print("已跳过优化，程序退出。")
-        return 0
-
-    # ── 5. 运行 Pareto 优化 ──────────────────────────────────────────────────
-    _sep()
-    print("🚀 开始运行 Pareto 贝叶斯优化…")
-    _sep()
-
+    opt_cfg.agent_loop = {**opt_cfg.agent_loop, "enabled": True}
+    if intent_text:
+        opt_cfg.agent_context["intent"] = intent_text
     from src.aspen_driver.driver import AspenDriver
-    from src.workflows.optimize_pareto_case import optimize_pareto_case
-
-    log.info("正在连接 Aspen Plus 并打开仿真文件……")
     try:
         with AspenDriver(**driver_kwargs) as driver:
             driver.open(sim_filepath)
-            log.info("仿真文件已打开，开始多目标贝叶斯优化……")
             result = optimize_pareto_case(driver, opt_cfg)
     except Exception as exc:
-        log.error("优化运行失败：%s", exc, exc_info=True)
+        log.error("Agent 闭环失败：%s", exc, exc_info=True)
         return 1
-
-    # ── 6. 打印结果摘要 ──────────────────────────────────────────────────────
-    _print_pareto_summary(log, result, opt_cfg.db_path)
-
-    # ── 7. 生成可视化图表 ─────────────────────────────────────────────────────
-    try:
-        from src.reporting.plot_pareto import generate_pareto_report
-        generate_pareto_report(
-            opt_cfg.db_path,
-            out_dir=opt_cfg.db_path.parent,
-            session_id=getattr(result, "session_id", None),
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("可视化报告生成失败（不影响结果）：%s", exc)
-
+    _print_pareto_summary(log, result, db_path)
+    log.info("闭环状态：%s", result.early_stop_reason)
     return 0
 
 
@@ -563,6 +450,9 @@ def main(argv: list[str] | None = None) -> int:
     # 识别要处理的场景（用户还没有配置，需要先接入/拟合/推荐边界）。
     config_path = Path(args.config)
     if args.agent and config_path.suffix.lower() in (".bkp", ".apw"):
+        if args.dry_run:
+            log.info("--dry-run 不执行接入向导；闭环配置校验请传 YAML。")
+            return 0
         if args.chat:
             return _run_coordinator_chat_loop(
                 aspen_file=config_path.resolve(),
@@ -590,6 +480,25 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     opt_cfg.db_path = db_path
+    if hasattr(opt_cfg, "agent_loop"):
+        if args.checkpoint:
+            opt_cfg.agent_checkpoint_path = str(Path(args.checkpoint).resolve())
+        opt_cfg.agent_resume = args.resume or opt_cfg.agent_resume
+        if args.agent:
+            opt_cfg.agent_loop["enabled"] = True
+        if opt_cfg.agent_loop.get("enabled"):
+            from src.workflows.agent_entry import validate_agent_config
+            try:
+                validate_agent_config(opt_cfg)
+            except (ValueError, TypeError) as exc:
+                log.error("Agent 配置错误：%s", exc)
+                return 1
+    if args.resume and not getattr(opt_cfg, "agent_loop", {}).get("enabled"):
+        log.error("--resume 仅支持 Agent 闭环")
+        return 1
+    if args.dry_run:
+        log.info("配置有效；--dry-run 不连接 Aspen、不调用 LLM、不写回 YAML。")
+        return 0
 
     # ── Agent 协作模式：boundary_advisor 推荐边界 → 写回 YAML → 跑优化 ────────
     if args.agent:

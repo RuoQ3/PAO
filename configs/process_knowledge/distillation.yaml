@@ -1,0 +1,38 @@
+version: 1
+rules:
+  - id: distinguish_convergence_and_quality
+    applies_when: "所有流程；有求解状态和产品约束结果时"
+    guidance: "先区分求解失败、目标读取失败与产品不达标。收敛但不达标的可信数据应保留用于约束学习；不达标不等于数值不收敛。"
+    source: "PAO src/models/process_case.py 的状态定义；项目实验规则"
+  - id: controlled_distillation_probe
+    applies_when: "已经确认设备为精馏塔，并有可复现的收敛基准点"
+    guidance: "将回流比、压力、塔板数和进料位置分组做小步实验。一次改变多组变量时不可仅凭相关性断定失败原因；方向性假设须用实际结果检验。"
+    source: "项目受控实验规则；须结合具体体系和 Aspen 模型验证"
+  - id: stage_dependencies
+    applies_when: "设计变量含理论板数和进料板位置或归一化进料位置"
+    guidance: "遵守配置中的整数和依赖约束。检查实际映射后的进料板是否变化；多个 frac 值映射到同一板时不要误认为获得了新实验。"
+    source: "PAO src/workflows/common.py apply_derived_vars"
+  - id: numerical_initialization_probe
+    applies_when: "存在可靠的收敛基准，且失败诊断提示初始化或循环收敛问题"
+    guidance: "可比较 reset 与 previous 初始化；previous 依赖真实当前仿真状态。跨进程恢复后先 reset；初始化改变也属于实验条件，必须记录并计入预算。"
+    source: "PAO src/aspen_driver/runner.py 初始化接口；项目诊断规则"
+  - id: preserve_problem_definition
+    applies_when: "所有优化轮次"
+    guidance: "不能通过降低产品纯度要求、修改反应动力学或物性模型来宣称达到原目标。搜索区允许在工程硬边界内调整，工程边界不能从经验猜测自动扩大。"
+    source: "项目优化问题不变性约定"
+  - id: verify_candidate
+    applies_when: "达到目标、预算耗尽或前沿停滞后存在可行工况"
+    guidance: "保留独立预算，从 reset 初始化复验一个代表工况；同时检查约束和目标重复性。单个工况复验不证明全局最优，也不验证整个前沿。"
+    source: "项目结果验收规则"
+  - id: steady_mass_balance
+    applies_when: "稳态流程；已知完整的边界进出物流质量流率，单位和基准一致"
+    guidance: "核查总进料与总出料质量流率之差，并按配置的容差评估。组分摩尔守恒只适用于无反应对应组分；存在反应时先使用总质量与元素衡算。不要把缺少物流数据当作守恒成立。"
+    source: "稳态质量与元素守恒关系；数值必须来自当前 Aspen 工况"
+  - id: distillation_energy_quality_tradeoff
+    applies_when: "已确认是精馏过程，且不同实验的进料、压力及其他规格具有可比性"
+    guidance: "联合检查产品组成、回收率和再沸器/冷凝器负荷。回流比与理论级数的改变涉及分离与能耗的权衡；当前体系是否单调改善必须由小步实验验证，不能跨物性模型或进料条件直接迁移结论。"
+    source: "精馏物料与能量衡算的实验解释规则；具体趋势需当前模型验证"
+  - id: kinetic_parameters_are_model_parameters
+    applies_when: "优化变量涉及反应活化能或指前因子"
+    guidance: "区分模型标定参数与可操纵运行变量。没有新的实验标定依据时，不得为了改善优化结果改变活化能或指前因子；应在独立标定任务中处理并建立新模型版本。"
+    source: "PAO 模型参数与操作参数分离约定"

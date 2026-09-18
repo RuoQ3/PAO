@@ -105,6 +105,7 @@ class SurrogateOptimizer:
         integer_indices: set[int] | None = None,
     ) -> None:
         self._bounds = bounds
+        self._config = config
         self._integer_indices: set[int] = integer_indices or set()
         self._n_initial_min = config.n_initial_min
         self._rng = _random.Random(config.random_seed)
@@ -188,7 +189,7 @@ class SurrogateOptimizer:
             except Exception as exc:
                 _log.warning("skopt.tell() 失败（已忽略）：%s", exc)
 
-    def ask(self) -> list[float]:
+    def ask(self, active_bounds: list[tuple[float, float]] | None = None) -> list[float]:
         """
         推荐下一个候选点。
 
@@ -201,16 +202,30 @@ class SurrogateOptimizer:
             and self._n_success >= self._n_initial_min
         ):
             try:
+                if active_bounds is not None:
+                    # Train in immutable global coordinates; score only local candidates.
+                    # Creating a new skopt space from local bounds rejects older observations.
+                    from skopt.acquisition import gaussian_ei, gaussian_pi, gaussian_lcb
+                    pool = [self._random_point(active_bounds) for _ in range(256)]
+                    X = self._skopt.space.transform(pool)
+                    model = self._skopt.models[-1]
+                    if self._config.acquisition == "UCB":
+                        score = gaussian_lcb(X, model, kappa=self._config.kappa)
+                    elif self._config.acquisition == "PI":
+                        score = -gaussian_pi(X, model, y_opt=min(self._skopt.yi), xi=self._config.xi)
+                    else:
+                        score = -gaussian_ei(X, model, y_opt=min(self._skopt.yi), xi=self._config.xi)
+                    return pool[int(score.argmin())]
                 return self._skopt.ask()
             except Exception as exc:
                 _log.warning("skopt.ask() 失败，回退到随机采样：%s", exc)
-        return self._random_point()
+        return self._random_point(active_bounds)
 
-    def _random_point(self) -> list[float]:
+    def _random_point(self, bounds=None) -> list[float]:
         """在各维度边界内均匀采样随机点，整数维度严格返回 [ceil(lo), floor(hi)] 内的整数。"""
         import math
         point = []
-        for i, (lo, hi) in enumerate(self._bounds):
+        for i, (lo, hi) in enumerate(bounds if bounds is not None else self._bounds):
             if i in self._integer_indices:
                 int_lo = math.ceil(lo)
                 int_hi = math.floor(hi)

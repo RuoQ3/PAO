@@ -78,6 +78,10 @@ def load_optimize_config(
     driver_kwargs = _parse_driver_kwargs(cfg)
     run_cfg       = _build_run_config(cfg)
     opt_cfg       = _build_optimize_config(cfg, run_cfg)
+    if hasattr(opt_cfg, "agent_loop"):
+        from ..workflows.agent_entry import configure_agent
+        configure_agent(opt_cfg, cfg, yaml_path, sim_filepath)
+
 
     _log.info(
         "已加载配置：%s → %d 个设计变量，%d 个目标函数，n_initial=%d，n_iterations=%d。",

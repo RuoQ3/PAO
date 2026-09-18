@@ -166,6 +166,7 @@ class BoTorchMOOptimizer:
         # 目标函数观测数据（最小化方向）
         self._train_X: list[list[float]] = []
         self._train_Y: list[list[float]] = []
+        self._train_feasible: list[bool] = []
 
         # 约束 margin 观测数据
         # _train_C[i] 与 _train_X[i] 一一对应：
@@ -204,7 +205,7 @@ class BoTorchMOOptimizer:
         y_scalar:
             标量化值（ParEGO 兼容，BoTorch 路径不使用）。
         is_success:
-            True 表示仿真成功且所有目标均可用。
+            True 表示工况可行；False 的可信 y_vec/c_vec 仍用于约束学习。
         y_vec:
             多目标值向量（最小化方向）。None 时不参与 GP 训练。
         c_vec:
@@ -212,31 +213,26 @@ class BoTorchMOOptimizer:
             margin = actual_value - threshold（>= 0 满足约束）。
             None 或空字典时该点不参与约束 GP 训练。
         """
-        if is_success and y_vec is not None:
-            if len(y_vec) == self._n_obj:
-                self._train_X.append(list(x))
-                self._train_Y.append(list(y_vec))
-
-                if c_vec:
-                    # 首次确定约束名顺序（排序保证确定性）
-                    if not self._constraint_names:
-                        self._constraint_names = sorted(c_vec.keys())
-                        _log.debug(
-                            "约束 GP：确定约束顺序 %s（共 %d 个）。",
-                            self._constraint_names, len(self._constraint_names),
-                        )
-                    margin_vec = [
-                        c_vec.get(name, 0.0) for name in self._constraint_names
-                    ]
-                    self._train_C.append(margin_vec)
-                else:
-                    # 无约束数据：空列表占位，保持与 _train_X 索引对齐
-                    self._train_C.append([])
-            else:
-                _log.warning(
-                    "tell(): y_vec 维度 %d 与 n_objectives %d 不一致，忽略此点。",
-                    len(y_vec), self._n_obj,
-                )
+        # y_vec is supplied only for trustworthy, finite simulation outputs.
+        # is_success describes feasibility, not whether the observation is useful.
+        if y_vec is None:
+            return
+        if (len(y_vec) != self._n_obj or len(x) != len(self._bounds)
+                or not all(math.isfinite(float(v)) for v in list(x) + list(y_vec))):
+            raise ValueError("Invalid objective observation")
+        margin_vec = []
+        if c_vec:
+            if not all(math.isfinite(float(v)) for v in c_vec.values()):
+                raise ValueError("Non-finite constraint observation")
+            names = sorted(c_vec)
+            if self._constraint_names and names != self._constraint_names:
+                raise ValueError("Constraint names changed within an optimization session")
+            self._constraint_names = names
+            margin_vec = [float(c_vec[name]) for name in names]
+        self._train_X.append(list(x))
+        self._train_Y.append(list(y_vec))
+        self._train_C.append(margin_vec)
+        self._train_feasible.append(bool(is_success))
 
     def ask(self) -> list[float]:
         """
@@ -311,8 +307,11 @@ class BoTorchMOOptimizer:
             )
 
         # ── 无约束版本（与旧行为完全一致）───────────────────────────
+        feasible = [i for i, ok in enumerate(self._train_feasible) if ok]
+        if len(feasible) < self._n_initial_min:
+            return self._random_point(active_bounds)
         return self._ask_unconstrained(
-            train_X, train_Y_max, active_bounds, device, dtype
+            train_X[feasible], train_Y_max[feasible], active_bounds, device, dtype
         )
 
     def _ask_unconstrained(
@@ -339,7 +338,8 @@ class BoTorchMOOptimizer:
         mll = ExactMarginalLogLikelihood(model.likelihood, model)
         fit_gpytorch_mll(mll)
 
-        ref_point = (train_Y_max.min(dim=0).values * 1.1).tolist()
+        worst = train_Y_max.min(dim=0).values
+        ref_point = (worst - 0.1 * worst.abs().clamp_min(1.0)).tolist()
         sampler = self._make_sampler(device, dtype)
         qLogEHVI, qLogNEHVI = _import_qlog_ehvi()
 
@@ -428,12 +428,13 @@ class BoTorchMOOptimizer:
 
             constraint_callables.append(_make_callable(output_idx))
 
-        ref_point = (Y_obj.min(dim=0).values * 1.1).tolist()
+        worst = Y_obj.min(dim=0).values
+        ref_point = (worst - 0.1 * worst.abs().clamp_min(1.0)).tolist()
         ref_point_t = torch.tensor(ref_point, dtype=dtype, device=device)
         # partitioning 只包含目标维度（n_obj 维），ref_point 也只有 n_obj 维。
-        # train_Y_max 全集保持 Pareto 前沿完整（含无约束数据的点）。
+        # Only verified feasible observations define the incumbent Pareto front.
         partitioning = NondominatedPartitioning(
-            ref_point=ref_point_t, Y=train_Y_max,
+            ref_point=ref_point_t, Y=Y_obj[(C_mat >= 0).all(dim=-1)],
         )
         sampler = self._make_sampler(device, dtype)
         qLogEHVI, _ = _import_qlog_ehvi()

@@ -36,7 +36,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from ..aspen_driver.driver import AspenDriver
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.exporter import TreeExporter, TreeValueRecord
 from ..aspen_driver.runner import SimulationRunner
 from ..models.block import BlockInput, BlockOutput, BlockResult, block_result_from_runner
