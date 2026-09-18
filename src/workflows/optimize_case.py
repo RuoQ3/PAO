@@ -80,7 +80,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from ..aspen_driver.driver import AspenDriver
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..aspen_driver.driver import AspenDriver
 from ..aspen_driver.errors import AspenConnectionError
 from ..models.process_case import CaseStatus, ProcessCase
 from ..optimization.feasibility import FeasibilityClassifier, FeasibilityConfig

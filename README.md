@@ -6,6 +6,19 @@ PAO 通过 Windows COM 自动化驱动 Aspen Plus，将贝叶斯代理模型优�
 
 ---
 
+## 自主 Agent 优化闭环
+
+现在支持一个主决策 Agent 在小批次仿真之间读取证据、提出结构化动作、调整软搜索区域并检验效果。包含总预算、失败触发、约束学习、断点恢复和最终工况复验。工程硬边界、目标和产品约束不会被 Agent 修改。
+
+```bash
+python -m src.main cases/demo_case_2/agent_loop_config.yaml --dry-run
+python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent
+# 中断后恢复同一会话
+python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent --resume
+```
+
+详见 [自主闭环使用说明](docs/agent_closed_loop.md)。没有 LLM key 时明确降级为规则决策。`--agent` + YAML 使用新闭环；普通 YAML 不启用 `agent_loop` 时仍使用原优化器。Web 部分是历史架构说明，当前仓库没有跟踪 backend/frontend 源码。
+
 ## 功能特性
 
 | 功能 | 说明 |

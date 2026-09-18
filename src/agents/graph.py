@@ -80,6 +80,10 @@ class PAOGraphState:
     user_feedback: dict = field(default_factory=dict)  # confirm 节点的反馈
     user_decision: str = ""  # decide 节点的决策（continue/adjust/done）
     write_feasibility_report: Any = None   # WriteFeasibilityReport | None
+    # Opt-in closed loop: one initial HITL confirmation, autonomous bounded iterations.
+    agent_loop: dict = field(default_factory=dict)
+    agent_checkpoint_path: str | None = None
+    agent_resume: bool = False
     process_topology: dict = field(default_factory=dict)  # {nodes, edges}
 
 
@@ -361,6 +365,11 @@ def optimization_node(state: PAOGraphState) -> dict:
     # 确保工况写入数据库时用的 session_id 与后续查询时一致
     session_id = state.session_id
     opt_cfg.session_id = session_id
+    if state.agent_loop.get("enabled", False):
+        opt_cfg.agent_loop.update(state.agent_loop)
+        opt_cfg.agent_checkpoint_path = state.agent_checkpoint_path or str(pathlib.Path(config_path).parent / "output" / "agent_checkpoint.db")
+        opt_cfg.agent_resume = state.agent_resume
+        opt_cfg.agent_llm_config = state.llm_config
 
     # 构建实时进度回调：每个仿真样本完成后更新 SessionEntry
     # 用可变容器在闭包中积累 HV 历史（每次 on_case_complete 追加一个值）
@@ -488,6 +497,7 @@ def optimization_node(state: PAOGraphState) -> dict:
     new_msgs.append(f"【优化】第 {state.iteration + 1} 轮完成，DB：{db_path}")
     new_msgs.append(result_text[:500])
     return {"current_phase": "analyzing", "db_path": db_path,
+            "termination_reason": result.early_stop_reason if state.agent_loop.get("enabled") else None,
             "iteration": state.iteration + 1, "messages": new_msgs}
 
 
@@ -638,7 +648,11 @@ def build_graph(checkpointer=None):
     # 固定边
     g.add_edge(START,               "onboarding")
     g.add_edge("onboarding",        "write_feasibility")   # 试写验证在确认前自动执行
-    g.add_edge("analysis",          "human_decide")
+    g.add_conditional_edges(
+        "analysis",
+        lambda s: "done" if s.agent_loop.get("enabled", False) else "human_decide",
+        {"done": "done", "human_decide": "human_decide"},
+    )
     g.add_edge("done",              END)
 
     # write_feasibility → human_confirm（正常）或 done（无可写变量）
