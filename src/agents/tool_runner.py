@@ -17,13 +17,14 @@ from __future__ import annotations
 import re
 
 from src.agents.tools import (
-    validate_config_tool,
-    run_case_tool,
-    optimize_pareto_tool,
-    query_simulation_db_tool,
+    analyze_closed_loop_tool,
     diagnose_case_tool,
+    optimize_pareto_tool,
     query_node_db_tool,
+    query_simulation_db_tool,
+    run_case_tool,
     summarize_pareto_tool,
+    validate_config_tool,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,7 +159,7 @@ class RealToolRunner:
         )
         # tool 返回错误报告时作为异常抛出，而非静默返回空列表
         stripped = report.lstrip()
-        if stripped.startswith("错误：") or stripped.startswith("错误:"):
+        if stripped.startswith(("错误：", "错误:")):
             raise RuntimeError(
                 f"get_failed_case_ids: query_simulation_db 返回错误报告 — {report}"
             )
@@ -207,5 +208,24 @@ class RealToolRunner:
         return _invoke_tool(summarize_pareto_tool, {
             "db_path": db_path,
             "objective_names": ",".join(objective_names),
+            "include_infeasible": include_infeasible,
+        })
+
+    # ------------------------------------------------------------------
+    # 闭环数据分析
+    # ------------------------------------------------------------------
+
+    def analyze_closed_loop(
+        self,
+        db_path: str,
+        objective_names: list[str],
+        session_id: str | None = None,
+        include_infeasible: bool = False,
+    ) -> str:
+        """返回可供 Agent 消费的结构化 AnalysisReport JSON。"""
+        return _invoke_tool(analyze_closed_loop_tool, {
+            "db_path": db_path,
+            "objective_names": ",".join(objective_names),
+            "session_id": session_id or "",
             "include_infeasible": include_infeasible,
         })

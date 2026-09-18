@@ -37,6 +37,13 @@ flowchart TD
 5. `run_case()` 调用 Aspen，结果以 `ProcessCase` 保存，并通过 `tell()` 更新代理模型。
 6. 达到目标、预算耗尽、连续失败、停滞或 Agent 请求停止时，对一个代表可行工况进行独立复验。
 
+每次决策快照还会自动生成结构化 `analysis_report`。它由确定性的程序代码计算，包含
+数据质量、收敛率、目标/约束趋势、Pareto/HV、敏感性排序和失败模式；主 Agent 只负责
+根据这些证据选择下一步动作。动作前后的报告分别写入 checkpoint 的
+`before_analysis`、`after_analysis`，并保存 `analysis_effect` 指标差异（仅表示观察到的
+相关性，不自动宣称因果）。敏感性排序同时保存有效样本数和 `reliable` 标记，样本不足时
+不会被提示词当作可信物理规律。
+
 Agent 可以改变软搜索区，但不能修改以下内容：
 
 - `design_variables` 的工程硬边界；
@@ -47,6 +54,25 @@ Agent 可以改变软搜索区，但不能修改以下内容：
 没有配置 LLM key 时，`ProcessDecisionAgent` 会明确降级为规则决策，闭环、预算、约束和断点机制仍然运行。
 
 详细设计见 [docs/agent_closed_loop.md](docs/agent_closed_loop.md)。
+
+### 离线分析工具
+
+不启动 Aspen 也可以让 Agent 或人工审查历史工况。`analyze_closed_loop_tool` 从
+`SimulationDB` 读取记录并返回与闭环相同的 JSON 分析报告，支持按 `session_id`、迭代范围
+和 tags 过滤：
+
+```python
+from src.agents.tools import analyze_closed_loop_tool
+
+report_json = analyze_closed_loop_tool.invoke({
+    "db_path": "cases/demo_case_2/output/simulation.db",
+    "objective_names": "CAPEX,EMISSIONS",
+    "session_id": "optional-session-id",
+})
+```
+
+默认 Pareto 只使用可行工况；只有在研究可行域或约束松弛时才设置
+`include_infeasible=True`。该工具是确定性数据分析 skill，不会创建额外的自主 Agent。
 
 ## 环境要求
 
@@ -268,7 +294,8 @@ PAO/
 │   │   ├── botorch_backend.py        # 可选 qEHVI/qNEHVI 后端
 │   │   └── pareto.py                 # Pareto 与超体积计算
 │   ├── agents/
-│   │   ├── closed_loop/              # ActionPlan、主 Agent、checkpoint
+│   │   ├── closed_loop/              # ActionPlan、主 Agent、分析报告、checkpoint
+│   │   ├── tools/                    # LangChain 工具（含离线闭环分析）
 │   │   ├── coordinator/              # 裸 Aspen 文件的任务路由
 │   │   ├── onboarding_agent/         # 变量发现和配置草案
 │   │   ├── boundary_advisor/         # 边界建议
@@ -298,7 +325,7 @@ python -m pytest -q
 python -m compileall -q src tests
 ```
 
-当前闭环改造的测试结果为 `29 passed, 1 skipped`。跳过项是可选 BoTorch 联合 GP 测试；安装兼容的 `torch`、`botorch` 和 `gpytorch` 后才会运行。GitHub Actions 配置位于 `.github/workflows/agent-loop.yml`。
+当前闭环改造的测试结果为 `35 passed, 1 skipped`。跳过项是可选 BoTorch 联合 GP 测试；安装兼容的 `torch`、`botorch` 和 `gpytorch` 后才会运行。GitHub Actions 配置位于 `.github/workflows/agent-loop.yml`。
 
 真实 Aspen 验收仍需在 Windows + Aspen Plus 环境中进行，建议使用同一 `.bkp` 副本、同一目标/约束和相同总调用预算，对比普通优化器与 Agent 闭环的可行率、首次达标时间、最终目标、失败次数和复验结果。
 

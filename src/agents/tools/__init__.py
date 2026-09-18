@@ -13,6 +13,7 @@ src/agents/tools/__init__.py — PAO Agent 工具包。
   query_node_db.py        — query_node_db_tool（不依赖 Aspen COM）
   diagnose_case.py        — diagnose_case_tool（不依赖 Aspen COM）
   summarize_pareto.py     — summarize_pareto_tool（不依赖 Aspen COM）
+  analyze_closed_loop.py  — analyze_closed_loop_tool（不依赖 Aspen COM）
 
 公开接口（与旧 tools.py 完全兼容）：
   load_case_config_tool        — BaseTool
@@ -24,6 +25,7 @@ src/agents/tools/__init__.py — PAO Agent 工具包。
   query_node_db_tool           — BaseTool
   diagnose_case_tool           — BaseTool
   summarize_pareto_tool        — BaseTool
+  analyze_closed_loop_tool     — BaseTool
   get_agent_tools()            — 返回所有工具列表
 
 测试 patch 路径示例（新路径）：
@@ -111,6 +113,10 @@ from .summarize_pareto import (
     _fmt_hv_section,
     _fmt_sensitivity_section,
 )
+from .analyze_closed_loop import (
+    analyze_closed_loop_tool,
+    _impl_analyze_closed_loop,
+)
 from .discover_tunables import (
     discover_tunables_tool,
     discover_tunables_impl,
@@ -150,6 +156,7 @@ def get_agent_tools() -> list[BaseTool]:
         query_node_db_tool,
         diagnose_case_tool,
         summarize_pareto_tool,
+        analyze_closed_loop_tool,
         discover_tunables_tool,
     ]
 
@@ -164,10 +171,12 @@ __all__ = [
     "query_simulation_db_tool",
     "query_node_db_tool",
     "discover_tunables_tool",
+    "analyze_closed_loop_tool",
     # 工具注册
     "get_agent_tools",
     # 核心实现（供测试）
     "_impl_load_config",
+    "_build_config_summary",
     "_impl_validate_config",
     "_impl_run_case",
     "_impl_optimize_pareto",
@@ -206,6 +215,7 @@ __all__ = [
     "_fmt_pareto_front_section",
     "_fmt_hv_section",
     "_fmt_sensitivity_section",
+    "_impl_analyze_closed_loop",
     # 校验辅助（供测试）
     "_check_sim_file",
     "_check_design_var_sanity",
@@ -228,6 +238,7 @@ __all__ = [
     "discover_tunables_impl",
     "_build_tunable_variables",
     "_build_readable_targets",
+    "_scan_aspen_file",
     "_compute_semantic_coverage",
     "_serialize_report",
 ]

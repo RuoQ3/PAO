@@ -10,12 +10,21 @@ import uuid
 from dataclasses import asdict, replace
 
 from src.agents.closed_loop.advisor import ProcessDecisionAgent, fallback_plan
-from src.agents.closed_loop.contracts import ActionPlan, LoopConfig, finite, validate_plan
+from src.agents.closed_loop.analysis import (
+    build_analysis_report,
+    compare_analysis_reports,
+)
+from src.agents.closed_loop.contracts import (
+    ActionPlan,
+    LoopConfig,
+    finite,
+    validate_plan,
+)
 from src.agents.closed_loop.journal import SessionJournal, decode_case, encode_case
 from src.models.process_case import CaseStatus, ProcessCase
-from src.optimization.search_session import ParetoSearchSession
-from src.optimization.feasibility import FeasibilityClassifier
 from src.optimization.convergence_kb import match_failure_patterns
+from src.optimization.feasibility import FeasibilityClassifier
+from src.optimization.search_session import ParetoSearchSession
 from src.workflows.common import (
     apply_derived_vars,
     feasibility_feature_names,
@@ -23,8 +32,11 @@ from src.workflows.common import (
     repair_design_vars,
 )
 from src.workflows.optimize_pareto_case import (
-    _compute_hv_fixed, _extract_all_objectives, _maybe_recover_driver, _preflight_blocked,
     _build_feasibility_rows,
+    _compute_hv_fixed,
+    _extract_all_objectives,
+    _maybe_recover_driver,
+    _preflight_blocked,
 )
 from src.workflows.run_case import run_case
 
@@ -59,6 +71,7 @@ def _anchor(state):
 
 def build_snapshot(state, config, settings, context, knowledge):
     metrics = _metrics(state, config)
+    cases = [decode_case(row) for row in state["observations"]]
     recent = state["observations"][-max(12, settings.batch_size):]
     errors = [(r.get("sim_result") or {}).get("error", "") or r.get("notes", "")
               for r in recent if r.get("sim_result") or r.get("notes")]
@@ -73,11 +86,20 @@ def build_snapshot(state, config, settings, context, knowledge):
         compact[-1]["error"] = ((row.get("sim_result") or {}).get("error") or row.get("notes", ""))[:2000]
         compact[-1]["block_statuses"] = row.get("block_statuses", [])[:20]
     from src.optimization.pareto import compute_pareto
-    front = compute_pareto([decode_case(r) for r in state["observations"]], config.objective_names).first_front
+    front = compute_pareto(cases, config.objective_names).first_front
     front_ids = {c.case_id for c in front.cases} if front else set()
     front_evidence = [{"case_id": r["case_id"], "optimizer_inputs": r["optimizer_inputs"],
                        "objectives": r["objectives"], "constraints": r["constraints"]}
                       for r in state["observations"] if r["case_id"] in front_ids][:12]
+    analysis_report = build_analysis_report(
+        cases,
+        objective_names=config.objective_names,
+        param_paths=list(config.param_bounds),
+        optimizer_inputs=[row.get("optimizer_inputs", {}) for row in state["observations"]],
+        recent_window=max(12, settings.batch_size),
+        hypervolume=metrics["hypervolume"],
+        hv_margin=getattr(config, "hv_margin", 0.1),
+    )
     return {
         "process_context": context, "knowledge": knowledge,
         "pareto_evidence": front_evidence,
@@ -90,6 +112,8 @@ def build_snapshot(state, config, settings, context, knowledge):
         "metrics": metrics, "recent_convergence_rate": metrics["convergence_rate"],
         "stagnation_count": state["stagnation_count"], "recent_observations": compact,
         "diagnostic_hypotheses": diagnoses, "previous_actions": state["decisions"][-4:],
+        # Deterministic evidence is generated before the LLM sees the snapshot.
+        "analysis_report": analysis_report,
     }
 
 
@@ -113,6 +137,27 @@ def _finish_action(state, config):
         "case_ids": [r["case_id"] for r in state["observations"][decision["start_index"]:]],
         "interpretation": "Observed association only; not proof of causal attribution",
     }
+    # Persist a richer deterministic before/after comparison for audit and
+    # resume.  Older checkpoints may not contain before_analysis; the legacy
+    # metric comparison above remains the compatibility fallback.
+    before_analysis = decision.get("before_analysis")
+    if before_analysis is not None:
+        cases = [decode_case(row) for row in state["observations"]]
+        after_analysis = build_analysis_report(
+            cases,
+            objective_names=config.objective_names,
+            param_paths=list(config.param_bounds),
+            optimizer_inputs=[row.get("optimizer_inputs", {}) for row in state["observations"]],
+            recent_window=max(12, int(decision.get("window_size", 12))),
+            hypervolume=after["hypervolume"],
+            hv_margin=getattr(config, "hv_margin", 0.1),
+        )
+        decision["outcome"]["analysis_effect"] = compare_analysis_reports(
+            before_analysis,
+            after_analysis,
+            expected_effect=decision["plan"].get("expected_effect"),
+        )
+        decision["outcome"]["after_analysis"] = after_analysis
 
 
 def _choose_plan(state, config, settings, agent, context, knowledge):
@@ -128,6 +173,8 @@ def _choose_plan(state, config, settings, agent, context, knowledge):
         validate_plan(plan, state, settings, config.integer_var_paths, {r["id"] for r in knowledge})
     decision = {"id": str(uuid.uuid4()), "plan": plan.to_dict(), "source": source,
                 "rejection": rejected, "before": snapshot["metrics"],
+                "before_analysis": snapshot["analysis_report"],
+                "window_size": snapshot["analysis_report"].get("window_size", 12),
                 "start_index": len(state["observations"])}
     state["decisions"].append(decision)
     state["search_region"].update(plan.search_region)
@@ -206,9 +253,12 @@ def _pick_candidate(state, config, settings, session):
     for candidate in candidates:
         try:
             point, actual = _prepare_candidate(candidate, config, state["hard_bounds"])
-            if not plan.candidate and state["observations"]:
-                if any(not local[p][0] <= v <= local[p][1] for p, v in point.items()):
-                    continue
+            if (
+                not plan.candidate
+                and state["observations"]
+                and any(not local[p][0] <= v <= local[p][1] for p, v in point.items())
+            ):
+                continue
             if fingerprint_design_vars(actual) in seen and not (plan.repeat and plan.candidate):
                 continue
             prepared.append((point, actual))
