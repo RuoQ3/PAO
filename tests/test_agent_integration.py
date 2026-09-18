@@ -3,9 +3,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.agents.closed_loop.advisor import ProcessDecisionAgent
-from src.models.process_case import ProcessCase, ObjectiveValue, ConstraintValue, CaseStatus
-from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig, optimize_pareto_case
+from src.agents.closed_loop.advisor import (
+    ProcessDecisionAgent,
+    parse_action_plan_response,
+)
+from src.models.process_case import (
+    CaseStatus,
+    ConstraintValue,
+    ObjectiveValue,
+    ProcessCase,
+)
+from src.workflows.optimize_pareto_case import (
+    ParetoOptimizeCaseConfig,
+    optimize_pareto_case,
+)
 
 
 def cfg(tmp_path):
@@ -76,9 +87,44 @@ def test_llm_json_proposal_is_used_and_malformed_response_is_rejected(monkeypatc
         agent.propose({})
 
 
+def test_llm_proposal_retries_invalid_shape_and_accepts_fenced_json(monkeypatch):
+    from src.agents import llm_client
+
+    responses = iter([
+        '```json\n{"action":"continue","search_region":{"x":[0.2,0.8]}}\n```',
+        '前置说明\n{"action":"continue","search_region":{}}\n',
+    ])
+    calls = []
+
+    def fake_chat(*args, **kwargs):
+        calls.append(kwargs["system"])
+        return next(responses)
+
+    monkeypatch.setattr(llm_client, "is_configured", lambda cfg: True)
+    monkeypatch.setattr(llm_client, "chat", fake_chat)
+    agent = ProcessDecisionAgent(llm_config=SimpleNamespace())
+    plan, source = agent.propose({"recent_observations": [], "batch_size_limit": 1})
+
+    assert source == "llm:retry"
+    assert plan.action == "continue"
+    assert plan.search_region == {}
+    assert len(calls) == 2
+    assert "上一次动作输出没有通过" in calls[1]
+
+
+def test_action_plan_response_parser_tolerates_preamble():
+    plan = parse_action_plan_response(
+        "根据当前证据，建议继续采样。\n"
+        '{"action":"probe","candidate":{"x":0.6}}\n'
+    )
+    assert plan.action == "probe"
+    assert plan.candidate == {"x": 0.6}
+
+
 def test_graph_preserves_confirmation_and_skips_final_manual_loop(monkeypatch):
     from langgraph.checkpoint.memory import MemorySaver
-    import src.agents.graph as graph
+
+    from src.agents import graph
     monkeypatch.setattr(graph, "onboarding_node", lambda s: {})
     monkeypatch.setattr(graph, "write_feasibility_node", lambda s: {})
     monkeypatch.setattr(graph, "human_confirm_node", lambda s: {"current_phase": "optimizing"})
@@ -94,7 +140,7 @@ def test_graph_preserves_confirmation_and_skips_final_manual_loop(monkeypatch):
 
 
 def test_graph_optimization_forwards_agent_settings(tmp_path, monkeypatch):
-    import src.agents.graph as graph
+    from src.agents import graph
     from src.agents.tools import _common
     config = cfg(tmp_path)
     seen = []

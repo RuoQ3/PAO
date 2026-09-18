@@ -124,7 +124,13 @@ def _finish_action(state, config):
     before, after = decision["before"], _metrics(state, config)
     objective_gain = ((after["hypervolume"] or 0) > (before["hypervolume"] or 0) + 1e-10)
     gain = objective_gain or after["feasible_count"] > before["feasible_count"]
-    state["stagnation_count"] = 0 if gain else state["stagnation_count"] + 1
+    # A rejected LLM proposal is a protocol failure, not evidence that the
+    # experiment itself stagnated.  Do not let malformed JSON or an invalid
+    # action/field combination consume the stagnation patience; the fallback
+    # still runs a safe experiment and the next decision gets a fresh chance.
+    stagnation_counted = not bool(decision.get("rejection"))
+    if stagnation_counted:
+        state["stagnation_count"] = 0 if gain else state["stagnation_count"] + 1
     effect = decision["plan"]["expected_effect"]
     improved = {
         "objective": objective_gain,
@@ -136,6 +142,8 @@ def _finish_action(state, config):
         "after": after, "expected_metric_improved": improved,
         "case_ids": [r["case_id"] for r in state["observations"][decision["start_index"]:]],
         "interpretation": "Observed association only; not proof of causal attribution",
+        "stagnation_counted": stagnation_counted,
+        "stagnation_count": state["stagnation_count"],
     }
     # Persist a richer deterministic before/after comparison for audit and
     # resume.  Older checkpoints may not contain before_analysis; the legacy

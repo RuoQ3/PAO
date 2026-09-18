@@ -149,6 +149,19 @@ def test_invalid_agent_plan_falls_back_and_records_reason(tmp_path):
     assert all(0 <= r["optimizer_inputs"]["x"] <= 1 for r in state["observations"])
 
 
+def test_rejected_agent_proposal_does_not_consume_stagnation_patience(tmp_path):
+    agent = ScriptedAgent(
+        lambda snap: ActionPlan(action="continue", search_region={"x": [0.2, 0.8]})
+    )
+    settings = LoopConfig(max_evaluations=8, batch_size=1, stagnation_batches=1)
+    state = run(tmp_path, agent=agent, settings=settings)
+
+    assert state["termination_reason"] == "evaluation_budget"
+    assert state["used"] == 8
+    assert state["stagnation_count"] == 0
+    assert all(not decision["outcome"]["stagnation_counted"] for decision in state["decisions"])
+
+
 def test_resume_replays_evidence_and_does_not_repeat_unknown_trial(tmp_path):
     captured = []
     def interrupt(driver, actual, rc, iteration, tags):
