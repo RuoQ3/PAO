@@ -411,15 +411,16 @@ def infer_reference_point(
     """
     从目标向量集合自动推断超体积参考点。
 
-    参考点 = 各维度最大值 × (1 + margin)（最小化方向）。
-    margin 默认 0.1（10%），确保参考点严格劣于所有 Pareto 点。
+    参考点 = 各维度最大值 + margin * 该维度观测范围（最小化方向）。
+    若该维度所有值相同，则使用 max(abs(max), 1.0) 作为退化范围。
+    这样对负数目标和最大化目标取负后的内部值同样能保证参考点严格劣于样本点。
 
     Parameters
     ----------
     objective_vectors:
         目标向量列表（最小化方向）。
     margin:
-        各维度最大值的扩展比例，默认 0.1。
+        各维度观测范围的扩展比例，默认 0.1。
 
     Returns
     -------
@@ -432,12 +433,11 @@ def infer_reference_point(
     n_obj = len(objective_vectors[0])
     ref = []
     for m in range(n_obj):
+        min_val = min(v[m] for v in objective_vectors)
         max_val = max(v[m] for v in objective_vectors)
-        # 处理负值（最大化目标取负后可能为负数）
-        if max_val >= 0:
-            ref.append(max_val * (1.0 + margin))
-        else:
-            ref.append(max_val * (1.0 - margin))
+        span = max_val - min_val
+        scale = span if span > 0.0 else max(abs(max_val), 1.0)
+        ref.append(max_val + margin * scale)
     return ref
 
 

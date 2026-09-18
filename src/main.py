@@ -10,10 +10,20 @@ main.py — PAO 命令行入口。
     --db PATH       结果数据库路径（默认：与 YAML 同目录的 output/simulation.db）
     --log LEVEL     日志级别（DEBUG/INFO/WARNING，默认 INFO）
     --dry-run       只加载配置并打印摘要，不运行 Aspen 仿真
-    --agent         启用 AI Agent 协作模式：LLM 自动扫描 Aspen 变量、生成配置草案，
-                    终端交互确认/修改边界，再运行 Pareto 优化（忽略 YAML 配置）
-    --intent TEXT   优化意图自然语言描述（仅 --agent 模式使用），
-                    如 "最小化 TAC 和 CO2 排放，约束产品纯度 > 99%"
+    --agent         启用 AI Agent 协作模式。行为按传入的文件类型分支：
+                      - 传入已有的 YAML 配置：boundary_advisor 扫描已有 design_variables
+                        推荐边界，终端交互确认/修改，再运行 Pareto 优化（原有行为不变）。
+                      - 传入裸 Aspen 文件（.bkp/.apw，尚无配置）：走 Coordinator
+                        意图识别 + 任务拆解，按 --intent 描述的需求路由到
+                        onboarding_agent / boundary_advisor / kinetics_advisor /
+                        process_advisor / optimize_pareto 中的一个或多个。
+    --intent TEXT   自由文本描述。YAML 输入时是"优化意图"（如边界推荐的工艺背景）；
+                    Aspen 文件输入时是"任务请求"（如"帮我接入这个新工艺" /
+                    "帮我拟合这批实验数据的活化能"），决定 Coordinator 路由到哪个 agent。
+    --data CSV_PATH 实验数据 CSV 路径（Aspen 文件输入且意图涉及动力学拟合时使用）。
+    --chat          连续对话模式（仅裸 Aspen 文件 + --agent 时可用）：进入 REPL 循环，
+                    可连续输入多轮指令；系统记住上一轮产出的配置/数据库路径，
+                    后续提问不用重复给路径（但不记住数值结果，如拟合出的 Ea 数值）。
 
 示例
 ----
@@ -23,10 +33,22 @@ main.py — PAO 命令行入口。
     # 多目标 Pareto 优化（optimizer.type: pareto_bayesian）
     python -m src.main cases/demo_case/pareto_tac_emissions_config.yaml
 
-    # AI Agent 协作模式（LLM 扫描变量，终端 HITL 交互）
+    # AI Agent 协作模式：已有 YAML，boundary_advisor 推荐边界 + 终端 HITL
     python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --agent
     python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --agent \\
         --intent "最小化总年费用和碳排放，约束甘油纯度 > 99%"
+
+    # AI Agent 协作模式：裸 Aspen 文件，Coordinator 意图识别 + 路由（单轮）
+    python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent \\
+        --intent "帮我接入这个新工艺，分析可调变量"
+    python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent \\
+        --intent "帮我拟合这批实验数据的活化能" --data scripts/kinetics_example_data.csv
+
+    # AI Agent 协作模式：连续对话（多轮，记住上一轮产出的配置路径）
+    python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent --chat
+    PAO> 帮我接入这个工艺
+    PAO> 帮我推荐一下边界    # 自动复用上一轮生成的配置路径
+    PAO> exit
 
     python -m src.main cases/demo_case/case_config.yaml --db output/run1.db --log DEBUG
     python -m src.main cases/demo_case/case_config.yaml --dry-run
@@ -37,6 +59,14 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+
+# Windows 控制台默认 GBK 编码，Agent 模式的报告文本含 emoji/"±"等字符会
+# 导致 UnicodeEncodeError；强制 stdout/stderr 走 UTF-8，不影响非 Windows 环境
+# （reconfigure 是幂等操作）。与 scripts/run_kinetics_advisor.py 的处理一致。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 
 def _setup_logging(level: str, log_file: Path | None = None) -> None:
@@ -58,7 +88,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--agent",    action="store_true",
                         help="启用 AI Agent 协作模式（LLM 扫描变量 + 终端 HITL 交互）")
     parser.add_argument("--intent",   default="",
-                        help="优化意图自然语言描述（仅 --agent 模式使用）")
+                        help="优化意图自然语言描述（--agent 模式使用；传入 Aspen 文件时"
+                             "作为 Coordinator 的自由文本请求，决定路由到哪个子 agent）")
+    parser.add_argument("--data",     default=None, metavar="CSV_PATH",
+                        help="实验数据 CSV 路径（--agent 模式下传入 Aspen 文件且意图涉及"
+                             "动力学参数拟合时使用，列：temperature,rate_constant）")
+    parser.add_argument("--chat",     action="store_true",
+                        help="连续对话模式（仅 --agent + 裸 Aspen 文件时可用）：进入 REPL 循环，"
+                             "可连续输入多轮指令，系统记住上一轮产出的配置/数据库路径，"
+                             "后续提问不用重复给路径。若同时给了 --intent，先执行这一轮再进入循环。")
     return parser.parse_args(argv)
 
 
@@ -349,6 +387,157 @@ def _run_agent_mode(
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Agent 模式：Coordinator（意图识别 + 任务拆解 + 分发执行）
+# ---------------------------------------------------------------------------
+
+def _print_coordinator_result(result) -> None:
+    """打印一次 Coordinator 执行结果（意图识别摘要 + 执行报告）。
+
+    被单轮模式（_run_coordinator_mode）和连续对话模式
+    （_run_coordinator_chat_loop）共用，保证两种模式下的输出格式一致。
+    """
+    from src.agents.coordinator.tools import format_execution_report
+
+    print(f"\n意图识别：{'LLM' if result.classification.used_llm else '规则兜底'}"
+          f"，共 {len(result.classification.steps)} 个步骤")
+    if result.classification.notes:
+        print(f"  总结：{result.classification.notes}")
+    for w in result.classification.warnings:
+        print(f"  警告：{w}")
+
+    _sep()
+    print(format_execution_report(result.execution))
+
+    if result.execution.has_clarify:
+        print("\n⚠ 部分/全部请求信息不足，无法确定具体任务。请补充说明后重新描述需求。")
+
+
+def _run_coordinator_mode(
+    aspen_file: Path,
+    intent_text: str,
+    data_csv: str | None,
+    log: logging.Logger,
+) -> int:
+    """
+    裸 Aspen 文件（尚无配置 YAML）时的 Agent 模式入口（单轮，无跨轮记忆）。
+
+    与 _run_agent_mode 的区别：_run_agent_mode 假定 design_variables 已经
+    填好，只做"推荐边界 + 跑优化"；这里假定用户可能什么都还没有，先做
+    意图识别，再路由到 onboarding_agent / boundary_advisor / kinetics_advisor /
+    process_advisor / optimize_pareto 中的一个或多个。
+
+    已知范围限定（见 src.agents.coordinator.agent 模块 docstring）：
+    不做任务间数值结果自动传递，不做 write_feasibility 验证。
+    """
+    from src.agents.coordinator import run_coordinator
+
+    _sep()
+    print("🤖  PAO Coordinator 模式")
+    print(f"    Aspen 文件：{aspen_file}")
+    print(f"    请求：{intent_text or '（未指定，将走规则兜底或提示澄清）'}")
+    _sep()
+
+    if not intent_text.strip():
+        print("\n⚠ 未提供 --intent，无法确定具体任务，请重新运行并附上 --intent 描述需求。")
+        return 1
+
+    result = run_coordinator(
+        intent_text,
+        aspen_file=str(aspen_file),
+        data_csv=data_csv,
+    )
+    _print_coordinator_result(result)
+
+    if result.execution.has_clarify:
+        return 1
+
+    return 1 if result.execution.has_errors() else 0
+
+
+# ---------------------------------------------------------------------------
+# Agent 模式：Coordinator 连续对话（--chat）
+# ---------------------------------------------------------------------------
+
+_CHAT_HELP_TEXT = """\
+可用元命令：
+  exit / quit   结束对话
+  help          显示本帮助
+  state         查看当前会话记住的文件路径
+
+直接输入自然语言描述你想做的任务即可，例如：
+  帮我接入这个工艺，扫描一下可调变量
+  帮我推荐一下边界
+  帮我拟合这批实验数据的活化能（需配合 --data 或后续版本支持对话内指定路径）
+"""
+
+
+def _run_coordinator_chat_loop(
+    aspen_file: Path,
+    initial_intent: str,
+    data_csv: str | None,
+    log: logging.Logger,
+) -> int:
+    """
+    连续对话模式：REPL 循环，多轮调用 run_coordinator_turn。
+
+    与 _run_coordinator_mode 的区别：维护一个 ChatSessionState，记住上一轮
+    任务产出的文件路径（如 onboarding 生成的配置 YAML），下一轮用户提问
+    缺少路径时自动填空。不记忆任何数值结果——那部分仍需用户自己看完上一轮
+    输出后决定下一轮怎么问。
+
+    退出码：正常通过 exit/quit 或 EOF 结束返回 0；由 --intent 触发的首轮
+    执行失败不会中断进入循环（让用户有机会在对话里补救）。
+    """
+    from src.agents.coordinator import ChatSessionState, run_coordinator_turn
+
+    session = ChatSessionState(aspen_file=str(aspen_file), data_csv=data_csv)
+
+    _sep()
+    print("🤖  PAO Coordinator 连续对话模式")
+    print(f"    Aspen 文件：{aspen_file}")
+    print("    输入 'help' 查看可用命令，输入 'exit' 结束对话。")
+    _sep()
+
+    def _run_turn(user_text: str) -> None:
+        result = run_coordinator_turn(session, user_text, data_csv=data_csv)
+        _print_coordinator_result(result)
+
+    if initial_intent.strip():
+        print(f"\nPAO> {initial_intent}")
+        try:
+            _run_turn(initial_intent)
+        except Exception as exc:  # noqa: BLE001 — 首轮失败不应阻止进入交互循环
+            log.error("首轮请求执行失败：%s", exc, exc_info=True)
+            print(f"\n⚠ 执行失败：{exc}")
+
+    while True:
+        try:
+            user_text = input("\nPAO> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见。")
+            return 0
+
+        if not user_text:
+            continue
+        if user_text.lower() in ("exit", "quit"):
+            print("再见。")
+            return 0
+        if user_text.lower() == "help":
+            print(_CHAT_HELP_TEXT)
+            continue
+        if user_text.lower() == "state":
+            for k, v in session.as_display_dict().items():
+                print(f"  {k}: {v}")
+            continue
+
+        try:
+            _run_turn(user_text)
+        except Exception as exc:  # noqa: BLE001 — 单轮失败不应中断整个对话
+            log.error("本轮请求执行失败：%s", exc, exc_info=True)
+            print(f"\n⚠ 执行失败：{exc}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
@@ -367,6 +556,30 @@ def main(argv: list[str] | None = None) -> int:
 
     _setup_logging(args.log, log_file=log_file)
     log = logging.getLogger(__name__)
+
+    # ── Agent 模式 + 裸 Aspen 文件（尚无配置 YAML）：走 Coordinator ───────────
+    # 必须在 load_optimize_config 之前分支：该函数假定输入是可解析的优化
+    # 配置 YAML，传入 .bkp/.apw 会直接加载失败，而这正是 Coordinator 意图
+    # 识别要处理的场景（用户还没有配置，需要先接入/拟合/推荐边界）。
+    config_path = Path(args.config)
+    if args.agent and config_path.suffix.lower() in (".bkp", ".apw"):
+        if args.chat:
+            return _run_coordinator_chat_loop(
+                aspen_file=config_path.resolve(),
+                initial_intent=args.intent,
+                data_csv=args.data,
+                log=log,
+            )
+        return _run_coordinator_mode(
+            aspen_file=config_path.resolve(),
+            intent_text=args.intent,
+            data_csv=args.data,
+            log=log,
+        )
+
+    if args.chat:
+        log.error("--chat 仅在 --agent 模式且传入裸 Aspen 文件（.bkp/.apw）时可用。")
+        return 1
 
     # 加载配置（agent 和普通模式都需要）
     from src.utils.file_io import load_optimize_config
