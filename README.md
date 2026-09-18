@@ -1,343 +1,307 @@
 # PAO — Process Aspen Optimization
 
-> 基于贝叶斯优化 + LangGraph 多智能体的 Aspen Plus 化工流程多目标优化框架
+PAO 是一个以 Aspen Plus 为仿真执行层的化工流程优化工具。项目通过 Windows COM 驱动 Aspen Plus，把 YAML 配置、单目标/多目标贝叶斯优化、Pareto 分析、工艺知识和 Agent 决策串成一套可追溯的实验闭环。
 
-PAO 通过 Windows COM 自动化驱动 Aspen Plus，将贝叶斯代理模型优化算法、帕累托多目标搜索、LangGraph 协作状态机、HITL（人机协同）工作流与经济/排放目标计算集成为一套完整的流程优化工具链，并提供 FastAPI 后端 + Vue 3 前端可视化界面。
+当前仓库的主线是 **CLI + Aspen 驱动 + 优化器 + 一个主决策 Agent**。Agent 不直接操作 COM，而是读取工艺事实和历史工况，提出受约束的结构化动作；PAO 校验动作后调用现有仿真接口，再把结果反馈给下一轮决策。
 
----
+## 当前实现范围
 
-## 自主 Agent 优化闭环
+| 入口 | 输入 | 当前行为 |
+|---|---|---|
+| 普通 YAML | `optimizer.type: bayesian` | 单目标贝叶斯优化 |
+| 普通 YAML | `optimizer.type: pareto_bayesian` | 多目标 Pareto 贝叶斯优化 |
+| Agent YAML | YAML + `--agent`，或 YAML 中 `agent_loop.enabled: true` | 进入持久化自主实验闭环；当前要求 Pareto 配置 |
+| 裸 Aspen 文件 | `.bkp/.apw` + `--agent` | Coordinator 根据 `--intent` 路由到接入、边界、动力学或过程分析任务 |
+| LangGraph | `PAOGraphState.agent_loop.enabled=True` | 保留首次人工确认，确认后进入自主闭环 |
 
-现在支持一个主决策 Agent 在小批次仿真之间读取证据、提出结构化动作、调整软搜索区域并检验效果。包含总预算、失败触发、约束学习、断点恢复和最终工况复验。工程硬边界、目标和产品约束不会被 Agent 修改。
+裸 Aspen 文件的 Coordinator 是任务接入和路由入口；真正的“仿真结果 → 下一次参数决策”闭环使用 YAML Agent 入口。当前不需要多 Agent 才能完成闭环：一个主决策 Agent 负责假设和动作，现有优化器负责候选生成，Aspen 负责过程评价，数据库负责证据留存。
 
-```bash
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --dry-run
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent
-# 中断后恢复同一会话
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent --resume
+## Agent 闭环
+
+```mermaid
+flowchart TD
+    A["工艺事实 + 知识 + 历史工况"] --> B["主决策 Agent"]
+    B --> C["ActionPlan 校验器"]
+    C --> D["搜索会话 + 单次仿真"]
+    D --> E["Aspen Plus COM"]
+    E --> F["ProcessCase + SQLite"]
+    F --> A
 ```
 
-详见 [自主闭环使用说明](docs/agent_closed_loop.md)。没有 LLM key 时明确降级为规则决策。`--agent` + YAML 使用新闭环；普通 YAML 不启用 `agent_loop` 时仍使用原优化器。Web 部分是历史架构说明，当前仓库没有跟踪 backend/frontend 源码。
+每轮闭环包含以下步骤：
 
-## 功能特性
+1. 读取近期收敛状态、目标、约束、失败诊断、Pareto 证据和剩余预算。
+2. Agent 输出 `ActionPlan`，动作只能是 `continue`、`set_region`、`probe` 或 `stop`。
+3. 程序校验证据 ID、变量类型、整数约束、变量依赖、硬边界、搜索区域和批次预算。
+4. `ParetoSearchSession` 在软搜索区内生成候选；随后执行整数修复、derived 变量映射、预检查和实际 Aspen 输入去重。
+5. `run_case()` 调用 Aspen，结果以 `ProcessCase` 保存，并通过 `tell()` 更新代理模型。
+6. 达到目标、预算耗尽、连续失败、停滞或 Agent 请求停止时，对一个代表可行工况进行独立复验。
 
-| 功能 | 说明 |
-|------|------|
-| **单目标贝叶斯优化** | 支持 GP / RF / ET / GBRT 代理模型，EI / UCB / PI 采集函数 |
-| **多目标帕累托优化** | NSGA-II 快速非支配排序 + 拥挤距离，WFG 超体积指标 |
-| **自适应区域搜索** | 三阶段策略：空间分区 → DOE 采样 → 贝叶斯精化 |
-| **参数扫描 (DOE)** | 网格 / LHS 拉丁超立方 / 随机采样 |
-| **经济目标** | TAC 总年费用（Turton 方法，CAPEX + OPEX） |
-| **排放目标** | LCA 全生命周期 CO₂ 当量核算 |
-| **AI 协作 Onboarding** | LLM 自动扫描 Aspen 变量、解析优化意图、生成配置草案 |
-| **HITL 人机协同** | LangGraph 状态机在关键节点暂停，等待用户确认或决策 |
-| **实时进度推送** | FastAPI SSE 流推送 Pareto 前沿 + 超体积历史 |
-| **SQLite 持久化** | 所有运行案例自动存入本地数据库，支持断点续算 |
-| **YAML 配置驱动** | 无需修改代码，通过配置文件定义优化问题 |
-| **优雅降级** | scikit-optimize / numpy 缺失时自动回退到随机采样 |
+Agent 可以改变软搜索区，但不能修改以下内容：
 
----
+- `design_variables` 的工程硬边界；
+- 产品纯度、流量、温度等约束；
+- 目标函数、物性模型和反应动力学参数；
+- 任意 Aspen 写入路径或可执行代码。
 
-## 系统架构
+没有配置 LLM key 时，`ProcessDecisionAgent` 会明确降级为规则决策，闭环、预算、约束和断点机制仍然运行。
 
-```
-┌─────────────────────────────────────────┐
-│           Vue 3 前端 (frontend/)         │
-│  Pareto 图 · SSE 实时流 · HITL 交互面板  │
-└────────────────┬────────────────────────┘
-                 │ HTTP / SSE
-┌────────────────▼────────────────────────┐
-│       FastAPI 后端 (backend/)            │
-│  /session/start  /stream  /resume        │
-│  /status  /report                        │
-└────────────────┬────────────────────────┘
-                 │
-┌────────────────▼────────────────────────┐
-│     LangGraph 协作状态机 (src/agents/)   │
-│                                         │
-│  onboarding → human_confirm             │
-│      → optimization → analysis          │
-│      → human_decide → done              │
-└────────────────┬────────────────────────┘
-                 │
-┌────────────────▼────────────────────────┐
-│   Aspen Plus COM 驱动 (src/aspen_driver/)│
-│   优化算法层 (src/optimization/)         │
-│   SQLite 持久化 (src/database/)          │
-└─────────────────────────────────────────┘
-```
-
----
+详细设计见 [docs/agent_closed_loop.md](docs/agent_closed_loop.md)。
 
 ## 环境要求
 
-- **操作系统**：Windows 10 / 11（Aspen Plus COM 接口仅支持 Windows）
-- **Python**：3.9 或以上
-- **Node.js**：18 或以上（仅前端开发需要）
-- **Aspen Plus**：已安装并激活许可证（支持 V11 及以上版本）
-- 依赖库见 [requirements.txt](requirements.txt)
-
----
-
-## 安装
-
-```bash
-# 1. 克隆仓库
-git clone <repo-url>
-cd PAO
-
-# 2. 创建虚拟环境（推荐）
-python -m venv .venv
-.venv\Scripts\activate
-
-# 3. 安装 Python 依赖
-pip install -r requirements.txt
-
-# 4. 安装前端依赖（可选，仅 Web UI 开发时需要）
-cd frontend
-npm install
-cd ..
-```
-
----
+- Python 3.10+（CI 使用 Python 3.12，建议使用 3.12）。
+- 真实 Aspen 运行：Windows、已安装并激活许可证的 Aspen Plus，以及可用的 `.bkp`/`.apw` 模型。
+- Linux/macOS：可以运行不连接 Aspen 的合成测试和配置检查，但不能使用 Windows COM 驱动真实 Aspen。
+- 完整依赖见 [requirements.txt](requirements.txt)；其中 `torch`/`botorch`/`gpytorch` 用于可选 qEHVI/qNEHVI 后端，缺失时会退回兼容的 GP/随机搜索路径。
 
 ## 快速开始
 
-### 方式一：命令行直接运行
+### 1. 真实 Aspen 运行
+
+真实仿真需要 Windows、Aspen Plus 和可用许可证。建议从项目根目录执行：
+
+```powershell
+git clone https://github.com/RuoQ3/PAO.git
+cd PAO
+
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+### 2. 先做配置检查
+
+`--dry-run` 不连接 Aspen、不调用 LLM，也不修改 YAML：
 
 ```bash
-# 单次确定性运行
-python src/main.py cases/demo_case/case_config.yaml
-
-# 单目标贝叶斯优化
-python src/main.py cases/demo_case/case_config.yaml --db results.db
-
-# 多目标帕累托优化
-python src/main.py cases/demo_case/pareto_config.yaml --db results.db
-
-# 干运行（仅验证配置，不启动 Aspen）
-python src/main.py cases/demo_case/pareto_config.yaml --dry-run
+python -m src.main cases/demo_case_2/agent_loop_config.yaml --dry-run
 ```
 
-#### 命令行参数
+### 3. 启动 Agent 闭环
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `config` | YAML 配置文件路径 | 必填 |
-| `--db` | SQLite 数据库路径 | `results.db` |
-| `--log` | 日志级别 (DEBUG/INFO/WARNING) | `INFO` |
-| `--log-file` | 日志文件路径 | 无（仅控制台） |
-| `--dry-run` | 仅解析配置，不运行仿真 | `False` |
-
----
-
-### 方式二：Web UI（后端 + 前端）
+示例配置已经包含 `agent_loop.enabled: true`、硬边界、软搜索区、工艺事实和默认知识库：
 
 ```bash
-# 1. 启动后端
-python -m backend.server
-# 或：uvicorn backend.app:app --reload --port 8000
+# 启动新会话；总预算 40 次，包含最终复验
+python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent
 
-# 2. 启动前端（另开终端）
-cd frontend
-npm run dev
-# 浏览器访问 http://localhost:5173
+# 使用命令行指定 checkpoint 路径
+python -m src.main cases/demo_case_2/agent_loop_config.yaml \
+  --agent --checkpoint cases/demo_case_2/output/agent_run.db
+
+# 从同一个 checkpoint 恢复
+python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent --resume
 ```
 
-前端提供：
-- 多智能体 7 节点状态矩阵可视化
-- Pareto 前沿实时图表
-- HITL 确认/决策交互面板
-- 优化完成后 Markdown 报告展示
+配置中的相对 `checkpoint_path` 相对于 YAML 文件所在目录解析。checkpoint 已存在时必须显式使用 `--resume`；不要把 checkpoint 和 `SimulationDB` 指向同一个 SQLite 文件。
 
----
+闭环结束后会生成：
 
-## AI Agent 协作工作流
+- `*.db`：Agent checkpoint，保存动作、证据、预算、随机状态和 pending 状态；
+- `*.report.json`：机器可读审计记录；
+- `*.report.md`：人类可读的决策和结果报告；
+- `simulation.db`：现有报告/查询层使用的工况数据库投影。
 
-PAO 内置基于 LangGraph 的多智能体协作状态机（`src/agents/graph.py`），节点流程如下：
+### 4. 运行普通优化器
 
+不启用 `agent_loop` 时，仍可直接运行现有优化器：
+
+```bash
+# 多目标 Pareto 优化
+python -m src.main cases/demo_case/pareto_config.yaml
+
+# 指定结果数据库和日志级别
+python -m src.main cases/demo_case/pareto_config.yaml \
+  --db cases/demo_case/output/run.db --log DEBUG
+
+# 只检查配置
+python -m src.main cases/demo_case/pareto_config.yaml --dry-run
 ```
-START
-  └→ onboarding_node        # 扫描 Aspen 文件 + 解析用户意图 + 生成配置草案
-       └→ human_confirm_node  # [HITL 暂停] 用户审查草案、修改边界/约束
-            └→ optimization_node  # 运行 Pareto 贝叶斯优化（写入 SQLite）
-                 └→ analysis_node    # Process Advisor 只读分析
-                      └→ human_decide_node  # [HITL 暂停] 继续 / 调整 / 结束
-                           ├→ continue → human_confirm_node
-                           ├→ adjust  → onboarding_node
-                           └→ done   → done_node → END
+
+### 5. 接入裸 Aspen 文件
+
+裸 `.bkp`/`.apw` 文件不能直接进入 YAML 优化循环，需要先使用 Coordinator 描述任务：
+
+```bash
+python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent \
+  --intent "帮我接入这个工艺并分析可调变量"
+
+# 连续对话模式；会记住上一轮生成的配置或数据库路径，但不记忆拟合数值
+python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent --chat
 ```
 
-**HITL 交互方式：**
-- 图在 `human_confirm` 和 `human_decide` 节点执行前自动暂停
-- 通过 SSE 推送 `hitl_prompt` 事件，前端展示对应界面
-- 用户提交后调用 `POST /api/session/{id}/resume` 恢复执行
+动力学拟合任务可附带实验数据：
 
----
+```bash
+python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent \
+  --intent "帮我拟合这批实验数据的活化能" \
+  --data path/to/kinetics.csv
+```
 
-## API 端点
+## LLM 配置
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `POST` | `/api/session/start` | 启动新优化会话，返回 `session_id` |
-| `GET` | `/api/session/{id}/stream` | SSE 事件流（message / hitl_prompt / progress / done / error） |
-| `POST` | `/api/session/{id}/resume` | 提交 HITL 响应，恢复暂停会话 |
-| `GET` | `/api/session/{id}/status` | 心跳查询（running / hitl_paused / done / error） |
-| `GET` | `/api/session/{id}/report` | 获取优化完成后的 Markdown 报告 |
-| `GET` | `/` | 健康检查 |
+LLM key 不写入 YAML、代码或 checkpoint，只从环境变量读取。可复制 `.env.example`：
 
-所有端点均支持 `?mock=true` 参数切换到 mock 模式，不依赖真实 Aspen，适合前端开发与演示。
+```powershell
+Copy-Item .env.example .env
+```
 
----
+支持的环境变量：
 
-## 配置文件格式
+| 变量 | 作用 |
+|---|---|
+| `PAO_LLM_PROVIDER` | `anthropic`、`openai` 或 `deepseek` |
+| `PAO_LLM_MODEL` | 模型名；留空使用 provider 默认值 |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` | 对应 provider 的 key |
+| `PAO_LLM_TEMPERATURE` | 采样温度，默认 `0.2` |
+| `PAO_LLM_MAX_TOKENS` | 单次输出上限，默认 `2048` |
+
+使用某个 provider 时，还需要安装对应的 LangChain provider adapter。没有 key 或 adapter 时，Agent 会回退到规则决策或返回明确错误，不会伪装成 LLM 已经执行。
+
+## YAML 配置要点
+
+当前解析器使用 `n_initial_points`、`n_iterations` 和 `acquisition_function` 等字段；旧 README 中的 `n_initial`、`acquisition` 写法不应直接复制。
 
 ```yaml
-# 仿真器设置
 simulator:
-  filepath: path/to/simulation.bkp   # Aspen 备份文件路径
-  visible: false
-  suppress_dialogs: true
+  filepath: cases/demo_case_2/2epsd.bkp
+  reinit: true                 # Agent 闭环必须为 true
+  verify_inputs: true
   timeout: 300
 
-# 设计变量
 design_variables:
-  - name: feed_flow
-    aspen_path: \Data\Streams\FEED\Input\TOTFLOW\MIXED
-    type: continuous          # continuous | integer
-    lower_bound: 100.0
-    upper_bound: 500.0
-    initial_value: 300.0
+  - name: T1_RR
+    aspen_path: \\Data\\Blocks\\T1\\Input\\BASIS_RR
+    type: continuous           # continuous | integer | derived
+    lower_bound: 0.416
+    upper_bound: 2.08
+    initial_value: 0.832
 
-# 目标函数
 objectives:
-  - name: TAC
-    type: tac                 # tac | emissions | aspen_path
+  - name: CAPEX
+    type: custom_module         # aspen_path | tac | emissions | custom_module
+    module: cases/demo_case_2/epsd_objectives.py
+    function: make_epsd_capex_objective
     minimize: true
-    unit: $/yr
-  - name: CO2
-    type: emissions
-    minimize: true
-    unit: kg/yr
 
-# 约束条件（可选）
 constraints:
-  - name: purity
-    aspen_path: \Data\Streams\PROD\Output\MOLEFRAC\MIXED\ETHANOL
+  - name: product_purity
+    aspen_path: \\Data\\Streams\\D1\\Output\\MOLEFRAC\\MIXED\\PF
     operator: ">="
-    threshold: 0.995
+    threshold: 0.999
 
-# 优化器
 optimizer:
-  type: pareto_bayesian       # run | bayesian | pareto_bayesian | param_scan | adaptive_region
-  surrogate_model: GP         # GP | RF | ET | GBRT | random
-  acquisition: EI             # EI | UCB | PI
-  n_initial: 10
-  n_iterations: 40
-  scalarization: Tschebycheff
+  type: pareto_bayesian
+  n_initial_points: 20
+  n_iterations: 60
+  surrogate_model: qEHVI    # GP | RF | ET | GBRT | random | qEHVI | NEHVI
+  acquisition_function: EI  # EI | UCB | PI
+  scalarization: chebyshev  # weighted_sum | chebyshev
+  random_seed: 42
+
+search_region:
+  T1_RR: [0.7, 1.0]          # 软搜索区，可用变量 name 或 Aspen path
+
+agent_loop:
+  enabled: true
+  max_evaluations: 40
+  batch_size: 5
+  failure_trigger: 3
+  max_decisions: 12
+  max_step_fraction: 0.1
+  verification_repeats: 1
+  verification_rtol: 0.02
+  objective_targets: {}
+  checkpoint_path: output/agent_checkpoint.db
+  process_facts:
+    description: "体系、物性方法、设备限制和已知可行工况"
 ```
 
----
+几个容易混淆的字段：
 
-## 优化工作流说明
+| 配置 | 含义 |
+|---|---|
+| `lower_bound` / `upper_bound` | Agent 不可突破的工程硬边界 |
+| `search_region` | Agent 可调整的软搜索区，始终必须在硬边界内 |
+| `agent_loop.max_evaluations` | Agent 闭环总预算，失败、预检查拦截和复验都占用预算 |
+| `agent_loop.objective_targets` | 可选的原始目标阈值；空字典不表示自动达标 |
+| `type: derived` | 优化虚拟变量，运行前按依赖变量映射为真实 Aspen 输入 |
+| `type: custom_module` | 从指定 Python 模块加载目标函数；模块内容会参与 checkpoint 指纹 |
 
-```
-src/main.py (CLI 入口)
-    │
-    ├── run_case                  单次确定性运行
-    ├── optimize_case             单目标贝叶斯优化循环
-    ├── optimize_pareto_case      多目标帕累托 + 贝叶斯
-    ├── param_scan                DOE 参数扫描
-    └── adaptive_region_search    三阶段自适应区域搜索
-            │
-            ├── Phase 0：输入空间分区（超立方网格）
-            ├── Phase 1：各区域 DOE 采样 → 收敛率 / 灵敏度分析
-            └── Phase 2：高优先级区域 → optimize_pareto_case 精化
-```
+改变硬边界、产品约束、物性/动力学模型或目标函数，代表一个新的优化问题，应使用新的 checkpoint。
 
-所有工作流均通过 `SimulationDB` 将案例实时写入 SQLite，支持中断恢复、按目标排序查询与跨会话历史对比。
+## 持久化、约束和复验
 
----
+- checkpoint 是闭环恢复的权威记录，`SimulationDB` 是查询和报告投影。
+- 每次调用 Aspen 前都会先保存 `pending` 并扣除预算；进程在仿真中途退出时，该次结果按“未知失败”计入预算，不自动重复运行。
+- 恢复时会重建代理模型，不恢复 COM 对象；首次运行、恢复会话、上一轮失败或驱动重建后会强制使用 `reset` 初始化。
+- 收敛但违反产品约束的工况仍可进入 BoTorch 约束/目标学习；Pareto 前沿只接受可行工况。
+- `target_verified` 只表示同一个代表工况达到目标并通过复验，不表示整个 Pareto 前沿或全局最优已经被证明。
 
-## 目录结构
+闭环结果状态：
 
-```
+| 状态 | 含义 |
+|---|---|
+| `target_verified` | 代表工况达到目标并通过独立复验 |
+| `completed_verified` | 代表工况复验通过，但没有指定目标声明 |
+| `verification_failed` | 复验未收敛、约束失败或目标偏差超出容差 |
+| `no_feasible_solution` | 当前预算内没有找到可行解 |
+| `unverified` | 例如 Aspen 驱动不可用，未完成复验 |
+
+## 代码结构
+
+```text
 PAO/
 ├── src/
-│   ├── main.py                  # CLI 入口
-│   ├── agents/                  # LangGraph 多智能体层
-│   │   ├── graph.py             # 协作状态机（B2 阶段）
-│   │   ├── onboarding_agent/    # Onboarding：变量发现 + 配置草案生成
-│   │   ├── hitl_protocol.py     # HITL 交互协议定义
-│   │   └── tools/               # Agent 工具集（validate_config 等）
-│   ├── aspen_driver/            # Aspen Plus COM 底层驱动
-│   ├── models/                  # 数据模型（ProcessCase、SimulationResult 等）
-│   ├── workflows/               # 高层工作流（优化、扫描、自适应搜索）
-│   ├── optimization/            # 算法层（代理模型、帕累托、灵敏度）
-│   ├── database/                # SQLite 持久化（node_db、simulation_db）
-│   ├── economics/               # TAC / 排放目标计算
-│   ├── reporting/               # 摘要报告生成（Markdown）
-│   └── utils/                   # 日志、文件 IO、单位换算
-├── backend/                     # FastAPI 后端
-│   ├── app.py                   # API 路由（H4-1）
-│   ├── models.py                # Pydantic 请求/响应模型
-│   ├── session_store.py         # 会话状态管理
-│   └── server.py                # 启动入口
-├── frontend/                    # Vue 3 前端
-│   ├── src/
-│   │   ├── views/               # 页面视图
-│   │   ├── components/          # 组件（Pareto 图、Agent 矩阵、HITL 面板）
-│   │   └── stores/              # Pinia 状态管理
-│   └── package.json
-├── tests/                       # pytest 测试套件
-├── cases/                       # 示例案例与配置文件
-│   └── demo_case/
-│       ├── pareto_config.yaml
-│       └── *.bkp                # Aspen 备份文件
-├── configs/
-│   └── aspen_semantics/         # Aspen 语义元数据映射（RADFRAC、HEATX 等）
-├── docs/                        # 开发文档
-├── reports/                     # 运行报告输出
-├── scripts/                     # 辅助脚本
-├── requirements.txt
-└── README.md
+│   ├── main.py                       # CLI 入口
+│   ├── aspen_driver/                 # Aspen Plus COM、节点、运行和导出
+│   ├── workflows/
+│   │   ├── run_case.py               # 单次仿真与目标/约束计算
+│   │   ├── optimize_case.py          # 单目标优化
+│   │   ├── optimize_pareto_case.py   # 多目标优化与闭环路由
+│   │   ├── agent_entry.py            # Agent 配置和结果适配
+│   │   └── agent_optimize.py         # observe/decide/ask/evaluate/tell
+│   ├── optimization/
+│   │   ├── search_session.py         # 增量 ask/tell 搜索会话
+│   │   ├── surrogate.py              # skopt 与随机回退
+│   │   ├── botorch_backend.py        # 可选 qEHVI/qNEHVI 后端
+│   │   └── pareto.py                 # Pareto 与超体积计算
+│   ├── agents/
+│   │   ├── closed_loop/              # ActionPlan、主 Agent、checkpoint
+│   │   ├── coordinator/              # 裸 Aspen 文件的任务路由
+│   │   ├── onboarding_agent/         # 变量发现和配置草案
+│   │   ├── boundary_advisor/         # 边界建议
+│   │   ├── process_advisor/          # 结果分析
+│   │   ├── kinetics_advisor/         # 动力学拟合/建议
+│   │   ├── graph.py                  # LangGraph + HITL 状态机
+│   │   └── hitl_protocol.py          # HITL 会话协议
+│   ├── database/                     # SimulationDB 与 node DB
+│   ├── models/                       # ProcessCase、SimulationResult 等
+│   └── economics/                    # TAC 与排放目标
+├── cases/                            # Aspen 模型和 YAML 示例
+├── configs/aspen_semantics/          # Aspen 语义规则
+├── configs/process_knowledge/        # Agent 可审查工艺知识
+├── docs/                             # 设计和使用文档
+└── tests/                            # Linux 可执行的合成/集成测试
 ```
 
----
+当前仓库没有跟踪 `backend/` 或 `frontend/` 源码，因此本 README 不提供 Web 服务启动命令；`requirements.txt` 中保留的 FastAPI 相关依赖不能代表 Web 控制面板已经包含在本仓库中。
 
-## 运行测试
+## 测试与 CI
+
+不连接 Aspen 的 Linux 测试可以安装最小依赖后执行：
 
 ```bash
-# 运行全部测试
-pytest tests/
-
-# 仅运行不依赖 Aspen 的单元测试
-pytest tests/ -k "not aspen"
-
-# 查看详细输出
-pytest tests/ -v
+python -m pip install pytest PyYAML numpy scikit-optimize python-dotenv langgraph langchain-core
+python -m pytest -q
+python -m compileall -q src tests
 ```
 
-> 集成测试（`smoke_test_*.py`）需要有效的 Aspen Plus 安装与许可证。不含 Aspen 环境时，单元测试（`test_*_logic.py`）可独立运行。
+当前闭环改造的测试结果为 `29 passed, 1 skipped`。跳过项是可选 BoTorch 联合 GP 测试；安装兼容的 `torch`、`botorch` 和 `gpytorch` 后才会运行。GitHub Actions 配置位于 `.github/workflows/agent-loop.yml`。
 
----
+真实 Aspen 验收仍需在 Windows + Aspen Plus 环境中进行，建议使用同一 `.bkp` 副本、同一目标/约束和相同总调用预算，对比普通优化器与 Agent 闭环的可行率、首次达标时间、最终目标、失败次数和复验结果。
 
-## 依赖说明
+## 许可证与使用范围
 
-| 包 | 用途 | 是否必需 |
-|----|------|----------|
-| `pywin32` | Aspen Plus COM 自动化 | ✅ 必需 |
-| `PyYAML` | 配置文件解析 | ✅ 必需 |
-| `fastapi` + `uvicorn` | HTTP / SSE 后端 | ✅ 后端必需 |
-| `langgraph` | 多智能体状态机 | ✅ Agent 工作流必需 |
-| `numpy` | LHS 采样加速 | ⚡ 可选（缺失时回退随机采样） |
-| `scikit-optimize` | 贝叶斯代理模型 | ⚡ 可选（缺失时回退随机采样） |
-| `scipy` / `scikit-learn` | scikit-optimize 依赖 | ⚡ 随 skopt 安装 |
-| `matplotlib` | 帕累托前沿可视化脚本 | 📊 仅脚本 |
-| `pytest` | 测试框架 | 🧪 仅开发 |
-
----
-
-## License
-
-本项目为私有研究代码，未经授权禁止分发。
+本项目当前为研究与工程验证代码。请在实际工艺应用前核对 Aspen 模型、物性方法、设备边界、产品约束和结果复验，不要把 Agent 的规则判断当作经过认证的化工专家系统结论。
