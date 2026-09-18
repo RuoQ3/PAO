@@ -72,6 +72,13 @@ agent_loop:
 
 `continue` 继续采样；`set_region` 修改软区域；`probe` 指定候选；`stop` 请求停止。`expected_effect` 只能是 convergence / feasibility / objective / information。动作不允许包含任意代码、任意 Aspen 写入路径、目标或约束改动。
 
+主 Agent 的文本响应不会直接进入执行层。程序先提取其中唯一的 JSON 对象，再检查 `ActionPlan` 协议：
+`set_region` 只能填写 `search_region`，`probe` 只能填写完整 `candidate`，而 `continue`/`stop`
+必须将这两个映射留空。空响应、Markdown 围栏、前后缀文本或上述字段冲突会触发一次带纠正提示的重试；
+重试仍失败时记录拒绝原因并使用确定性的规则动作。该动作仍经过同一边界、证据和预算校验。
+协议拒绝不是实验停滞，因此不会增加 `stagnation_count`；真正执行的实验批次仍会按 `stagnation_batches`
+计数。checkpoint 的每个动作效果包含 `stagnation_counted` 和当时的 `stagnation_count`，便于审计。
+
 `initialization: previous` 只在当前进程的 Aspen 确实保有上次收敛状态时生效。首次运行、恢复会话、失败或驱动重建后强制 reset。reset 使用配置中的固定初始化值，不复用上一轮 inherit 的循环流估值；复验总是 reset。
 
 本闭环自己管理软区域、步长、停止和预算。因此旧整轮工作流的 Phase 0 DOE、敏感度探针、ThawScheduler、TrustRegion、boundary_refine 与 early_stopping 不会同时启动。已复用的是目标/约束计算、单次仿真、预检查、变量映射、可行性分类器和代理模型。避免两个控制器同时修改同一个搜索区域。

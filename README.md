@@ -52,6 +52,8 @@ Agent 可以改变软搜索区，但不能修改以下内容：
 - 任意 Aspen 写入路径或可执行代码。
 
 没有配置 LLM key 时，`ProcessDecisionAgent` 会明确降级为规则决策，闭环、预算、约束和断点机制仍然运行。
+配置了 LLM 时，主 Agent 的返回先经过 JSON 提取和 `ActionPlan` 协议校验；空响应、带围栏/前后缀的响应和动作字段冲突会自动进行一次纠正重试。
+两次都不合格时，程序记录拒绝原因并切换到确定性的规则动作，不会把未经校验的内容写入 Aspen。被拒绝的 LLM 提案不会消耗 `stagnation_batches` 的停滞耐心，真正完成的实验批次仍按原规则计数。
 
 详细设计见 [docs/agent_closed_loop.md](docs/agent_closed_loop.md)。
 
@@ -184,6 +186,8 @@ Copy-Item .env.example .env
 | `PAO_LLM_MAX_TOKENS` | 单次输出上限，默认 `2048` |
 
 使用某个 provider 时，还需要安装对应的 LangChain provider adapter。没有 key 或 adapter 时，Agent 会回退到规则决策或返回明确错误，不会伪装成 LLM 已经执行。
+
+主 Agent 的响应协议是故意收紧的：`set_region` 只能填写 `search_region`，`probe` 只能填写完整的 `candidate`，`continue`/`stop` 必须把两者都留空。这样可以避免把一次“建议改区域”的文本误当成候选点直接写入 Aspen。
 
 ## YAML 配置要点
 
@@ -325,7 +329,7 @@ python -m pytest -q
 python -m compileall -q src tests
 ```
 
-当前闭环改造的测试结果为 `35 passed, 1 skipped`。跳过项是可选 BoTorch 联合 GP 测试；安装兼容的 `torch`、`botorch` 和 `gpytorch` 后才会运行。GitHub Actions 配置位于 `.github/workflows/agent-loop.yml`。
+测试覆盖了主 Agent 的 JSON 重试、动作字段协议、拒绝提案的停滞计数、断点恢复和离线分析。可选 BoTorch 联合 GP 测试在未安装兼容的 `torch`、`botorch` 和 `gpytorch` 时会跳过。GitHub Actions 配置位于 `.github/workflows/agent-loop.yml`。
 
 真实 Aspen 验收仍需在 Windows + Aspen Plus 环境中进行，建议使用同一 `.bkp` 副本、同一目标/约束和相同总调用预算，对比普通优化器与 Agent 闭环的可行率、首次达标时间、最终目标、失败次数和复验结果。
 
