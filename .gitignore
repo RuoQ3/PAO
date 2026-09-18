@@ -16,6 +16,7 @@ __pycache__/
 .pytest-tmp/
 .pycache-tmp/
 .Python
+tests/
 
 # 构建产物
 build/
