@@ -47,6 +47,14 @@ def test_existing_optimizer_entry_routes_to_loop_and_report(tmp_path, monkeypatc
     assert "completed_verified" in result.early_stop_reason
     assert (tmp_path / "agent.report.json").exists()
     assert (tmp_path / "agent.report.md").exists()
+    report = (tmp_path / "agent.report.md").read_text(encoding="utf-8")
+    assert "## 一、执行摘要" in report
+    assert "## 二、已经完成的工作" in report
+    assert "## 四、专业建议" in report
+    assert "## 五、结论边界" in report
+    assert "```json" not in report
+    assert "隐藏思维" not in report
+    assert len(report.splitlines()) < 180
     config.agent_resume = True
     monkeypatch.setattr(loop, "run_case", lambda *a, **kw: pytest.fail("terminal resume must not run"))
     assert optimize_pareto_case(None, config).n_total == 5
