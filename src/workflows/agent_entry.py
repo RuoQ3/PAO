@@ -83,6 +83,7 @@ def validate_agent_config(config):
 def run_configured_agent(driver, config):
     from src.agents.closed_loop.journal import decode_case
     from src.agents.closed_loop.advisor import ProcessDecisionAgent
+    from src.agents.closed_loop.reporting import render_explanatory_report
     from src.optimization.pareto import compute_pareto, _restore_reference_point
     from src.workflows.agent_optimize import optimize_agent_case
     from src.workflows.optimize_pareto_case import ParetoOptimizeResult
@@ -102,16 +103,17 @@ def run_configured_agent(driver, config):
     reference_raw = _restore_reference_point(reference, sample, config.objective_names) if reference and sample else None
     pareto = compute_pareto(cases, config.objective_names, reference_point=reference_raw, compute_hv=True)
     # Human-readable report and machine-readable audit share the same checkpoint identity.
-    report_path = Path(checkpoint).with_suffix(".report.json")
-    report_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = ["# PAO 自主实验闭环报告", "", f"会话：{state['session_id']}",
-             f"结果：{state['result']}", f"停止原因：{state['termination_reason']}",
-             f"预算使用：{state['used']}/{settings.max_evaluations}",
-             "", "复验只针对选定代表工况，不代表整个 Pareto 前沿或全局最优。", ""]
-    for i, decision in enumerate(state["decisions"], 1):
-        lines += [f"## 决策 {i}（{decision['source']}）", decision["plan"]["hypothesis"],
-                  "", "```json", json.dumps(decision, ensure_ascii=False, indent=2), "```", ""]
-    Path(checkpoint).with_suffix(".report.md").write_text("\n".join(lines), encoding="utf-8")
+    report_json_path = Path(checkpoint).with_suffix(".report.json")
+    report_json_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_md_path = Path(checkpoint).with_suffix(".report.md")
+    report_md_path.write_text(
+        render_explanatory_report(
+            state,
+            settings=settings,
+            objective_names=config.objective_names,
+        ),
+        encoding="utf-8",
+    )
     return ParetoOptimizeResult(
         cases=cases, pareto_result=pareto, param_bounds=config.param_bounds,
         fixed_vars=config.fixed_vars, objective_names=config.objective_names,

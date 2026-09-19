@@ -128,8 +128,13 @@ python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent --resume
 
 - `*.db`：Agent checkpoint，保存动作、证据、预算、随机状态和 pending 状态；
 - `*.report.json`：机器可读审计记录；
-- `*.report.md`：人类可读的决策和结果报告；
+- `*.report.md`：面向工程师的分析报告，按“执行摘要—已完成工作—工程发现—专业建议—结论边界”组织内容；
 - `simulation.db`：现有报告/查询层使用的工况数据库投影。
+
+Markdown 报告只使用 checkpoint 中已经保存的可审计字段，不伪造 Agent 的隐藏思维过程，也不展示原始 JSON
+或代码。它会用工程语言解释优化目标、已完成的 Aspen 工作、约束瓶颈、代表工况和下一步建议。一次参数动作
+后的 HV、可行率或目标变化只能支持下一轮实验假设，不能单独证明该动作造成了变化；完整参数、状态、失败信息
+和 `before_analysis`/`after_analysis` 请查看同名 `.report.json`。
 
 ### 4. 运行普通优化器
 
