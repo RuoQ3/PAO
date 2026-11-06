@@ -1,7 +1,7 @@
 import json
 
-from src.agents.tools import analyze_closed_loop_tool
-from src.agents.tools.analyze_closed_loop import _impl_analyze_closed_loop
+from src.agents.subagents.tools import analyze_closed_loop_tool
+from src.agents.subagents.tools.analyze_closed_loop import _impl_analyze_closed_loop
 from src.database.simulation_db import SimulationDB
 from src.models.process_case import (
     CaseStatus,

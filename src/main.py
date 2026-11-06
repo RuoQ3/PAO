@@ -101,8 +101,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "后续提问不用重复给路径。若同时给了 --intent，先执行这一轮再进入循环。")
     parser.add_argument("--unified-chat", "--conversation", action="store_true",
                         help="启用统一只读工程对话：ProcessContext + IMA + 本地历史分析")
-    parser.add_argument("--legacy-coordinator-chat", action="store_true",
-                        help="使用旧 Coordinator --chat REPL（兼容模式）")
+    parser.add_argument("--legacy-coordinator-chat", action="store_true", help=argparse.SUPPRESS)
+    # "使用旧 Coordinator --chat REPL（兼容模式）")
     parser.add_argument("--yaml", dest="yaml_path", default=None, metavar="PATH",
                         help="统一对话使用的 YAML 配置路径")
     parser.add_argument("--node-db", dest="node_db_path", default=None, metavar="PATH",
@@ -188,7 +188,7 @@ def _load_var_metas(yaml_path: Path) -> tuple[list, dict, set]:
     (variables, var_types, integer_names)
     """
     import yaml as _yaml
-    from src.agents.boundary_advisor import VarMeta
+    from src.agents.subagents.boundary_advisor import VarMeta
 
     with open(yaml_path, encoding="utf-8") as f:
         cfg = _yaml.safe_load(f)
@@ -286,207 +286,52 @@ def _run_agent_mode(
 # Agent 模式：Coordinator（意图识别 + 任务拆解 + 分发执行）
 # ---------------------------------------------------------------------------
 
-def _print_coordinator_result(result) -> None:
-    """打印一次 Coordinator 执行结果（意图识别摘要 + 执行报告）。
-
-    被单轮模式（_run_coordinator_mode）和连续对话模式
-    （_run_coordinator_chat_loop）共用，保证两种模式下的输出格式一致。
-    """
-    from src.agents.coordinator.tools import format_execution_report
-
-    print(f"\n意图识别：{'LLM' if result.classification.used_llm else '规则兜底'}"
-          f"，共 {len(result.classification.steps)} 个步骤")
-    if result.classification.notes:
-        print(f"  总结：{result.classification.notes}")
-    for w in result.classification.warnings:
-        print(f"  警告：{w}")
-
-    _sep()
-    print(format_execution_report(result.execution))
-
-    if result.execution.has_clarify:
-        print("\n⚠ 部分/全部请求信息不足，无法确定具体任务。请补充说明后重新描述需求。")
-
-
-def _run_coordinator_mode(
-    aspen_file: Path,
-    intent_text: str,
-    data_csv: str | None,
-    log: logging.Logger,
-) -> int:
-    """
-    裸 Aspen 文件（尚无配置 YAML）时的 Agent 模式入口（单轮，无跨轮记忆）。
-
-    与 _run_agent_mode 的区别：_run_agent_mode 假定 design_variables 已经
-    填好，只做"推荐边界 + 跑优化"；这里假定用户可能什么都还没有，先做
-    意图识别，再路由到 onboarding_agent / boundary_advisor / kinetics_advisor /
-    process_advisor / optimize_pareto 中的一个或多个。
-
-    已知范围限定（见 src.agents.coordinator.agent 模块 docstring）：
-    不做任务间数值结果自动传递，不做 write_feasibility 验证。
-    """
-    from src.agents.coordinator import run_coordinator
-
-    _sep()
-    print("🤖  PAO Coordinator 模式")
-    print(f"    Aspen 文件：{aspen_file}")
-    print(f"    请求：{intent_text or '（未指定，将走规则兜底或提示澄清）'}")
-    _sep()
-
-    if not intent_text.strip():
-        print("\n⚠ 未提供 --intent，无法确定具体任务，请重新运行并附上 --intent 描述需求。")
-        return 1
-
-    result = run_coordinator(
-        intent_text,
-        aspen_file=str(aspen_file),
-        data_csv=data_csv,
-    )
-    _print_coordinator_result(result)
-
-    if result.execution.has_clarify:
-        return 1
-
-    return 1 if result.execution.has_errors() else 0
-
-
-# ---------------------------------------------------------------------------
-# Agent 模式：Coordinator 连续对话（--chat）
-# ---------------------------------------------------------------------------
-
-_CHAT_HELP_TEXT = """\
-可用元命令：
-  exit / quit   结束对话
-  help          显示本帮助
-  state         查看当前会话记住的文件路径
-
-直接输入自然语言描述你想做的任务即可，例如：
-  帮我接入这个工艺，扫描一下可调变量
-  帮我推荐一下边界
-  帮我拟合这批实验数据的活化能（需配合 --data 或后续版本支持对话内指定路径）
-"""
-
-
-def _run_coordinator_chat_loop(
-    aspen_file: Path,
-    initial_intent: str,
-    data_csv: str | None,
-    log: logging.Logger,
-) -> int:
-    """
-    连续对话模式：REPL 循环，多轮调用 run_coordinator_turn。
-
-    与 _run_coordinator_mode 的区别：维护一个 ChatSessionState，记住上一轮
-    任务产出的文件路径（如 onboarding 生成的配置 YAML），下一轮用户提问
-    缺少路径时自动填空。不记忆任何数值结果——那部分仍需用户自己看完上一轮
-    输出后决定下一轮怎么问。
-
-    退出码：正常通过 exit/quit 或 EOF 结束返回 0；由 --intent 触发的首轮
-    执行失败不会中断进入循环（让用户有机会在对话里补救）。
-    """
-    from src.agents.coordinator import ChatSessionState, run_coordinator_turn
-
-    session = ChatSessionState(aspen_file=str(aspen_file), data_csv=data_csv)
-
-    _sep()
-    print("🤖  PAO Coordinator 连续对话模式")
-    print(f"    Aspen 文件：{aspen_file}")
-    print("    输入 'help' 查看可用命令，输入 'exit' 结束对话。")
-    _sep()
-
-    def _run_turn(user_text: str) -> None:
-        result = run_coordinator_turn(session, user_text, data_csv=data_csv)
-        _print_coordinator_result(result)
-
-    if initial_intent.strip():
-        print(f"\nPAO> {initial_intent}")
-        try:
-            _run_turn(initial_intent)
-        except Exception as exc:  # noqa: BLE001 — 首轮失败不应阻止进入交互循环
-            log.error("首轮请求执行失败：%s", exc, exc_info=True)
-            print(f"\n⚠ 执行失败：{exc}")
-
-    while True:
-        try:
-            user_text = input("\nPAO> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见。")
-            return 0
-
-        if not user_text:
-            continue
-        if user_text.lower() in ("exit", "quit"):
-            print("再见。")
-            return 0
-        if user_text.lower() == "help":
-            print(_CHAT_HELP_TEXT)
-            continue
-        if user_text.lower() == "state":
-            for k, v in session.as_display_dict().items():
-                print(f"  {k}: {v}")
-            continue
-
-        try:
-            _run_turn(user_text)
-        except Exception as exc:  # noqa: BLE001 — 单轮失败不应中断整个对话
-            log.error("本轮请求执行失败：%s", exc, exc_info=True)
-            print(f"\n⚠ 执行失败：{exc}")
-
-
 def _run_unified_chat_loop(
-    *,
-    config_path: Path,
-    yaml_path: Path | None,
-    db_path: Path | None,
-    node_db_path: Path | None,
-    initial_intent: str,
-    log: logging.Logger,
+    *, config_path: Path, yaml_path: Path | None, db_path: Path | None,
+    node_db_path: Path | None, initial_intent: str, log: logging.Logger,
 ) -> int:
-    """Run the first usable read-only engineering conversation."""
-    from src.agents.conversation.unified import UnifiedConversation
+    """Run the unified Lead Agent conversation entry point."""
+    from src.agents.lead import ConversationSession, LeadAgent
+    from src.agents.orchestration import RuntimePolicy, SessionState
+    from src.agents.context import ProcessContextBuilder
 
     aspen_file = config_path if config_path.suffix.lower() in (".bkp", ".apw") else None
     if yaml_path is None and config_path.suffix.lower() in (".yaml", ".yml"):
         yaml_path = config_path
-    session = UnifiedConversation(
-        aspen_file=aspen_file,
-        yaml_path=yaml_path,
-        simulation_db_path=db_path,
-        node_db_path=node_db_path,
+    builder = ProcessContextBuilder(
+        yaml_path=yaml_path, aspen_file=aspen_file,
+        node_db=node_db_path if node_db_path and node_db_path.exists() else None,
+        simulation_db=db_path if db_path and db_path.exists() else None, read_only=True,
     )
-    print("\nPAO 统一只读工程对话")
-    print("输入 /help 查看命令，/status /sources /history /context 为只读查询，/exit 退出。")
-    print(session.state.context_summary)
+    session = ConversationSession(SessionState(), LeadAgent(
+        policy=RuntimePolicy(allow_writes=False), context_builder=builder))
+    print("\nPAO Lead Agent conversation")
+    print("?????/exit ???")
 
     def run_turn(text: str) -> bool:
+        if text.strip().lower() in {"/exit", "exit", "quit"}:
+            return True
         result = session.submit(text)
-        if result.output:
-            print(result.output)
-        if result.error:
-            print(f"错误：{result.error}")
-        if text.lstrip().lower().startswith("/open ") and not result.error:
-            # Rebuild the snapshot after a model switch; this still performs
-            # no Aspen COM access or writes.
-            session._initialize()  # noqa: SLF001 - CLI adapter refresh hook
-            print(session.state.context_summary)
-        return result.should_exit
+        print(result.text)
+        if result.recommendations:
+            print("??/??:", result.recommendations)
+        return False
 
-    if initial_intent.strip():
-        if run_turn(initial_intent):
-            session.close()
-            return 0
     try:
+        if initial_intent.strip() and run_turn(initial_intent):
+            return 0
         while True:
             try:
                 text = input("\nPAO> ")
             except (EOFError, KeyboardInterrupt):
-                print("\n再见。")
+                print("\n???")
                 return 0
             if run_turn(text):
-                print("再见。")
+                print("???")
                 return 0
     finally:
-        session.close()
+        builder.close()
+
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
@@ -514,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     config_path = Path(args.config)
     # Unified conversation is explicitly read-only.  It is available with a
     # YAML or Aspen path and never enters the optimization execution branch.
-    if args.unified_chat or (args.chat and not args.agent) or (args.chat and not args.legacy_coordinator_chat and args.agent and config_path.suffix.lower() not in (".bkp", ".apw")):
+    if args.unified_chat or args.chat:
         yaml_path = Path(args.yaml_path).resolve() if args.yaml_path else (config_path.resolve() if config_path.suffix.lower() in (".yaml", ".yml") else None)
         node_db_path = Path(args.node_db_path).resolve() if args.node_db_path else None
         return _run_unified_chat_loop(
@@ -527,28 +372,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.agent and config_path.suffix.lower() in (".bkp", ".apw"):
         if args.dry_run:
-            log.info("--dry-run 不执行接入向导；闭环配置校验请传 YAML。")
+            log.info("--dry-run skips Lead Agent interaction")
             return 0
-        if args.chat and not args.unified_chat and not args.legacy_coordinator_chat:
-            return _run_unified_chat_loop(
-                config_path=config_path.resolve(),
-                yaml_path=Path(args.yaml_path).resolve() if args.yaml_path else None,
-                db_path=db_path,
-                node_db_path=Path(args.node_db_path).resolve() if args.node_db_path else None,
-                initial_intent=args.intent,
-                log=log,
-            )
-        if args.chat:
-            return _run_coordinator_chat_loop(
-                aspen_file=config_path.resolve(),
-                initial_intent=args.intent,
-                data_csv=args.data,
-                log=log,
-            )
-        return _run_coordinator_mode(
-            aspen_file=config_path.resolve(),
-            intent_text=args.intent,
-            data_csv=args.data,
+        return _run_unified_chat_loop(
+            config_path=config_path.resolve(),
+            yaml_path=Path(args.yaml_path).resolve() if args.yaml_path else None,
+            db_path=db_path,
+            node_db_path=Path(args.node_db_path).resolve() if args.node_db_path else None,
+            initial_intent=args.intent,
             log=log,
         )
 

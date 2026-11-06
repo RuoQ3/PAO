@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.agents.closed_loop.analysis import (
+from src.agents.orchestration.closed_loop.analysis import (
     build_analysis_report,
     compare_analysis_reports,
 )
-from src.agents.closed_loop.contracts import ActionPlan, LoopConfig, validate_plan
-from src.agents.closed_loop.journal import SessionJournal
+from src.agents.orchestration.closed_loop.contracts import ActionPlan, LoopConfig, validate_plan
+from src.agents.orchestration.closed_loop.journal import SessionJournal
 from src.models.process_case import (
     CaseStatus,
     ConstraintValue,

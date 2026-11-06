@@ -7,8 +7,8 @@ import math
 import time
 from pathlib import Path
 
-from src.agents.closed_loop.advisor import load_knowledge
-from src.agents.closed_loop.contracts import LoopConfig, finite
+from src.agents.orchestration.closed_loop.advisor import load_knowledge
+from src.agents.orchestration.closed_loop.contracts import LoopConfig, finite
 
 
 def _resolve_file(raw, base):
@@ -81,9 +81,9 @@ def validate_agent_config(config):
 
 
 def run_configured_agent(driver, config):
-    from src.agents.closed_loop.journal import decode_case
-    from src.agents.closed_loop.advisor import ProcessDecisionAgent
-    from src.agents.closed_loop.reporting import render_explanatory_report
+    from src.agents.orchestration.closed_loop.journal import decode_case
+    from src.agents.orchestration.closed_loop.advisor import ProcessDecisionAgent
+    from src.agents.orchestration.closed_loop.reporting import render_explanatory_report
     from src.optimization.pareto import compute_pareto, _restore_reference_point
     from src.workflows.agent_optimize import optimize_agent_case
     from src.workflows.optimize_pareto_case import ParetoOptimizeResult
@@ -97,7 +97,7 @@ def run_configured_agent(driver, config):
     # the optimization loop; the closed-loop bridge falls back to local rules.
     technical_advisor = None
     try:
-        from src.agents.technical_advisor import TechnicalAdvisor
+        from src.agents.subagents.technical_advisor import TechnicalAdvisor
         from src.integrations.ima import ImaServiceClient
         technical_advisor = TechnicalAdvisor(ImaServiceClient.from_env())
     except Exception:

@@ -2,7 +2,7 @@
 
 ## 1. 范围与现状基线
 
-本阶段只定义公共接口、数据契约和调用边界，不连接真实 IMA，不改变现有 CLI、Aspen 驱动、优化闭环或 LangGraph 运行流程。接口包位于 `src/agents/contracts/`，只依赖 Python 标准库。
+本阶段只定义公共接口、数据契约和调用边界，不连接真实 IMA，不改变现有 CLI、Aspen 驱动、优化闭环或 LangGraph 运行流程。接口包位于 `src/agents/evidence/`，只依赖 Python 标准库。
 
 当前系统可以分成四层：
 
@@ -163,9 +163,9 @@ flowchart TD
 
 新增文件：
 
-- `src/agents/contracts/__init__.py`
-- `src/agents/contracts/models.py`
-- `src/agents/contracts/protocols.py`
+- `src/agents/evidence/__init__.py`
+- `src/agents/evidence/models.py`
+- `src/agents/evidence/protocols.py`
 - `tests/agents/contracts/test_models.py`
 - `docs/agent_conversation_architecture.md`
 

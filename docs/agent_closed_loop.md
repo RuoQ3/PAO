@@ -109,7 +109,7 @@ agent_loop:
 
 通用 Agent 或离线审查还可以调用 `analyze_closed_loop_tool`：它从 SimulationDB 按会话、
 迭代范围或 tags 过滤历史工况，返回同一结构化 JSON，不需要 Aspen COM。该工具已经通过
-`get_agent_tools()` 和 `RealToolRunner.analyze_closed_loop()` 注册；它是数据分析工具，不是
+`get_agent_tools()` 注册；它是数据分析工具，不是
 另一个自主决策 Agent。默认只把可行工况用于正式 Pareto，`include_infeasible=true` 仅用于
 约束松弛/可行域诊断。
 

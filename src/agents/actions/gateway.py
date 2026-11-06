@@ -26,6 +26,21 @@ class ActionGateway:
         self.audit.record(action.audit_id, AuditEventType.USER_REQUEST, actor=actor, status=status.value, payload=action.to_dict())
         self.audit.record(action.audit_id, AuditEventType.VALIDATION, status=status.value, message="; ".join(result.errors), payload={"warnings": result.warnings})
         return result
+
+    def preview_proposal(self, proposal):
+        """Translate a Lead proposal to a validated preview without executing it."""
+        action = ActionRequest(
+            action_type=proposal.action_type,
+            target=proposal.target,
+            reason=proposal.reason,
+            evidence=list(proposal.evidence_ids),
+            risk=list(proposal.risks),
+            requires_confirmation=proposal.requires_confirmation,
+        )
+        result = self.submit(action, actor="lead_agent")
+        if not result.valid or result.preview is None:
+            return {"valid": False, "errors": list(result.errors), "warnings": list(result.warnings)}
+        return {"valid": True, "audit_id": action.audit_id, "preview": result.preview.to_dict()}
     def preview(self, audit_id: str) -> ActionPreview:
         action, status, created, preview = self._get(audit_id); self._expire_if_needed(audit_id)
         _, status, _, preview = self._get(audit_id)

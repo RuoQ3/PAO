@@ -119,7 +119,7 @@ def _load_pareto_best(db_path: str, session_id: str | None) -> _ParetoRows:
         return _ParetoRows(rows=[], source="empty", warning="")
 
     try:
-        from src.agents.tools.summarize_pareto import _dict_to_process_case
+        from src.agents.subagents.tools.summarize_pareto import _dict_to_process_case
         from src.optimization.pareto import compute_pareto
 
         cases = [_dict_to_process_case(r) for r in all_rows]

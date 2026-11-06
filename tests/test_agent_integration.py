@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.agents.closed_loop.advisor import (
+from src.agents.orchestration.closed_loop.advisor import (
     ProcessDecisionAgent,
     parse_action_plan_response,
 )
@@ -37,7 +37,7 @@ def fake_run(driver, design_vars, run_config, iteration=0, tags=None, run_id=Non
 
 def test_existing_optimizer_entry_routes_to_loop_and_report(tmp_path, monkeypatch):
     import src.workflows.agent_optimize as loop
-    from src.agents.closed_loop.advisor import fallback_plan
+    from src.agents.orchestration.closed_loop.advisor import fallback_plan
     monkeypatch.setattr(loop, "run_case", fake_run)
     monkeypatch.setattr(ProcessDecisionAgent, "propose", lambda self, snap: (fallback_plan(snap, 2), "test"))
     config = cfg(tmp_path)
@@ -149,7 +149,7 @@ def test_graph_preserves_confirmation_and_skips_final_manual_loop(monkeypatch):
 
 def test_graph_optimization_forwards_agent_settings(tmp_path, monkeypatch):
     from src.agents import graph
-    from src.agents.tools import _common
+    from src.agents.subagents.tools import _common
     config = cfg(tmp_path)
     seen = []
     class Driver:
@@ -164,7 +164,7 @@ def test_graph_optimization_forwards_agent_settings(tmp_path, monkeypatch):
         seen.append(kw["config"])
         return SimpleNamespace(early_stop_reason="evaluation_budget:completed_verified")
     monkeypatch.setattr(_common, "_optimize_pareto_fn", optimize)
-    from src.agents.tools import optimize_pareto
+    from src.agents.subagents.tools import optimize_pareto
     monkeypatch.setattr(optimize_pareto, "_fmt_pareto_result_summary", lambda *a: "ok")
     result = graph.optimization_node(graph.PAOGraphState(
         config_yaml_path=str(tmp_path / "cfg.yaml"), agent_loop={"enabled": True, "max_evaluations": 6},

@@ -182,7 +182,7 @@ def _build_process_cases(rows: list[dict[str, Any]]) -> list[Any]:
     复用 summarize_pareto_tool 中的 _dict_to_process_case，避免重复实现。
     blocks/streams 不填充（轻量重建），适合 Pareto 计算和变量重要性分析。
     """
-    from src.agents.tools.summarize_pareto import _dict_to_process_case
+    from src.agents.subagents.tools.summarize_pareto import _dict_to_process_case
     return [_dict_to_process_case(r) for r in rows]
 
 
@@ -198,7 +198,7 @@ def _build_process_cases_with_blocks(rows: list[dict[str, Any]]) -> list[Any]:
     - convergence 字符串映射到 BlockConvergenceStatus，默认 SUCCESS
     - outputs 列表还原为 BlockOutput 对象列表
     """
-    from src.agents.tools.summarize_pareto import _dict_to_process_case
+    from src.agents.subagents.tools.summarize_pareto import _dict_to_process_case
     from src.models.block import BlockConvergenceStatus, BlockOutput, BlockResult, BlockType
 
     results = []
@@ -755,7 +755,7 @@ def generate_failure_summary(
     lines.append("**逐工况诊断建议：**\n")
 
     try:
-        from src.agents.tools.diagnose_case import _impl_diagnose_case
+        from src.agents.subagents.tools.diagnose_case import _impl_diagnose_case
         _diagnose_available = True
     except ImportError:
         _diagnose_available = False

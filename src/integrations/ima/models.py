@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.agents.contracts.models import ImaAnswer as ContractImaAnswer
+from src.agents.evidence.models import ImaAnswer as ContractImaAnswer
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ class ImaAnswer:
 
     def to_contract(self) -> ContractImaAnswer:
         """Project to the phase-0 public contract while retaining citations."""
-        from src.agents.contracts.models import EvidenceItem, EvidenceSource
+        from src.agents.evidence.models import EvidenceItem, EvidenceSource
         evidence = [EvidenceItem(
             id=f"ima-source-{i}", source=EvidenceSource.IMA,
             claim=s.snippet or s.title or s.source, source_ref=s.source,

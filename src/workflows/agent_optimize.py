@@ -9,19 +9,19 @@ import random
 import uuid
 from dataclasses import asdict, replace
 
-from src.agents.closed_loop.advisor import ProcessDecisionAgent, fallback_plan
-from src.agents.closed_loop.technical_advisor import consult
-from src.agents.closed_loop.analysis import (
+from src.agents.orchestration.closed_loop.advisor import ProcessDecisionAgent, fallback_plan
+from src.agents.orchestration.closed_loop.technical_advisor import consult
+from src.agents.orchestration.closed_loop.analysis import (
     build_analysis_report,
     compare_analysis_reports,
 )
-from src.agents.closed_loop.contracts import (
+from src.agents.orchestration.closed_loop.contracts import (
     ActionPlan,
     LoopConfig,
     finite,
     validate_plan,
 )
-from src.agents.closed_loop.journal import SessionJournal, decode_case, encode_case
+from src.agents.orchestration.closed_loop.journal import SessionJournal, decode_case, encode_case
 from src.models.process_case import CaseStatus, ProcessCase
 from src.optimization.convergence_kb import match_failure_patterns
 from src.optimization.feasibility import FeasibilityClassifier
