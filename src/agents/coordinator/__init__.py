@@ -18,7 +18,10 @@ optimize_pareto_tool），不重新实现任何业务逻辑。
   build_plan             任务拆解
   dispatch_plan          执行分发
 """
-from src.agents.coordinator.agent import CoordinatorResult, run_coordinator, run_coordinator_turn
+from src.agents.coordinator.agent import CoordinatorResult, run_coordinator, run_coordinator_turn, run_orchestrator_turn
+from src.agents.coordinator.orchestrator import (
+    OrchestrationResult, ROUTE_TABLE, RouteSpec, orchestrate_turn, merge_evidence,
+)
 from src.agents.coordinator.dispatcher import dispatch_plan
 from src.agents.coordinator.intent import classify_intent, classify_intent_agent
 from src.agents.coordinator.planner import build_plan
@@ -33,4 +36,10 @@ __all__ = [
     "classify_intent_agent",
     "build_plan",
     "dispatch_plan",
+    "run_orchestrator_turn",
+    "orchestrate_turn",
+    "OrchestrationResult",
+    "RouteSpec",
+    "ROUTE_TABLE",
+    "merge_evidence",
 ]

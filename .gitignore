@@ -2,6 +2,7 @@
 .venv/
 venv/
 env/
+.venv312/
 
 # 测试运行时产物（跟踪测试源码 .py，只忽略运行时产物）
 tests/__pycache__/

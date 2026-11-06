@@ -53,6 +53,12 @@ from src.agents.coordinator.dispatcher import dispatch_plan
 from src.agents.coordinator.intent import classify_intent_agent
 from src.agents.coordinator.planner import build_plan, make_env
 from src.models.coordinator import ChatSessionState, ExecutionState, IntentClassification, Plan
+from src.agents.coordinator.orchestrator import OrchestrationResult, orchestrate_turn
+
+
+def run_orchestrator_turn(user_text: str, **kwargs) -> OrchestrationResult:
+    """Persistent orchestration entry point; legacy execution APIs are unchanged."""
+    return orchestrate_turn(user_text, **kwargs)
 
 
 @dataclass

@@ -109,6 +109,36 @@ def parse_action_plan_response(raw: str) -> ActionPlan:
     return plan
 
 
+# ============================================================================
+# 新增：工厂函数和增强决策接口
+# ============================================================================
+
+def create_decision_agent(llm_config=None, use_two_step: bool = True, use_memory: bool = False):
+    """
+    工厂函数：创建决策 Agent。
+
+    Args:
+        llm_config: LLM 配置
+        use_two_step: 是否使用两阶段决策（默认 True，推荐）
+        use_memory: 是否使用案例记忆增强（默认 False，实验性）
+
+    Returns:
+        ProcessDecisionAgent 或 TwoStepDecisionAgent
+    """
+    if use_two_step:
+        try:
+            from .two_step_advisor import TwoStepDecisionAgent
+            agent = TwoStepDecisionAgent(llm_config=llm_config)
+            if use_memory:
+                from .case_memory import CaseMemory
+                agent._memory = CaseMemory()  # 添加记忆能力
+            return agent
+        except ImportError:
+            _log.warning("TwoStepDecisionAgent 不可用，回退到 ProcessDecisionAgent")
+
+    return ProcessDecisionAgent(llm_config=llm_config)
+
+
 def fallback_plan(snapshot: dict, batch_size: int) -> ActionPlan:
     recent = snapshot["recent_observations"]
     evidence = [r["case_id"] for r in recent[-3:]]

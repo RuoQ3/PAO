@@ -195,7 +195,7 @@ class NodeDB:
         父目录不存在时自动创建。
     """
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, read_only: bool = False) -> None:
         self._path = Path(db_path)
         # 空路径（''）会被 Path() 解析为 '.'，sqlite3.connect('.') 会崩溃
         # 回退到系统临时目录下的默认文件
@@ -203,12 +203,22 @@ class NodeDB:
             import tempfile
             self._path = Path(tempfile.gettempdir()) / "pao_node_default.db"
             _log.debug("NodeDB: 空路径已回退到 %s", self._path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+        self._read_only = read_only
+        if read_only:
+            if not self._path.is_file():
+                raise FileNotFoundError(self._path)
+            self._conn = sqlite3.connect(
+                self._path.resolve().as_uri() + "?mode=ro", uri=True,
+                check_same_thread=False,
+            )
+        else:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_DDL)
-        self._conn.commit()
-        self._migrate_schema()
+        if not read_only:
+            self._conn.executescript(_DDL)
+            self._conn.commit()
+            self._migrate_schema()
 
     # ------------------------------------------------------------------ #
     # 上下文管理器
@@ -914,6 +924,13 @@ class NodeDB:
             "SELECT * FROM catalog_scans ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    def list_catalog_scans(self) -> list[dict[str, Any]]:
+        """Return catalog metadata newest first without changing the database."""
+        rows = self._conn.execute(
+            "SELECT * FROM catalog_scans ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_latest_manifest_by_catalog(self, catalog_id: str) -> dict[str, Any] | None:
         """

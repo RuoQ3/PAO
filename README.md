@@ -85,6 +85,31 @@ report_json = analyze_closed_loop_tool.invoke({
 
 ## 快速开始
 
+### PowerShell 命令写法（重要）
+
+本项目的命令参数之间不需要反引号。PowerShell 反引号 `` ` `` 只用于续行，并且必须放在上一行的末尾。
+
+正确写法：
+
+```powershell
+python -m src.main cases/demo_case/pareto_config.yaml --agent
+```
+
+多行写法：
+
+```powershell
+python -m src.main `
+  cases/demo_case/pareto_config.yaml `
+  --agent
+```
+
+下面这种写法会把 `--agent` 当成配置文件路径的一部分，导致“配置文件不存在”：
+
+```powershell
+# 错误：不要把反引号包在参数两侧
+python -m src.main `cases/demo_case/pareto_config.yaml` --agent
+```
+
 ### 1. 真实 Aspen 运行
 
 真实仿真需要 Windows、Aspen Plus 和可用许可证。建议从项目根目录执行：
@@ -121,6 +146,48 @@ python -m src.main cases/demo_case_2/agent_loop_config.yaml \
 # 从同一个 checkpoint 恢复
 python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent --resume
 ```
+
+`--agent` 在 YAML 配置上表示**自动运行 Agent 实验闭环**，不是进入交互式命令行。运行时会看到类似：
+
+```text
+Agent decision 1 [llm]
+Agent decision 2 [llm]
+```
+
+这表示 Agent 已经在读取证据、选择下一批实验并调用 Aspen。优化期间 Aspen 和 Python 进程会持续运行，请等待流程结束；可以用下面的命令实时查看日志：
+
+```powershell
+Get-Content cases/demo_case/output/run.log -Wait -Tail 30
+```
+
+如果需要交互式会话，请额外使用 `--chat`：
+
+```powershell
+python -m src.main `
+  cases/demo_case/pareto_config.yaml `
+  --agent `
+  --chat
+```
+
+交互式会话中可以输入问题或下一步要求，输入 `exit` 退出。`--agent` 和 `--agent --chat` 的行为不同：前者自动执行优化，后者进入对话流程。
+
+如果运行被中断，可以使用 checkpoint 恢复。新实验不要复用旧 checkpoint；已有 checkpoint 必须显式指定 `--resume`：
+
+```powershell
+python -m src.main `
+  cases/demo_case/pareto_config.yaml `
+  --agent `
+  --checkpoint cases/demo_case/output/agent_checkpoint.db `
+  --resume
+```
+
+Agent 运行结果默认写入 YAML 所在目录的 `output/`，常见文件包括：
+
+- `simulation.db`：工况、目标、约束和 Aspen 结果；
+- `agent_checkpoint.db`：闭环恢复所需的权威状态；
+- `*.report.json`：机器可读审计报告；
+- `*.report.md`：面向工程师的分析报告；
+- `run.log`：完整运行日志。
 
 配置中的相对 `checkpoint_path` 相对于 YAML 文件所在目录解析。checkpoint 已存在时必须显式使用 `--resume`；不要把 checkpoint 和 `SimulationDB` 指向同一个 SQLite 文件。
 

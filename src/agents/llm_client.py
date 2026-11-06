@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -240,6 +243,38 @@ def chat(cfg: LLMConfig, system: str, user: str) -> str:
     Raises:
         RuntimeError: 未配置 / 构造失败 / 调用失败（由上层降级处理）。
     """
+    # DeepSeek exposes an OpenAI-compatible endpoint. Use the standard library
+    # transport so the selected provider works when its optional LangChain
+    # adapter is not installed.
+    if cfg.provider == "deepseek":
+        base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        messages = ([{"role": "user", "content": f"[System instructions]\n{system}\n\n[User message]\n{user}"}]
+                    if _is_reasoning_model(cfg) and system else
+                    [{"role": "system", "content": system}, {"role": "user", "content": user}])
+        request_body = json.dumps({
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base_url}/chat/completions", data=request_body,
+            headers={"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            timeout = max(5, min(int(os.environ.get("PAO_LLM_TIMEOUT", "20")), 60))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"DeepSeek API returned HTTP {exc.code}") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"DeepSeek API unavailable ({type(exc).__name__})") from None
+        try:
+            return str(payload["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError("DeepSeek API returned an invalid chat response") from None
+
     from langchain_core.messages import HumanMessage, SystemMessage
 
     model = build_chat_model(cfg)

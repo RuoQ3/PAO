@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS tags (
 
 CREATE INDEX IF NOT EXISTS idx_tags_case_id ON tags (case_id);
 CREATE INDEX IF NOT EXISTS idx_tags_tag     ON tags (tag);
+
+CREATE TABLE IF NOT EXISTS action_audits (
+    audit_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_case_tag ON tags (case_id, tag);
 """
 
@@ -145,14 +151,24 @@ class SimulationDB:
         父目录不存在时自动创建。
     """
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, read_only: bool = False) -> None:
         self._path = Path(db_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+        self._read_only = read_only
+        if read_only:
+            if not self._path.is_file():
+                raise FileNotFoundError(self._path)
+            self._conn = sqlite3.connect(
+                self._path.resolve().as_uri() + "?mode=ro", uri=True,
+                check_same_thread=False,
+            )
+        else:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_DDL)
-        self._apply_migrations()
-        self._conn.commit()
+        if not read_only:
+            self._conn.executescript(_DDL)
+            self._apply_migrations()
+            self._conn.commit()
 
     def _apply_migrations(self) -> None:
         """
@@ -201,6 +217,18 @@ class SimulationDB:
         """
         with self._conn:
             self._insert_case(case_dict)
+
+    def save_action_audit(self, audit_id: str, payload: dict[str, Any]) -> None:
+        """Persist a parameter action and before/after/simulation linkage."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO action_audits(audit_id,payload,created_at) VALUES (?,?,?)",
+            (audit_id, json.dumps(payload, ensure_ascii=False, default=str), datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+
+    def get_action_audit(self, audit_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT payload FROM action_audits WHERE audit_id=?", (audit_id,)).fetchone()
+        return self._decode_json(row[0], None) if row else None
 
     def save_cases(self, case_dicts: list[dict[str, Any]]) -> None:
         """
@@ -341,6 +369,7 @@ class SimulationDB:
         iteration_max: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        newest_first: bool = False,
     ) -> list[dict[str, Any]]:
         """
         按条件查询摘要行（不含 blocks / streams / sim_result）。
@@ -392,7 +421,8 @@ class SimulationDB:
 
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY cases.iteration ASC, cases.created_at ASC"
+        order = "DESC" if newest_first else "ASC"
+        sql += f" ORDER BY cases.iteration {order}, cases.created_at {order}"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)

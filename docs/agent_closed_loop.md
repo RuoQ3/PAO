@@ -1,4 +1,4 @@
-# PAO 自主实验闭环
+﻿# PAO 自主实验闭环
 
 本版本把 Agent 接到每批仿真的决策位置。一个主决策 Agent 使用工艺事实、知识条目和历史证据生成结构化实验动作；程序校验后调用现有 Pareto 优化器和 Aspen 单次运行接口。每次结果都进入下一批决策，并保存动作效果。
 
@@ -172,3 +172,16 @@ python -m pytest -q
 安装 torch/botorch 后，额外执行真实联合 GP 与采集函数构建测试。不安装时该项明确跳过。
 
 真实验收建议使用同一个 `.bkp` 副本、同一硬边界、目标/约束和初始点，在相同总调用预算下比较原优化器与本闭环；记录可行率、首次达标用时、最终目标、超时数及复验结果，并用多个随机种子重复。比较中要把原工作流额外的 Phase 0/探针调用也计入预算。本仓库内的合成测试只证明软件行为，不证明真实化工案例的优化增益。
+
+
+## 技术顾问接入
+
+技术顾问是只读的专业假设来源。它不生成或执行 Aspen 动作，也不能修改 `ActionPlan`、硬边界、目标、约束、预算或 checkpoint 的权威状态。主决策 Agent 读取有界摘要后，仍必须输出经 `validate_plan` 校验的合法 `ActionPlan`。
+
+顾问按优先级按需触发：首次规划、连续失败达到 `failure_trigger`、约束瓶颈、停滞、Pareto 权衡变化，以及用户主动提问。没有触发条件时不查询 IMA；用户问题通过 `agent_context.technical_advisor_question` 传入。
+
+snapshot 只携带触发原因、结论摘要、最多 8 条假设、合法证据 case ID、建议探测变量、风险和最多 8 条 IMA 来源。完整 IMA 原文不会进入 prompt 或 checkpoint。decision 记录顾问触发、假设和 IMA 来源；observation 的 `action_audit` 记录 decision、实际 action、假设 ID、IMA 来源和实际输入。
+
+顾问输出会经过 case ID 和变量名校验。无效证据/变量会被丢弃；顾问不能扩大硬边界或写入 Aspen 路径。顾问、IMA 或解析失败时继续使用既有规则 fallback，`completed_verified`、`verification_failed` 等结果语义不变。
+
+接入前，失败和停滞只依赖确定性 fallback；接入后，主决策 Agent 可引用设备/物流机理假设和受控探测建议。执行、预算扣除、checkpoint 提交、Aspen 恢复和复验流程保持不变；IMA 不可用时行为退化为原有闭环。

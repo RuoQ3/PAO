@@ -39,6 +39,13 @@ _log = logging.getLogger(__name__)
 # "没有实验"（否定信号），否定信号语义更明确（用户已声明手头没有数据），
 # 必须优先匹配，否则会被"活化能"误判为要拟合。
 _KEYWORD_RULES: list[tuple[tuple[str, ...], IntentType]] = [
+    (("设备是什么", "什么设备", "是什么设备", "设备解释", "设备类型", "是什么内容", "介绍一下"), IntentType.EQUIPMENT_EXPLANATION),
+    (("物流追踪", "追踪物流", "上游", "下游"), IntentType.STREAM_TRACE),
+    (("案例比较", "对比案例", "比较案例", "横向比较"), IntentType.CASE_COMPARISON),
+    (("参数修改", "修改参数", "设置参数", "把参数改"), IntentType.PARAMETER_MODIFICATION),
+    (("单次仿真", "运行一次仿真", "模拟一次"), IntentType.SINGLE_SIMULATION),
+    (("优化规划", "规划优化", "优化方案", "如何优化"), IntentType.OPTIMIZATION_PLANNING),
+    (("边界建议", "边界推荐"), IntentType.BOUNDARY_ADVICE),
     (("没有数据", "没有实验", "冷启动", "估个", "估算") , IntentType.RECOMMEND_KINETICS_BOUNDS),
     (("拟合", "速率常数", "实验数据"), IntentType.FIT_KINETICS_PARAMS),
     (("动力学",) , IntentType.RECOMMEND_KINETICS_BOUNDS),  # 泛"动力学"但无拟合/数据信号

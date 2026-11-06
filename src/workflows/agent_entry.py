@@ -93,10 +93,20 @@ def run_configured_agent(driver, config):
     checkpoint = config.agent_checkpoint_path or str(
         Path(config.db_path or "output/simulation.db").with_name("agent_checkpoint.db"))
     start = time.monotonic()
+    # IMA is optional and read-only.  Failure to configure it must never stop
+    # the optimization loop; the closed-loop bridge falls back to local rules.
+    technical_advisor = None
+    try:
+        from src.agents.technical_advisor import TechnicalAdvisor
+        from src.integrations.ima import ImaServiceClient
+        technical_advisor = TechnicalAdvisor(ImaServiceClient.from_env())
+    except Exception:
+        technical_advisor = TechnicalAdvisor(None) if 'TechnicalAdvisor' in locals() else None
     state = optimize_agent_case(driver, config, settings=settings, checkpoint_path=checkpoint,
                                 context=config.agent_context, knowledge=config.agent_knowledge,
                                 resume=config.agent_resume,
-                                agent=ProcessDecisionAgent(config.agent_llm_config))
+                                agent=ProcessDecisionAgent(config.agent_llm_config),
+                                technical_advisor=technical_advisor)
     cases = [decode_case(row) for row in state["observations"]]
     reference = state.get("hv_reference")
     sample = next((c for c in cases if c.success), None)

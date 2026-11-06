@@ -96,9 +96,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="实验数据 CSV 路径（--agent 模式下传入 Aspen 文件且意图涉及"
                              "动力学参数拟合时使用，列：temperature,rate_constant）")
     parser.add_argument("--chat",     action="store_true",
-                        help="连续对话模式（仅 --agent + 裸 Aspen 文件时可用）：进入 REPL 循环，"
+                        help="统一只读工程对话 REPL（Aspen/YAML 均可）；旧 Coordinator 用 --legacy-coordinator-chat，"
                              "可连续输入多轮指令，系统记住上一轮产出的配置/数据库路径，"
                              "后续提问不用重复给路径。若同时给了 --intent，先执行这一轮再进入循环。")
+    parser.add_argument("--unified-chat", "--conversation", action="store_true",
+                        help="启用统一只读工程对话：ProcessContext + IMA + 本地历史分析")
+    parser.add_argument("--legacy-coordinator-chat", action="store_true",
+                        help="使用旧 Coordinator --chat REPL（兼容模式）")
+    parser.add_argument("--yaml", dest="yaml_path", default=None, metavar="PATH",
+                        help="统一对话使用的 YAML 配置路径")
+    parser.add_argument("--node-db", dest="node_db_path", default=None, metavar="PATH",
+                        help="NodeDB 路径（可选）")
     return parser.parse_args(argv)
 
 
@@ -425,6 +433,61 @@ def _run_coordinator_chat_loop(
             print(f"\n⚠ 执行失败：{exc}")
 
 
+def _run_unified_chat_loop(
+    *,
+    config_path: Path,
+    yaml_path: Path | None,
+    db_path: Path | None,
+    node_db_path: Path | None,
+    initial_intent: str,
+    log: logging.Logger,
+) -> int:
+    """Run the first usable read-only engineering conversation."""
+    from src.agents.conversation.unified import UnifiedConversation
+
+    aspen_file = config_path if config_path.suffix.lower() in (".bkp", ".apw") else None
+    if yaml_path is None and config_path.suffix.lower() in (".yaml", ".yml"):
+        yaml_path = config_path
+    session = UnifiedConversation(
+        aspen_file=aspen_file,
+        yaml_path=yaml_path,
+        simulation_db_path=db_path,
+        node_db_path=node_db_path,
+    )
+    print("\nPAO 统一只读工程对话")
+    print("输入 /help 查看命令，/status /sources /history /context 为只读查询，/exit 退出。")
+    print(session.state.context_summary)
+
+    def run_turn(text: str) -> bool:
+        result = session.submit(text)
+        if result.output:
+            print(result.output)
+        if result.error:
+            print(f"错误：{result.error}")
+        if text.lstrip().lower().startswith("/open ") and not result.error:
+            # Rebuild the snapshot after a model switch; this still performs
+            # no Aspen COM access or writes.
+            session._initialize()  # noqa: SLF001 - CLI adapter refresh hook
+            print(session.state.context_summary)
+        return result.should_exit
+
+    if initial_intent.strip():
+        if run_turn(initial_intent):
+            session.close()
+            return 0
+    try:
+        while True:
+            try:
+                text = input("\nPAO> ")
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见。")
+                return 0
+            if run_turn(text):
+                print("再见。")
+                return 0
+    finally:
+        session.close()
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
@@ -449,10 +512,32 @@ def main(argv: list[str] | None = None) -> int:
     # 配置 YAML，传入 .bkp/.apw 会直接加载失败，而这正是 Coordinator 意图
     # 识别要处理的场景（用户还没有配置，需要先接入/拟合/推荐边界）。
     config_path = Path(args.config)
+    # Unified conversation is explicitly read-only.  It is available with a
+    # YAML or Aspen path and never enters the optimization execution branch.
+    if args.unified_chat or (args.chat and not args.agent) or (args.chat and not args.legacy_coordinator_chat and args.agent and config_path.suffix.lower() not in (".bkp", ".apw")):
+        yaml_path = Path(args.yaml_path).resolve() if args.yaml_path else (config_path.resolve() if config_path.suffix.lower() in (".yaml", ".yml") else None)
+        node_db_path = Path(args.node_db_path).resolve() if args.node_db_path else None
+        return _run_unified_chat_loop(
+            config_path=config_path.resolve(),
+            yaml_path=yaml_path,
+            db_path=db_path,
+            node_db_path=node_db_path,
+            initial_intent=args.intent,
+            log=log,
+        )
     if args.agent and config_path.suffix.lower() in (".bkp", ".apw"):
         if args.dry_run:
             log.info("--dry-run 不执行接入向导；闭环配置校验请传 YAML。")
             return 0
+        if args.chat and not args.unified_chat and not args.legacy_coordinator_chat:
+            return _run_unified_chat_loop(
+                config_path=config_path.resolve(),
+                yaml_path=Path(args.yaml_path).resolve() if args.yaml_path else None,
+                db_path=db_path,
+                node_db_path=Path(args.node_db_path).resolve() if args.node_db_path else None,
+                initial_intent=args.intent,
+                log=log,
+            )
         if args.chat:
             return _run_coordinator_chat_loop(
                 aspen_file=config_path.resolve(),

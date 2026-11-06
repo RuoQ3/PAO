@@ -60,6 +60,17 @@ class IntentType(str, Enum):
     RUN_OPTIMIZATION = "run_optimization"
     GENERAL_CHAT = "general_chat"
     CLARIFY_NEEDED = "clarify_needed"
+    # Persistent orchestration intents.  The original names above remain
+    # supported for callers of the single round coordinator.
+    EQUIPMENT_EXPLANATION = "equipment_explanation"
+    STREAM_TRACE = "stream_trace"
+    DIAGNOSIS = "diagnosis"
+    CASE_COMPARISON = "case_comparison"
+    BOUNDARY_ADVICE = "boundary_advice"
+    OPTIMIZATION_PLANNING = "optimization_planning"
+    PARAMETER_MODIFICATION = "parameter_modification"
+    SINGLE_SIMULATION = "single_simulation"
+    OPTIMIZATION_RUN = "optimization_run"
 
 
 # ---------------------------------------------------------------------------

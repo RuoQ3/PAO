@@ -10,6 +10,7 @@ import uuid
 from dataclasses import asdict, replace
 
 from src.agents.closed_loop.advisor import ProcessDecisionAgent, fallback_plan
+from src.agents.closed_loop.technical_advisor import consult
 from src.agents.closed_loop.analysis import (
     build_analysis_report,
     compare_analysis_reports,
@@ -69,7 +70,7 @@ def _anchor(state):
     return dict(state["initial_point"])
 
 
-def build_snapshot(state, config, settings, context, knowledge):
+def build_snapshot(state, config, settings, context, knowledge, technical_advisor_summary=None):
     metrics = _metrics(state, config)
     cases = [decode_case(row) for row in state["observations"]]
     recent = state["observations"][-max(12, settings.batch_size):]
@@ -114,6 +115,10 @@ def build_snapshot(state, config, settings, context, knowledge):
         "diagnostic_hypotheses": diagnoses, "previous_actions": state["decisions"][-4:],
         # Deterministic evidence is generated before the LLM sees the snapshot.
         "analysis_report": analysis_report,
+        # Bounded, read-only technical advice.  Full IMA text never enters the
+        # prompt or checkpoint; citations and a compact hypothesis are enough
+        # for the primary decision agent to consider.
+        "technical_advisor": technical_advisor_summary or {"available": False},
     }
 
 
@@ -168,8 +173,10 @@ def _finish_action(state, config):
         decision["outcome"]["after_analysis"] = after_analysis
 
 
-def _choose_plan(state, config, settings, agent, context, knowledge):
+def _choose_plan(state, config, settings, agent, context, knowledge, technical_advisor=None):
     snapshot = build_snapshot(state, config, settings, context, knowledge)
+    technical = consult(snapshot, state, context, advisor=technical_advisor, settings=settings)
+    snapshot["technical_advisor"] = technical
     rejected = None
     try:
         plan, source = agent.propose(snapshot)
@@ -182,6 +189,10 @@ def _choose_plan(state, config, settings, agent, context, knowledge):
     decision = {"id": str(uuid.uuid4()), "plan": plan.to_dict(), "source": source,
                 "rejection": rejected, "before": snapshot["metrics"],
                 "before_analysis": snapshot["analysis_report"],
+                "technical_advisor": technical,
+                "technical_advisor_trigger": technical.get("trigger"),
+                "technical_advisor_ima_sources": technical.get("ima_sources", []),
+                "technical_advisor_hypotheses": technical.get("hypotheses", []),
                 "window_size": snapshot["analysis_report"].get("window_size", 12),
                 "start_index": len(state["observations"])}
     state["decisions"].append(decision)
@@ -316,7 +327,8 @@ def _verification_candidate(state, config, settings):
 
 def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path,
                         context: dict, knowledge: list[dict], resume=False, agent=None,
-                        evaluator=None, session_factory=ParetoSearchSession) -> dict:
+                        evaluator=None, session_factory=ParetoSearchSession,
+                        technical_advisor=None) -> dict:
     """Returns a JSON-ready audit report. All retries and verification consume one total budget.
 
     evaluator(driver, actual_inputs, run_config, iteration, tags) can be injected for tests.
@@ -408,7 +420,7 @@ def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path
                     elif len(state["decisions"]) >= settings.max_decisions:
                         reason = "decision_budget"
                     else:
-                        plan = _choose_plan(state, config, settings, agent, context, knowledge)
+                        plan = _choose_plan(state, config, settings, agent, context, knowledge, technical_advisor)
                         journal.save(state)
                         _log.info("Agent decision %d [%s]: %s", len(state["decisions"]),
                                   state["decisions"][-1]["source"], plan.hypothesis)
@@ -474,6 +486,18 @@ def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path
                 case = ProcessCase(status=CaseStatus.SIM_FAILED, iteration=pending["iteration"],
                                    design_vars=actual, tags=tags, notes=f"Evaluation error: {type(exc).__name__}: {exc}")
             row = encode_case(case, point, initialization)
+            # Link the actual simulator action to the advisory evidence that
+            # informed the decision.  This is audit metadata only; the
+            # checkpoint remains authoritative and ActionPlan remains the
+            # execution contract.
+            row["action_audit"] = {
+                "decision_id": state["decisions"][-1]["id"],
+                "action": state["decisions"][-1]["plan"].get("action"),
+                "technical_advisor_trigger": state["decisions"][-1].get("technical_advisor_trigger"),
+                "technical_advisor_hypothesis_ids": [h.get("id") for h in state["decisions"][-1].get("technical_advisor_hypotheses", [])],
+                "technical_advisor_ima_sources": state["decisions"][-1].get("technical_advisor_ima_sources", []),
+                "actual_inputs": dict(actual),
+            }
             state["observations"].append(row)
             state["pending"] = None
             state["batch_remaining"] -= 1
