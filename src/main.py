@@ -10,18 +10,18 @@ main.py — PAO 命令行入口。
     --db PATH       结果数据库路径（默认：与 YAML 同目录的 output/simulation.db）
     --log LEVEL     日志级别（DEBUG/INFO/WARNING，默认 INFO）
     --dry-run       只加载配置并打印摘要，不运行 Aspen 仿真
-    --agent         启用 AI Agent 协作模式。行为按传入的文件类型分支：
+    --conversation  启用 AI Agent 协作模式。行为按传入的文件类型分支：
                       - 传入已有的 YAML 配置：boundary_advisor 扫描已有 design_variables
                         推荐边界，终端交互确认/修改，再运行 Pareto 优化（原有行为不变）。
-                      - 传入裸 Aspen 文件（.bkp/.apw，尚无配置）：走 Coordinator
+                      - 传入裸 Aspen 文件（.bkp/.apw，尚无配置）：走 Lead Agent 只读接入
                         意图识别 + 任务拆解，按 --intent 描述的需求路由到
                         onboarding_agent / boundary_advisor / kinetics_advisor /
                         process_advisor / optimize_pareto 中的一个或多个。
     --intent TEXT   自由文本描述。YAML 输入时是"优化意图"（如边界推荐的工艺背景）；
                     Aspen 文件输入时是"任务请求"（如"帮我接入这个新工艺" /
-                    "帮我拟合这批实验数据的活化能"），决定 Coordinator 路由到哪个 agent。
+                    "帮我拟合这批实验数据的活化能"），由 Lead Agent 路由到 Subagent。
     --data CSV_PATH 实验数据 CSV 路径（Aspen 文件输入且意图涉及动力学拟合时使用）。
-    --chat          连续对话模式（仅裸 Aspen 文件 + --agent 时可用）：进入 REPL 循环，
+    # removed legacy --conversation: 连续对话模式（仅裸 Aspen 文件 + --conversation 时可用）：进入 REPL 循环，
                     可连续输入多轮指令；系统记住上一轮产出的配置/数据库路径，
                     后续提问不用重复给路径（但不记住数值结果，如拟合出的 Ea 数值）。
 
@@ -34,18 +34,18 @@ main.py — PAO 命令行入口。
     python -m src.main cases/demo_case/pareto_tac_emissions_config.yaml
 
     # AI Agent 协作模式：已有 YAML，boundary_advisor 推荐边界 + 终端 HITL
-    python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --agent
-    python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --agent \\
+    python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --conversation
+    python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --conversation \\
         --intent "最小化总年费用和碳排放，约束甘油纯度 > 99%"
 
-    # AI Agent 协作模式：裸 Aspen 文件，Coordinator 意图识别 + 路由（单轮）
-    python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent \\
+    # AI Agent 协作模式：裸 Aspen 文件进入 Lead Agent + Subagent 路由。
+    python -m src.main cases/demo_case/二级氢氰化工段.bkp --conversation \\
         --intent "帮我接入这个新工艺，分析可调变量"
-    python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent \\
+    python -m src.main cases/demo_case/二级氢氰化工段.bkp --conversation \\
         --intent "帮我拟合这批实验数据的活化能" --data scripts/kinetics_example_data.csv
 
     # AI Agent 协作模式：连续对话（多轮，记住上一轮产出的配置路径）
-    python -m src.main cases/demo_case/二级氢氰化工段.bkp --agent --chat
+    python -m src.main cases/demo_case/二级氢氰化工段.bkp --conversation
     PAO> 帮我接入这个工艺
     PAO> 帮我推荐一下边界    # 自动复用上一轮生成的配置路径
     PAO> exit
@@ -67,6 +67,11 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+if hasattr(sys.stdin, "reconfigure"):
+    # PowerShell may expose the console input stream with the legacy system
+    # code page.  Agent prompts are sent to the LLM as UTF-8 JSON, so decode
+    # interactive turns consistently before classification.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
 
 def _setup_logging(level: str, log_file: Path | None = None) -> None:
@@ -79,7 +84,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="python -m src.main",
         description="PAO — Aspen Plus 贝叶斯优化框架",
     )
-    parser.add_argument("config", help="case_config.yaml 路径（--agent 模式下作为 Aspen 文件目录提示）")
+    parser.add_argument("config", help="case_config.yaml 路径（--conversation 模式下作为 Aspen 文件目录提示）")
     parser.add_argument("--db",       default=None, help="结果数据库路径（.db）")
     parser.add_argument("--log",      default="INFO", help="日志级别（默认 INFO）")
     parser.add_argument("--log-file", default=None, metavar="PATH",
@@ -87,22 +92,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run",  action="store_true", help="只打印配置摘要，不运行仿真")
     parser.add_argument("--checkpoint", default=None, help="Agent 闭环 checkpoint 数据库路径")
     parser.add_argument("--resume", action="store_true", help="恢复同配置的 Agent 闭环")
-    parser.add_argument("--agent",    action="store_true",
-                        help="启用自主实验闭环（YAML）；裸 Aspen 文件仍走接入向导")
     parser.add_argument("--intent",   default="",
-                        help="优化意图自然语言描述（--agent 模式使用；传入 Aspen 文件时"
-                             "作为 Coordinator 的自由文本请求，决定路由到哪个子 agent）")
+                        help="优化意图自然语言描述（--conversation 模式使用；传入 Aspen 文件时"
+                             "作为 Lead Agent 的自由文本请求，路由到合适的 Subagent）")
     parser.add_argument("--data",     default=None, metavar="CSV_PATH",
-                        help="实验数据 CSV 路径（--agent 模式下传入 Aspen 文件且意图涉及"
+                        help="实验数据 CSV 路径（--conversation 模式下传入 Aspen 文件且意图涉及"
                              "动力学参数拟合时使用，列：temperature,rate_constant）")
-    parser.add_argument("--chat",     action="store_true",
-                        help="统一只读工程对话 REPL（Aspen/YAML 均可）；旧 Coordinator 用 --legacy-coordinator-chat，"
-                             "可连续输入多轮指令，系统记住上一轮产出的配置/数据库路径，"
-                             "后续提问不用重复给路径。若同时给了 --intent，先执行这一轮再进入循环。")
-    parser.add_argument("--unified-chat", "--conversation", action="store_true",
+    parser.add_argument("--conversation", action="store_true",
                         help="启用统一只读工程对话：ProcessContext + IMA + 本地历史分析")
-    parser.add_argument("--legacy-coordinator-chat", action="store_true", help=argparse.SUPPRESS)
-    # "使用旧 Coordinator --chat REPL（兼容模式）")
     parser.add_argument("--yaml", dest="yaml_path", default=None, metavar="PATH",
                         help="统一对话使用的 YAML 配置路径")
     parser.add_argument("--node-db", dest="node_db_path", default=None, metavar="PATH",
@@ -252,40 +249,6 @@ def _load_var_metas(yaml_path: Path) -> tuple[list, dict, set]:
     return variables, var_types, integer_names
 
 
-def _run_agent_mode(
-    yaml_path: Path,
-    intent_text: str,
-    log: logging.Logger,
-    opt_cfg,
-    sim_filepath: Path,
-    driver_kwargs: dict,
-    db_path: Path,
-) -> int:
-    """YAML Agent entry: bounded autonomous loop, using the same optimizer tool path."""
-    from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig, optimize_pareto_case
-    if not isinstance(opt_cfg, ParetoOptimizeCaseConfig):
-        log.error("Agent 闭环需要 optimizer.type: pareto_bayesian")
-        return 1
-    opt_cfg.agent_loop = {**opt_cfg.agent_loop, "enabled": True}
-    if intent_text:
-        opt_cfg.agent_context["intent"] = intent_text
-    from src.aspen_driver.driver import AspenDriver
-    try:
-        with AspenDriver(**driver_kwargs) as driver:
-            driver.open(sim_filepath)
-            result = optimize_pareto_case(driver, opt_cfg)
-    except Exception as exc:
-        log.error("Agent 闭环失败：%s", exc, exc_info=True)
-        return 1
-    _print_pareto_summary(log, result, db_path)
-    log.info("闭环状态：%s", result.early_stop_reason)
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Agent 模式：Coordinator（意图识别 + 任务拆解 + 分发执行）
-# ---------------------------------------------------------------------------
-
 def _run_unified_chat_loop(
     *, config_path: Path, yaml_path: Path | None, db_path: Path | None,
     node_db_path: Path | None, initial_intent: str, log: logging.Logger,
@@ -294,6 +257,10 @@ def _run_unified_chat_loop(
     from src.agents.lead import ConversationSession, LeadAgent
     from src.agents.orchestration import RuntimePolicy, SessionState
     from src.agents.context import ProcessContextBuilder
+    from src.agents.actions import ActionGateway
+    from src.agents.actions.models import ModelIdentity, ModelSchema, ParameterSpec
+    from src.agents.orchestration.parameter_impact import AspenSandboxRunner
+    from src.database.simulation_db import SimulationDB
 
     aspen_file = config_path if config_path.suffix.lower() in (".bkp", ".apw") else None
     if yaml_path is None and config_path.suffix.lower() in (".yaml", ".yml"):
@@ -303,10 +270,32 @@ def _run_unified_chat_loop(
         node_db=node_db_path if node_db_path and node_db_path.exists() else None,
         simulation_db=db_path if db_path and db_path.exists() else None, read_only=True,
     )
+    # Build the gateway at the CLI boundary.  The context remains read-only;
+    # Aspen is opened lazily by the runner only after preview + approval.
+    context = builder.build()
+    params = {}
+    for item in list((getattr(context, "variables", {}) or {}).values()) + [
+        p for values in (getattr(context, "equipment_parameters", {}) or {}).values()
+        for p in (values or []) if isinstance(p, dict)
+    ]:
+        path = str(item.get("aspen_path") or item.get("path") or "")
+        if "\\input\\" not in path.casefold():
+            continue
+        params[path] = ParameterSpec(path=path, value_type="int" if str(item.get("type", "")).casefold() in {"int", "integer"} else "float",
+                                     unit=item.get("unit"), minimum=item.get("lower", item.get("lower_bound")),
+                                     maximum=item.get("upper", item.get("upper_bound")), integer=bool(item.get("integer")))
+    schema = ModelSchema(ModelIdentity(str(getattr(context, "model_id", None) or "model")), parameters=params,
+                         current_values=getattr(context, "current_values", {}) or {},
+                         permissions={"inspect", "run_simulation"}, targets=("model", ""))
+    sim_db = SimulationDB(db_path)
+    runner = AspenSandboxRunner(driver_factory=lambda _path: __import__("src.aspen_driver.driver", fromlist=["AspenDriver"]).AspenDriver(),
+                                allowed_paths=set(params), require_path_whitelist=True)
+    gateway = ActionGateway(schema, simulation_runner=runner, simulation_db=sim_db)
     session = ConversationSession(SessionState(), LeadAgent(
-        policy=RuntimePolicy(allow_writes=False), context_builder=builder))
+        policy=RuntimePolicy(allow_writes=False), context_builder=builder,
+        action_gateway=gateway, use_llm=True))
     print("\nPAO Lead Agent conversation")
-    print("?????/exit ???")
+    print("输入问题，输入 exit 退出")
 
     def run_turn(text: str) -> bool:
         if text.strip().lower() in {"/exit", "exit", "quit"}:
@@ -324,12 +313,13 @@ def _run_unified_chat_loop(
             try:
                 text = input("\nPAO> ")
             except (EOFError, KeyboardInterrupt):
-                print("\n???")
+                print("\n已退出")
                 return 0
             if run_turn(text):
                 print("???")
                 return 0
     finally:
+        sim_db.close()
         builder.close()
 
 
@@ -352,14 +342,14 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.log, log_file=log_file)
     log = logging.getLogger(__name__)
 
-    # ── Agent 模式 + 裸 Aspen 文件（尚无配置 YAML）：走 Coordinator ───────────
+    # ── Agent 模式 + 裸 Aspen 文件（尚无配置 YAML）：走 Lead Agent 只读接入 ───
     # 必须在 load_optimize_config 之前分支：该函数假定输入是可解析的优化
-    # 配置 YAML，传入 .bkp/.apw 会直接加载失败，而这正是 Coordinator 意图
+    # 配置 YAML 加载器不接受 .bkp/.apw；裸模型由 Lead Agent 接入。
     # 识别要处理的场景（用户还没有配置，需要先接入/拟合/推荐边界）。
     config_path = Path(args.config)
     # Unified conversation is explicitly read-only.  It is available with a
     # YAML or Aspen path and never enters the optimization execution branch.
-    if args.unified_chat or args.chat:
+    if args.conversation:
         yaml_path = Path(args.yaml_path).resolve() if args.yaml_path else (config_path.resolve() if config_path.suffix.lower() in (".yaml", ".yml") else None)
         node_db_path = Path(args.node_db_path).resolve() if args.node_db_path else None
         return _run_unified_chat_loop(
@@ -370,21 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             initial_intent=args.intent,
             log=log,
         )
-    if args.agent and config_path.suffix.lower() in (".bkp", ".apw"):
-        if args.dry_run:
-            log.info("--dry-run skips Lead Agent interaction")
-            return 0
-        return _run_unified_chat_loop(
-            config_path=config_path.resolve(),
-            yaml_path=Path(args.yaml_path).resolve() if args.yaml_path else None,
-            db_path=db_path,
-            node_db_path=Path(args.node_db_path).resolve() if args.node_db_path else None,
-            initial_intent=args.intent,
-            log=log,
-        )
-
-    if args.chat:
-        log.error("--chat 仅在 --agent 模式且传入裸 Aspen 文件（.bkp/.apw）时可用。")
+    if config_path.suffix.lower() in (".bkp", ".apw") and not args.conversation:
+        log.error("Aspen 文件必须通过唯一的 --conversation 入口进入 LeadAgent")
         return 1
 
     # 加载配置（agent 和普通模式都需要）
@@ -400,8 +377,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.checkpoint:
             opt_cfg.agent_checkpoint_path = str(Path(args.checkpoint).resolve())
         opt_cfg.agent_resume = args.resume or opt_cfg.agent_resume
-        if args.agent:
-            opt_cfg.agent_loop["enabled"] = True
         if opt_cfg.agent_loop.get("enabled"):
             from src.workflows.agent_entry import validate_agent_config
             try:
@@ -412,21 +387,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume and not getattr(opt_cfg, "agent_loop", {}).get("enabled"):
         log.error("--resume 仅支持 Agent 闭环")
         return 1
-    if args.dry_run:
+    if args.dry_run and not args.conversation:
         log.info("配置有效；--dry-run 不连接 Aspen、不调用 LLM、不写回 YAML。")
         return 0
 
     # ── Agent 协作模式：boundary_advisor 推荐边界 → 写回 YAML → 跑优化 ────────
-    if args.agent:
-        return _run_agent_mode(
-            yaml_path=Path(args.config).resolve(),
-            intent_text=args.intent,
-            log=log,
-            opt_cfg=opt_cfg,
-            sim_filepath=sim_filepath,
-            driver_kwargs=driver_kwargs,
-            db_path=db_path,
-        )
+    if getattr(opt_cfg, "agent_loop", {}).get("enabled") and not args.conversation:
+        log.error("Agent 闭环必须通过唯一的 --conversation 入口进入 LeadAgent")
+        return 1
 
     # 判断优化类型
     from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig

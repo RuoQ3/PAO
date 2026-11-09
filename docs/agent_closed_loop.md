@@ -1,4 +1,4 @@
-﻿# PAO 自主实验闭环
+# PAO 自主实验闭环
 
 本版本把 Agent 接到每批仿真的决策位置。一个主决策 Agent 使用工艺事实、知识条目和历史证据生成结构化实验动作；程序校验后调用现有 Pareto 优化器和 Aspen 单次运行接口。每次结果都进入下一批决策，并保存动作效果。
 
@@ -17,9 +17,11 @@ python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent
 python -m src.main cases/demo_case_2/agent_loop_config.yaml --agent --resume
 ```
 
-`--agent` + YAML 现在进入闭环，不再覆盖 YAML 的设计变量上下界。`--agent` + `.bkp` / `.apw` 保留原有接入向导；向导生成并核实 YAML 后再启动闭环。没有配置 LLM key 时使用明确标记的规则决策，完整反馈、约束、预算及持久化机制仍然运行。
+`--agent`、`--chat` 和 `--unified-chat` 的用户请求统一先进入唯一的 `LeadAgent`。YAML 闭环由 LeadAgent 生成 `ActionProposal/ApprovalRequest`，预览和人工确认通过后才调用内部 `ClosedLoopService`，再由 `ActionGateway` 进入 Aspen/优化器。`.bkp/.apw` 接入请求也使用同一个 LeadAgent 会话。
 
-也可在已有多目标 YAML 中添加 `agent_loop.enabled: true`。这样 CLI、`optimize_pareto_tool`、Coordinator 的运行优化任务都通过同一个 `optimize_pareto_case()` 入口进入闭环。
+`ProcessDecisionAgent` 仅是闭环内部的决策组件，不能作为 CLI 或公共 Agent 入口。没有 LLM key 时闭环使用明确标记的规则回退；规则输出不会被当作仿真结果，真实结果必须来自 Aspen 执行。`--resume` 继续使用 checkpoint，未知结果不会自动重放。
+
+也可在已有多目标 YAML 中添加 `agent_loop.enabled: true`。这样 CLI、`optimize_pareto_tool`、Lead Agent 的运行优化任务都通过同一个 `optimize_pareto_case()` 入口进入闭环。
 
 默认 checkpoint 位于结果数据库同目录的 `agent_checkpoint.db`。示例指定 `cases/demo_case_2/output/agent_epsd.db`。路径已存在时必须显式 `--resume`；新实验使用 `--checkpoint path/to/new_run.db`。不要将 checkpoint 路径设成 SimulationDB 的同一个文件。
 
@@ -93,7 +95,7 @@ agent_loop:
 
 ## 确定性分析技能
 
-闭环每次构造决策快照时，`src.agents.closed_loop.analysis.build_analysis_report()` 会从当前
+闭环每次构造决策快照时，`src.agents.orchestration.closed_loop.analysis.build_analysis_report()` 会从当前
 `ProcessCase` 历史生成版本化的 `analysis_report`。分析代码不调用 LLM，也不连接 Aspen，
 因此恢复 checkpoint 或离线重放时可以得到同样的证据。报告包括：
 
@@ -185,3 +187,5 @@ snapshot 只携带触发原因、结论摘要、最多 8 条假设、合法证�
 顾问输出会经过 case ID 和变量名校验。无效证据/变量会被丢弃；顾问不能扩大硬边界或写入 Aspen 路径。顾问、IMA 或解析失败时继续使用既有规则 fallback，`completed_verified`、`verification_failed` 等结果语义不变。
 
 接入前，失败和停滞只依赖确定性 fallback；接入后，主决策 Agent 可引用设备/物流机理假设和受控探测建议。执行、预算扣除、checkpoint 提交、Aspen 恢复和复验流程保持不变；IMA 不可用时行为退化为原有闭环。
+
+\r\n

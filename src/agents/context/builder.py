@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from dataclasses import dataclass
@@ -62,6 +62,7 @@ class ProcessContextBuilder:
         self._owns_node = not isinstance(node_db, NodeDB) and self.node_db is not None
         self._owns_sim = not isinstance(simulation_db, SimulationDB) and self.simulation_db is not None
         self.catalog_warning: str | None = None
+        self._catalog_entries_cache: list[dict[str, Any]] = []
 
     def close(self) -> None:
         if self._owns_node and self.node_db:
@@ -153,6 +154,118 @@ class ProcessContextBuilder:
         self.catalog_id = catalog
         return self.node_db.get_catalog_entries(catalog)
 
+    def _config_node_db(self, cfg: dict[str, Any]) -> None:
+        """Attach the catalog database declared by the YAML configuration.
+
+        The conversation entry point intentionally does not know PAO's
+        extraction settings.  Resolving this here keeps ``--conversation``
+        useful with an existing YAML file while preserving the builder's
+        read-only contract.
+        """
+        if self.node_db is not None:
+            return
+        extraction = cfg.get("extraction", {}) or {}
+        raw = extraction.get("catalog_db") if isinstance(extraction, dict) else None
+        if not raw:
+            return
+        target = Path(str(raw)).expanduser()
+        if not target.is_absolute():
+            candidates = [Path.cwd() / target]
+            if self.yaml_path:
+                candidates.insert(0, self.yaml_path.parent / target)
+            # PAO configs commonly store paths relative to the repository
+            # root (for example ``cases/demo_case/output/node.db``), while
+            # small ad-hoc configs use paths relative to the YAML directory.
+            # Prefer an existing candidate; otherwise retain the repository
+            # relative spelling for a useful diagnostic.
+            target = next((item for item in candidates if item.exists()), Path.cwd() / Path(str(raw)))
+        if not target.exists():
+            self.catalog_warning = f"NodeDB 文件不存在: {target}"
+            return
+        self.node_db = NodeDB(target, read_only=self.read_only)
+        self._owns_node = True
+
+    def _bkp_model_parts(self, path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[EvidenceItem]]:
+        """Read the portable block/connection index embedded in a .bkp file.
+
+        Aspen's text backup format contains a small flowsheet index before
+        the binary-like data sections.  Reading that index gives the Agent a
+        useful, provenance-labelled inventory when Aspen COM or a catalog DB
+        is unavailable; values are never treated as live simulation results.
+        """
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, UnicodeError):
+            return [], [], {"nodes": [], "edges": []}, []
+        blocks: dict[str, dict[str, Any]] = {}
+        # The first flowsheet index lists: name, display label, Built-In, type.
+        pat = re.compile(r"(?m)^>VERSION[^\r\n]*\r?\n([^\r\n]+)\r?\n([^\r\n]+)\r?\nBuilt-In\r?\n([A-Za-z][A-Za-z0-9_-]*)")
+        for match in pat.finditer(text):
+            name = match.group(1).strip().strip('"')
+            if name and name not in blocks:
+                blocks[name] = {"id": name, "label": name, "block_type": match.group(3).upper()}
+        edges: list[dict[str, Any]] = []
+        stream_links: dict[str, dict[str, str]] = {}
+        block_pat = re.compile(r"BLOCK\s+BLKID\s*=\s*\"?([^\"\s]+)\"?\s+BLKTYPE\s*=\s*\"?([^\"\s]+)\"?(.*?)(?=\\\s*\\\s*BLOCK\b|$)", re.I | re.S)
+        for match in block_pat.finditer(text):
+            name, typ, body = match.group(1), match.group(2), match.group(3)
+            blocks.setdefault(name, {"id": name, "label": name, "block_type": typ.upper()})
+            blocks[name]["block_type"] = typ.upper()
+            for direction in ("IN", "OUT"):
+                section = re.search(rf"\b{direction}\s*=\s*\((.*?)\)", body, re.I | re.S)
+                if not section:
+                    continue
+                # Streams are followed by Aspen substream identifiers (M0-1,
+                # M1-2, ...).  This avoids mistaking those identifiers for
+                # stream names.
+                names = re.findall(r"([A-Za-z0-9][A-Za-z0-9_-]*)\s+M[0-9-]+", section.group(1))
+                for stream in names:
+                    stream_links.setdefault(stream, {})["source" if direction == "OUT" else "target"] = name
+        # Aspen stores stream composition vectors in STRM_XY.  Keep the
+        # component names and nonzero mole fractions in the read-only snapshot
+        # so a follow-up such as "流股0318包含哪些物料" can be answered from
+        # the .bkp without opening Aspen COM.  This is a snapshot value, not a
+        # newly simulated result.
+        component_names: list[str] = []
+        comp_match = re.search(r"IDSET\s+ID_\w+\s+\(COMPONENTS\)\s*\((.*?)\)", text, re.I | re.S)
+        if comp_match:
+            component_names = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", comp_match.group(1))
+        stream_compositions: dict[str, list[dict[str, Any]]] = {}
+        number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[DEde][-+]?\d+)?"
+        for match in re.finditer(r"DSET\s+STREAM\s+MATERIAL\s+([A-Za-z0-9_-]+)\s+STRM_XY\s+@\w+\s*\((.*?)\)", text, re.I | re.S):
+            stream = match.group(1)
+            values = [float(x.replace("D", "E").replace("d", "e"))
+                      for x in re.findall(number, match.group(2))]
+            if not component_names or len(values) < len(component_names):
+                continue
+            # STRM_XY begins with the mole-fraction vector.  Do not infer a
+            # mass basis from the following Aspen payload because its exact
+            # layout depends on the selected property scope.
+            n = len(component_names)
+            mole = values[:n]
+            stream_compositions[stream] = [
+                {"name": component, "mole_fraction": mole[i]}
+                for i, component in enumerate(component_names)
+                if abs(mole[i]) > 1e-12
+            ]
+        streams = [{"name": stream, "aspen_path": rf"\Data\Streams\{stream}", "source": "bkp_index",
+                    "upstream": link.get("source"), "downstream": link.get("target"),
+                    **({"components": stream_compositions[stream],
+                        "composition_basis": "mole_fraction (STRM_XY snapshot)"}
+                       if stream in stream_compositions else {})}
+                   for stream, link in sorted(stream_links.items())]
+        for stream, link in sorted(stream_links.items()):
+            if link.get("source") or link.get("target"):
+                edges.append({"id": stream, "source": link.get("source"), "target": link.get("target")})
+        equipment = [{"name": name, "aspen_path": rf"\Data\Blocks\{name}",
+                      "block_type": item.get("block_type", ""), "category": "unknown",
+                      "alias": None, "source": "bkp_index"}
+                     for name, item in blocks.items()]
+        evidence = [self._evidence("bkp.index", EvidenceSource.ASPEN_MODEL,
+                                    f"从 .bkp 文本索引读取到 {len(equipment)} 个设备和 {len(streams)} 条物流",
+                                    str(path), {"equipment": len(equipment), "streams": len(streams)})]
+        return equipment, streams, {"nodes": list(blocks.values()), "edges": edges}, evidence
+
     @staticmethod
     def _infer_topology(entries: list[dict[str, Any]]) -> dict[str, Any]:
         blocks: dict[str, dict[str, Any]] = {}
@@ -167,13 +280,15 @@ class ProcessContextBuilder:
         return {"nodes": list(blocks.values()), "edges": [], "streams": [{"name": s} for s in sorted(streams)]}
 
     def _model_parts(self, cfg: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[EvidenceItem]]:
+        cfg = cfg or {}
+        self._config_node_db(cfg)
         entries = self._catalog_entries(cfg)
         self._catalog_entries_cache = entries
         topo = self.topology or self._infer_topology(entries)
         nodes = list(topo.get("nodes") or [])
         edges = list(topo.get("edges") or [])
         equipment: list[dict[str, Any]] = []
-        aliases = (cfg or {}).get("equipment_aliases", {}) or {}
+        aliases = cfg.get("equipment_aliases", {}) or {}
         for n in nodes:
             name = str(n.get("id") or n.get("name") or n.get("label") or "")
             if not name:
@@ -190,7 +305,57 @@ class ProcessContextBuilder:
             evidence.append(self._evidence("model.topology", EvidenceSource.ASPEN_MODEL, f"读取到 {len(equipment)} 个设备和 {len(stream_items)} 条物流", self.catalog_id or "topology", {"equipment": len(equipment), "streams": len(stream_items)}))
         else:
             evidence.append(self._evidence("model.missing", EvidenceSource.ASPEN_MODEL, "未找到拓扑快照；模型可能未打开或尚未导出", self.catalog_id))
+        bkp_path = self._configured_aspen_file(cfg)
+        if bkp_path and bkp_path.exists() and bkp_path.suffix.casefold() in {".bkp", ".apw"}:
+            # BKP is the primary portable topology snapshot.  Keep it even
+            # when a NodeDB catalog is also present so normalization can
+            # retain both observations and report disagreements explicitly.
+            bkp_equipment, bkp_streams, bkp_topology, bkp_evidence = self._bkp_model_parts(bkp_path)
+            if bkp_equipment or bkp_streams:
+                equipment = bkp_equipment + equipment
+                stream_items = bkp_streams + stream_items
+                nodes = list(bkp_topology.get("nodes", [])) + nodes
+                edges = list(bkp_topology.get("edges", [])) + edges
+                evidence = bkp_evidence + evidence
         return equipment, stream_items, {"nodes": nodes, "edges": edges}, evidence
+
+    def _simulation_model_parts(self, session: Any = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[EvidenceItem]]:
+        """Read the latest persisted flowsheet snapshot, when available.
+
+        SimulationDB is an evidence source, not a live Aspen interface.  Its
+        blocks/streams JSON is accepted in both mapping and list forms and is
+        merged later by the same conflict-preserving normalizer.
+        """
+        if self.simulation_db is None:
+            return [], [], {"nodes": [], "edges": []}, []
+        session_id = self._session_value(session, "session_id")
+        case_id = self._session_value(session, "case_id")
+        row = self.simulation_db.get_case(str(case_id)) if case_id else None
+        if row is None:
+            summaries = self.simulation_db.query_cases(session_id=session_id, limit=1, newest_first=True) if session_id else self.simulation_db.query_cases(limit=1, newest_first=True)
+            if summaries:
+                row = self.simulation_db.get_case(str(summaries[0].get("case_id")))
+        if not row:
+            return [], [], {"nodes": [], "edges": []}, []
+        def records(raw: Any, *, key_name: str) -> list[dict[str, Any]]:
+            if isinstance(raw, dict):
+                result = []
+                for key, value in raw.items():
+                    result.append(dict(value, id=str(value.get("id") or key)) if isinstance(value, dict) else {"id": str(key), key_name: value})
+                return result
+            return [dict(x) for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+        equipment = records(row.get("blocks"), key_name="block")
+        for item in equipment:
+            item.setdefault("name", item.get("id"))
+            item.setdefault("source", "simulation_db")
+        streams = records(row.get("streams"), key_name="stream")
+        for item in streams:
+            item.setdefault("name", item.get("id"))
+            item.setdefault("source", "simulation_db")
+        evidence = [self._evidence("simulation.model", EvidenceSource.SIMULATION_DB,
+                                    "SimulationDB flowsheet snapshot loaded", str(row.get("case_id")),
+                                    {"equipment": len(equipment), "streams": len(streams)})]
+        return equipment, streams, {"nodes": equipment, "streams": streams, "edges": streams}, evidence
 
     @staticmethod
     def _variable_target(item: dict[str, Any]) -> str:
@@ -247,6 +412,10 @@ class ProcessContextBuilder:
                 "catalog_id": entry.get("catalog_id"),
                 "source": "nodedb",
                 "value_stage": "catalog_snapshot",
+                "authorized": bool(entry.get("is_enterable", True)),
+                "tunable": bool(entry.get("is_enterable", True)),
+                "confidence": 1.0,
+                "type": "float",
             })
         for items in grouped.values():
             items.sort(key=lambda x: str(x.get("name", "")).casefold())
@@ -257,19 +426,370 @@ class ProcessContextBuilder:
         m = re.search(rf"\\Data\\{kind}\\([^\\]+)", path, flags=re.I)
         return [m.group(1)] if m else []
 
+    _ROLE_MAP = {
+        "PUMP": "pump",
+        "MIXER": "mixer",
+        "RCSTR": "continuous_reactor",
+        "RSTOIC": "stoichiometric_reactor",
+        "FLASH2": "vapor_liquid_separator",
+        "RADFRAC": "fractionation_column",
+        "HEATER": "heater",
+        "COOLER": "cooler",
+        "HEATX": "heat_exchanger",
+        "SEP": "separator",
+    }
+    _ROLE_DESCRIPTIONS = {
+        "PUMP": "transport_or_pressurization",
+        "MIXER": "mixing",
+        "RCSTR": "continuous_reaction",
+        "RSTOIC": "stoichiometric_reaction",
+        "FLASH2": "vapor_liquid_equilibrium_separation",
+        "RADFRAC": "fractionation_or_stage_separation",
+        "HEATER": "heating",
+        "COOLER": "cooling",
+        "HEATX": "heat_exchange",
+        "SEP": "separation",
+    }
+
+    @classmethod
+    def _infer_role(cls, block_type: Any) -> tuple[str, float]:
+        kind = str(block_type or "").upper().strip()
+        if kind in cls._ROLE_MAP:
+            return cls._ROLE_MAP[kind], 0.95
+        return "unknown", 0.0
+
+    @staticmethod
+    def _number(value: Any) -> float | int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return value
+        text = str(value).strip().replace(",", "")
+        if not text or text.casefold() in {"nan", "na", "n/a", "none", "null", "*"}:
+            return None
+        try:
+            converted = float(text.replace("D", "E").replace("d", "e"))
+            return int(converted) if converted.is_integer() else converted
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _normalize_composition(cls, raw: Any, *, evidence_id: str) -> tuple[list[dict[str, Any]], list[str]]:
+        diagnostics: list[str] = []
+        if raw is None:
+            return [], diagnostics
+        if isinstance(raw, dict):
+            # Accept both ``{component: fraction}`` and a vector payload such
+            # as ``{components: [...], values: [...]}`` without guessing a
+            # basis when the vector lengths do not agree.
+            if isinstance(raw.get("components"), (list, tuple)) and isinstance(raw.get("values"), (list, tuple)):
+                names, values = list(raw["components"]), list(raw["values"])
+                if len(names) != len(values):
+                    diagnostics.append(f"composition {evidence_id} component/value count mismatch ({len(names)} != {len(values)})")
+                raw = [{"name": name, "mole_fraction": values[i] if i < len(values) else None}
+                       for i, name in enumerate(names)]
+            else:
+                raw = [{"name": name, "mole_fraction": value} for name, value in raw.items()]
+        if not isinstance(raw, (list, tuple)):
+            diagnostics.append(f"composition {evidence_id} is not a list or mapping")
+            return [], diagnostics
+        result: list[dict[str, Any]] = []
+        for index, item in enumerate(raw):
+            if isinstance(item, str):
+                name, value = item, None
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("component") or item.get("id")
+                value = item.get("mole_fraction", item.get("mole", item.get("mass_fraction", item.get("value"))))
+            else:
+                diagnostics.append(f"composition {evidence_id}[{index}] is not an object")
+                continue
+            if not name:
+                diagnostics.append(f"composition {evidence_id}[{index}] has no component name")
+                continue
+            parsed = cls._number(value)
+            entry = dict(item) if isinstance(item, dict) else {"name": name}
+            entry["name"] = str(name)
+            if parsed is not None:
+                if "mole_fraction" in entry or "mole" in entry or "value" in entry:
+                    entry["mole_fraction"] = parsed
+            result.append(entry)
+        return result, diagnostics
+
+    @classmethod
+    def _normalize_graph(cls, equipment: list[dict[str, Any]], streams: list[dict[str, Any]], topology: dict[str, Any], cfg: dict[str, Any], sources: list[EvidenceItem]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        """Normalize all supported snapshots into the stable graph contract."""
+        diagnostics: list[str] = []
+        conflicts: list[dict[str, Any]] = []
+        facts: list[dict[str, Any]] = []
+        inferences: list[dict[str, Any]] = []
+        evidence_ids = [item.id for item in sources]
+
+        # In-memory configurations may use any of these neutral names.  The
+        # aliases are deliberately structural and do not encode case meaning.
+        raw_nodes: list[dict[str, Any]] = list(equipment)
+        for key in ("equipment_nodes", "equipment", "blocks"):
+            value = cfg.get(key)
+            if isinstance(value, list):
+                raw_nodes.extend(x for x in value if isinstance(x, dict))
+        raw_nodes.extend(x for x in topology.get("nodes", []) if isinstance(x, dict))
+        # ``_model_parts`` exposes both its compatibility lists and the raw
+        # topology.  Identical records are one observation, while records with
+        # differing values are retained for conflict reporting.
+        unique_nodes: list[dict[str, Any]] = []
+        for candidate in raw_nodes:
+            if any(candidate == previous for previous in unique_nodes):
+                continue
+            unique_nodes.append(candidate)
+        raw_nodes = unique_nodes
+        node_map: dict[str, dict[str, Any]] = {}
+        for raw in raw_nodes:
+            name = str(raw.get("id") or raw.get("name") or raw.get("label") or "").strip()
+            if not name:
+                diagnostics.append("equipment entry is missing id/name")
+                continue
+            key = str(raw.get("id") or name).casefold()
+            item = dict(raw)
+            item["id"] = name
+            item["name"] = str(item.get("name") or item.get("label") or name)
+            item.setdefault("kind", "equipment")
+            item.setdefault("block_type", str(item.get("type") or "").upper())
+            item["block_type"] = str(item.get("block_type") or "").upper()
+            item.setdefault("aspen_path", rf"\\Data\\Blocks\\{name}")
+            role, confidence = cls._infer_role(item.get("block_type"))
+            item.setdefault("role", role)
+            item.setdefault("role_description", cls._ROLE_DESCRIPTIONS.get(item.get("block_type"), "unknown"))
+            item.setdefault("confidence", confidence)
+            item.setdefault("provenance_source", item.get("source") or "config")
+            item.setdefault("source", item.get("provenance_source") or "config")
+            item.setdefault("source_ref", item.get("source"))
+            item.setdefault("upstream_streams", [])
+            item.setdefault("downstream_streams", [])
+            item.setdefault("parameters", [])
+            item.setdefault("inference_method", "block_type_mapping")
+            item.setdefault("evidence_ids", evidence_ids[:1])
+            if key in node_map:
+                existing = node_map[key]
+                conflict_count = len(conflicts)
+                for field in ("block_type", "aspen_path", "role"):
+                    old, new = existing.get(field), item.get(field)
+                    old_cmp = str(old).replace("/", "\\").replace("\\\\", "\\") if field == "aspen_path" else old
+                    new_cmp = str(new).replace("/", "\\").replace("\\\\", "\\") if field == "aspen_path" else new
+                    if old_cmp not in (None, "", "unknown") and new_cmp not in (None, "", "unknown") and old_cmp != new_cmp:
+                        conflicts.append({"kind": "equipment", "id": name, "field": field, "values": [{"value": old, "source": existing.get("provenance_source")}, {"value": new, "source": item.get("provenance_source")}]})
+                for field, value in item.items():
+                    if existing.get(field) in (None, "", [], {}):
+                        existing[field] = value
+                if len(conflicts) > conflict_count:
+                    diagnostics.append(f"duplicate equipment merged with conflicting values: {name}")
+            else:
+                node_map[key] = item
+            node = node_map[key]
+            inferences.append({"kind": "inferred_role", "target_id": name, "role": role,
+                               "inference_method": "block_type_mapping", "confidence": confidence,
+                               "evidence_ids": list(node.get("evidence_ids") or evidence_ids[:1]),
+                               "note": ("block_type is not mapped; role remains unknown"
+                                        if role == "unknown" else None)})
+            facts.append({"kind": "equipment_observed", "target_id": name, "evidence_ids": list(node.get("evidence_ids") or evidence_ids[:1])})
+
+        raw_streams: list[dict[str, Any]] = list(streams)
+        for key in ("streams", "edges"):
+            value = cfg.get(key)
+            if isinstance(value, list):
+                raw_streams.extend(x for x in value if isinstance(x, dict))
+        raw_streams.extend(x for x in topology.get("streams", []) if isinstance(x, dict))
+        raw_streams.extend(x for x in topology.get("edges", []) if isinstance(x, dict))
+        unique_streams: list[dict[str, Any]] = []
+        for candidate in raw_streams:
+            if any(candidate == previous for previous in unique_streams):
+                continue
+            unique_streams.append(candidate)
+        raw_streams = unique_streams
+        stream_map: dict[str, dict[str, Any]] = {}
+        compositions: dict[str, list[dict[str, Any]]] = {}
+        for raw in raw_streams:
+            sid = str(raw.get("id") or raw.get("name") or raw.get("label") or "").strip()
+            if not sid:
+                diagnostics.append("stream entry is missing id/name")
+                continue
+            item = dict(raw)
+            item["id"] = sid
+            item["name"] = str(item.get("name") or item.get("label") or sid)
+            # Legacy fields carry endpoints.  Canonical endpoint fields are
+            # source_node/target; source remains the historical provenance
+            # value when supplied by existing Aspen readers.
+            raw_provenance = item.get("provenance_source")
+            raw_source = item.get("source")
+            endpoint_values = {item.get("upstream"), item.get("source_equipment"), item.get("source_node")}
+            if raw_provenance is None and raw_source and raw_source not in endpoint_values and str(raw_source).casefold() not in node_map:
+                raw_provenance = raw_source
+            source_node = item.get("source_node") or item.get("upstream") or item.get("source_equipment")
+            target_node = item.get("target") or item.get("downstream") or item.get("target_equipment")
+            if source_node is None and item.get("source") and str(item.get("source")).casefold() in node_map:
+                source_node = item.get("source")
+                item["provenance_source"] = item.get("provenance_source") or "topology"
+            item["source_node"] = source_node
+            item["target"] = target_node
+            # ``source`` is the canonical upstream endpoint.  Existing
+            # provenance labels remain available under ``provenance_source``
+            # and ``source_ref`` instead of being confused with topology.
+            item["provenance_source"] = raw_provenance or item.get("provenance_source") or "config"
+            item["source_ref"] = item.get("source_ref") or item["provenance_source"]
+            item["source"] = source_node
+            item["upstream"] = source_node
+            item["downstream"] = target_node
+            item.setdefault("aspen_path", rf"\\Data\\Streams\\{sid}")
+            # Explicit stream semantics are authoritative observations.  For
+            # an otherwise untyped edge we only infer generic boundary
+            # semantics from topology; no case-specific names are used.
+            explicit_stream_type = item.get("stream_type") or item.get("kind")
+            if explicit_stream_type:
+                item["stream_type"] = str(explicit_stream_type)
+            elif item.get("is_energy") or str(item.get("phase") or "").casefold() == "energy":
+                item["stream_type"] = "energy"
+            elif source_node is None and target_node is not None:
+                item["stream_type"] = "feed"
+            elif source_node is not None and target_node is None:
+                item["stream_type"] = "vent" if item.get("is_vent") else "product"
+            elif source_node is None and target_node is None:
+                item["stream_type"] = "unresolved_boundary"
+            else:
+                item["stream_type"] = "material"
+            item.setdefault("temperature", None)
+            item.setdefault("pressure", None)
+            item.setdefault("flow", None)
+            item.setdefault("phase", None)
+            item.setdefault("confidence", 0.9 if source_node or target_node else 0.4)
+            item.setdefault("evidence_ids", evidence_ids[:1])
+            for field in ("temperature", "pressure", "flow"):
+                if field in item and item[field] is not None:
+                    parsed = cls._number(item[field])
+                    if parsed is None:
+                        diagnostics.append(f"stream {sid} has unparseable {field}: {item[field]!r}")
+                    else:
+                        item[field] = parsed
+            composition_raw = item.get("composition", item.get("components"))
+            composition, comp_diag = cls._normalize_composition(composition_raw, evidence_id=sid)
+            diagnostics.extend(comp_diag)
+            if composition:
+                item["composition"] = composition
+                item["components"] = composition
+                compositions[sid] = composition
+            key = sid.casefold()
+            if key in stream_map:
+                existing = stream_map[key]
+                conflict_count = len(conflicts)
+                for field in ("source_node", "target", "temperature", "pressure", "flow", "composition"):
+                    old, new = existing.get(field), item.get(field)
+                    if old not in (None, "", [], {}) and new not in (None, "", [], {}) and old != new:
+                        conflicts.append({"kind": "stream", "id": sid, "field": field, "values": [{"value": old, "source": existing.get("provenance_source")}, {"value": new, "source": item.get("provenance_source")}]})
+                if len(conflicts) > conflict_count:
+                    diagnostics.append(f"duplicate stream merged with conflicting values: {sid}")
+                for field, value in item.items():
+                    if existing.get(field) in (None, "", [], {}):
+                        existing[field] = value
+            else:
+                stream_map[key] = item
+            facts.append({"kind": "stream_observed", "target_id": sid, "source_node": source_node, "target_node": target_node, "evidence_ids": list(item.get("evidence_ids") or evidence_ids[:1])})
+
+        normalized_nodes = list(node_map.values())
+        normalized_streams = list(stream_map.values())
+        node_names = {str(n["id"]).casefold() for n in normalized_nodes}
+        edges = []
+        for stream in normalized_streams:
+            source_node, target_node = stream.get("source_node"), stream.get("target")
+            if source_node and str(source_node).casefold() not in node_names:
+                diagnostics.append(f"stream {stream['id']} references unknown source {source_node}")
+            if target_node and str(target_node).casefold() not in node_names:
+                diagnostics.append(f"stream {stream['id']} references unknown target {target_node}")
+            if not source_node and not target_node:
+                diagnostics.append(f"stream {stream['id']} has no known upstream or downstream equipment")
+            elif not source_node or not target_node:
+                diagnostics.append(f"stream {stream['id']} is an open boundary stream")
+            if not stream.get("composition"):
+                diagnostics.append(f"stream {stream['id']} has no composition observation")
+            if source_node or target_node:
+                edges.append({"id": stream["id"], "source": source_node, "target": target_node, "stream_id": stream["id"]})
+        for node in normalized_nodes:
+            name = str(node["id"])
+            node["upstream_streams"] = [s["id"] for s in normalized_streams if str(s.get("target") or "").casefold() == name.casefold()]
+            node["downstream_streams"] = [s["id"] for s in normalized_streams if str(s.get("source_node") or "").casefold() == name.casefold()]
+            if not node["upstream_streams"] and not node["downstream_streams"]:
+                diagnostics.append(f"equipment {name} has no connected streams")
+        for stream in normalized_streams:
+            stream["source"] = stream.get("source_node")
+            stream.setdefault("provenance_source", "unknown")
+            if stream.get("stream_type") == "material" and ProcessContext(model_id="cycle-check", streams=normalized_streams)._is_cycle_stream(stream):
+                stream["stream_type"] = "recycle"
+        canonical_topology = {"nodes": normalized_nodes, "edges": edges,
+                              "streams": [{"id": s["id"], "source": s.get("source_node"), "target": s.get("target")} for s in normalized_streams]}
+        return normalized_nodes, normalized_streams, canonical_topology, compositions, conflicts, facts, inferences, diagnostics
+
     def build(self, *, session: Any = None, model_id: str | None = None) -> ProcessContext:
         cfg = self._load_config()
         equipment, streams, topology, sources = self._model_parts(cfg)
         equipment_parameters = self._equipment_parameter_parts(self._catalog_entries_cache)
         variables, objectives, constraints, yaml_evidence = self._yaml_parts(cfg)
+        configured_parameters = cfg.get("equipment_parameters", {})
+        if isinstance(configured_parameters, dict):
+            for equipment_id, raw_parameters in configured_parameters.items():
+                if isinstance(raw_parameters, dict):
+                    raw_parameters = [{"name": name, "value": value} for name, value in raw_parameters.items()]
+                if isinstance(raw_parameters, list):
+                    equipment_parameters.setdefault(str(equipment_id), []).extend(
+                        dict(item, source="config") for item in raw_parameters if isinstance(item, dict)
+                    )
+        # A YAML-only session has no Aspen/NodeDB topology by design.  Still
+        # expose equipment names that are explicitly present in configured
+        # variable paths, so read-only questions such as "有哪些设备" can be
+        # answered without opening Aspen COM.  These are configuration-derived
+        # names and are labelled accordingly, never presented as live model
+        # verification.
+        if not equipment:
+            names: dict[str, dict[str, Any]] = {}
+            for var in variables.values():
+                for name in var.get("related_equipment", []) or []:
+                    names.setdefault(str(name), {
+                        "name": str(name),
+                        "aspen_path": rf"\Data\Blocks\{name}",
+                        "block_type": "",
+                        "category": "unknown",
+                        "alias": None,
+                        "source": "yaml_path",
+                    })
+            equipment = list(names.values())
+            if equipment:
+                sources.append(self._evidence(
+                    "yaml.equipment_inferred", EvidenceSource.YAML,
+                    f"从 YAML 变量路径推断出 {len(equipment)} 个设备名称（未进行 Aspen 实时验证）",
+                    str(self.yaml_path) if self.yaml_path else "config",
+                    {"equipment": [x["name"] for x in equipment]},
+                ))
+        sim_equipment, sim_streams, sim_topology, sim_sources = self._simulation_model_parts(session)
+        if sim_equipment or sim_streams:
+            equipment.extend(sim_equipment)
+            streams.extend(sim_streams)
+            topology = {"nodes": list(topology.get("nodes", [])) + list(sim_topology.get("nodes", [])),
+                        "streams": list(topology.get("streams", [])) + list(sim_topology.get("streams", [])),
+                        "edges": list(topology.get("edges", [])) + list(sim_topology.get("edges", []))}
+            sources.extend(sim_sources)
         sources.extend(yaml_evidence)
+        # Normalize after YAML-only equipment discovery so every input mode
+        # (BKP, YAML, NodeDB, SimulationDB or an in-memory mapping) has the
+        # same graph vocabulary.  Existing ``equipment``/``streams`` values
+        # are retained as compatibility views of these normalized records.
+        (equipment, streams, topology, compositions, conflicts, facts,
+         inferences, graph_diagnostics) = self._normalize_graph(
+            equipment, streams, topology, cfg, sources)
         session_id = self._session_value(session, "session_id")
         case_id = self._session_value(session, "case_id")
         user_input = self._session_value(session, "user_input")
         if user_input:
             sources.append(self._evidence("user.input", EvidenceSource.USER_INPUT, "用户输入已纳入上下文", str(session_id or "session"), user_input))
         current_values: dict[str, Any] = {}
+        if isinstance(cfg.get("current_values"), dict):
+            current_values.update(dict(cfg["current_values"]))
         diagnostics: list[str] = []
+        diagnostics.extend(graph_diagnostics)
         if self.catalog_warning:
             diagnostics.append(self.catalog_warning)
         if self.node_db and case_id:
@@ -300,7 +820,67 @@ class ProcessContextBuilder:
             if not var.get("unit") and var.get("type") != "derived":
                 diagnostics.append(f"变量 {key} 缺少单位")
         status = "ok" if not diagnostics else "partial"
-        return ProcessContext(model_id=model_id or self.model_id or str(cfg.get("model_id") or (self.yaml_path.stem if self.yaml_path else "unknown")), model_version=cfg.get("model_version"), equipment=equipment, streams=streams, topology=topology, variables=variables, objectives=objectives, constraints=constraints, current_values=current_values, equipment_parameters=equipment_parameters, history_evidence=history, sources=sources, session_id=session_id, generated_at=datetime.now(timezone.utc).isoformat(), status=status, diagnostics=diagnostics)
+        # Keep source conflicts explicit and add evidence-backed composition
+        # observations.  A delta is a fact; a chemical interpretation remains
+        # an inference and is never asserted here.
+        for stream in streams:
+            if stream.get("composition"):
+                facts.append({"kind": "composition_observed", "stream_id": stream.get("id"),
+                              "composition": stream.get("composition"),
+                              "evidence_ids": list(stream.get("evidence_ids") or [])})
+        # Compare only observed inlet/outlet vectors.  The resulting facts
+        # describe enrichment/reduction; role labels such as reaction or
+        # separation stay explicitly probabilistic and evidence-linked.
+        for node in equipment:
+            node_id = str(node.get("id") or node.get("name") or "")
+            incoming = [s for s in streams if str(s.get("target") or "").casefold() == node_id.casefold() and s.get("composition")]
+            outgoing = [s for s in streams if str(s.get("source_node") or "").casefold() == node_id.casefold() and s.get("composition")]
+            if not incoming or not outgoing:
+                continue
+            for before in incoming:
+                for after in outgoing:
+                    comparison = ProcessContext(
+                        model_id="composition-comparison", streams=[before, after]
+                    ).compare_compositions(str(before.get("id")), str(after.get("id")))
+                    changes = [x for x in comparison["changes"] if x.get("classification") in {"enriched", "reduced"}]
+                    if not changes:
+                        continue
+                    evidence_ids = list(dict.fromkeys(list(before.get("evidence_ids") or []) + list(after.get("evidence_ids") or [])))
+                    facts.append({"kind": "composition_change", "equipment_id": node_id,
+                                  "input_stream": before.get("id"), "output_stream": after.get("id"),
+                                  "changes": changes, "evidence_ids": evidence_ids})
+                    block_type = str(node.get("block_type") or "").upper()
+                    possible = {"RCSTR": "possible_reaction", "RSTOIC": "possible_reaction",
+                                "FLASH2": "possible_separation", "RADFRAC": "possible_separation",
+                                "SEP": "possible_separation", "MIXER": "possible_mixing"}.get(block_type)
+                    if possible:
+                        inferences.append({"kind": possible, "target_id": node_id,
+                                           "input_stream": before.get("id"), "output_stream": after.get("id"),
+                                           "confidence": 0.45, "inference_method": "block_type_plus_composition_delta",
+                                           "evidence_ids": evidence_ids,
+                                           "note": "Composition change supports a possible role; it does not establish a chemical identity or mechanism."})
+            if len(incoming) > 1 and len(outgoing) >= 1:
+                inferences.append({"kind": "possible_mixing_or_dilution", "target_id": node_id,
+                                   "confidence": 0.35, "inference_method": "multiple_inlets_and_composition_observation",
+                                   "evidence_ids": list(dict.fromkeys(sum((list(s.get("evidence_ids") or []) for s in incoming + outgoing), [])))})
+        for stream in streams:
+            if context_cycle := ProcessContext(model_id="cycle-check", streams=streams)._is_cycle_stream(stream):
+                inferences.append({"kind": "recycle", "target_id": stream.get("id"),
+                                   "confidence": 0.9, "inference_method": "topology_cycle", "evidence_ids": list(stream.get("evidence_ids") or [])})
+        for conflict in conflicts:
+            diagnostics.append(f"conflicting values retained for {conflict.get('kind')} {conflict.get('id')} field {conflict.get('field')}")
+        return ProcessContext(
+            model_id=model_id or self.model_id or str(cfg.get("model_id") or (self.yaml_path.stem if self.yaml_path else "unknown")),
+            model_version=cfg.get("model_version"), equipment=equipment, streams=streams,
+            topology=topology, equipment_nodes=equipment, edges=list(topology.get("edges", [])),
+            compositions=compositions, variables=variables, objectives=objectives,
+            constraints=constraints, current_values=current_values,
+            equipment_parameters=equipment_parameters, history_evidence=history,
+            sources=sources, session_id=session_id,
+            generated_at=datetime.now(timezone.utc).isoformat(), status=status,
+            diagnostics=diagnostics, conflicts=conflicts, facts=facts,
+            inferences=inferences,
+        )
 
     @staticmethod
     def _match(value: str, query: str) -> bool:
@@ -353,4 +933,61 @@ class ProcessContextBuilder:
         names.update(x.get("name") for x in st)
         edges = [e for e in context.topology.get("edges", []) if e.get("id") in names or e.get("source") in names or e.get("target") in names]
         vars_ = {k: v for k, v in context.variables.items() if names.intersection(set(v.get("related_equipment", [])) | set(v.get("related_streams", [])))}
-        return ProcessContext(model_id=context.model_id, model_version=context.model_version, equipment=eq, streams=st, topology={"nodes": [n for n in context.topology.get("nodes", []) if n.get("id") in {e.get("name") for e in eq}], "edges": edges}, variables=vars_, objectives=context.objectives, constraints=[c for c in context.constraints if names.intersection(set(c.get("related_streams", [])))], current_values={k: v for k, v in context.current_values.items() if any(k.startswith((e.get("aspen_path") or "")) for e in eq + st)}, equipment_parameters={k: v for k, v in context.equipment_parameters.items() if k in {e.get("name") for e in eq}}, history_evidence=context.history_evidence, sources=context.sources, session_id=context.session_id, generated_at=context.generated_at, status=context.status, diagnostics=context.diagnostics)
+        selected_ids = {str(e.get("id") or e.get("name")) for e in eq}
+        selected_stream_ids = {str(s.get("id") or s.get("name")) for s in st}
+        return ProcessContext(model_id=context.model_id, model_version=context.model_version,
+            equipment=eq, streams=st,
+            topology={"nodes": [n for n in context.topology.get("nodes", []) if str(n.get("id") or n.get("name")) in selected_ids], "edges": edges},
+            equipment_nodes=eq, edges=edges,
+            compositions={k: v for k, v in context.compositions.items() if k in selected_stream_ids},
+            variables=vars_, objectives=context.objectives,
+            constraints=[c for c in context.constraints if names.intersection(set(c.get("related_streams", [])))],
+            current_values={k: v for k, v in context.current_values.items() if any(k.startswith((e.get("aspen_path") or "")) for e in eq + st)},
+            equipment_parameters={k: v for k, v in context.equipment_parameters.items() if k in selected_ids},
+            history_evidence=context.history_evidence, sources=context.sources,
+            session_id=context.session_id, generated_at=context.generated_at,
+            status=context.status, diagnostics=context.diagnostics,
+            conflicts=context.conflicts, facts=context.facts, inferences=context.inferences)
+
+    # Explicit builder-level wrappers make the read-only API convenient for
+    # callers that do not want to depend on ProcessContext implementation
+    # details, while the context methods remain the canonical behavior.
+    @staticmethod
+    def get_equipment(context: ProcessContext, equipment_id: str) -> dict[str, Any] | None:
+        return context.get_equipment(equipment_id)
+
+    @staticmethod
+    def get_stream(context: ProcessContext, stream_id: str) -> dict[str, Any] | None:
+        return context.get_stream(stream_id)
+
+    @staticmethod
+    def downstream(context: ProcessContext, equipment_id: str) -> list[str]:
+        return context.downstream(equipment_id)
+
+    @staticmethod
+    def upstream(context: ProcessContext, equipment_id: str) -> list[str]:
+        return context.upstream(equipment_id)
+
+    @staticmethod
+    def trace_stream(context: ProcessContext, stream_id: str) -> dict[str, Any] | None:
+        return context.trace_stream(stream_id)
+
+    @staticmethod
+    def trace_path(context: ProcessContext, start_id: str, end_id: str) -> list[dict[str, Any]]:
+        return context.trace_path(start_id, end_id)
+
+    @staticmethod
+    def terminal_streams(context: ProcessContext) -> list[dict[str, Any]]:
+        return context.terminal_streams()
+
+    @staticmethod
+    def boundary_nodes(context: ProcessContext) -> list[dict[str, Any]]:
+        return context.boundary_nodes()
+
+    @staticmethod
+    def summarize_process(context: ProcessContext) -> dict[str, Any]:
+        return context.summarize_process()
+
+    @staticmethod
+    def compare_compositions(context: ProcessContext, input_stream: str, output_stream: str) -> dict[str, Any]:
+        return context.compare_compositions(input_stream, output_stream)

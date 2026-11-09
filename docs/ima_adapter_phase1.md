@@ -10,7 +10,7 @@
 - `ImaClient.query_with_sources(ImaRequest) -> ImaAnswer`
 - `ImaClient.close() -> None`
 
-`ImaAnswer` 保留 `answer`、`confidence`、`assumptions`、`request_id` 和 `ImaSource` 列表。来源包含 `source/title/chapter/page/snippet/confidence/metadata`，并可投影为阶段 0 的公共 `src.agents.contracts.models.ImaAnswer`。
+`ImaAnswer` 保留 `answer`、`confidence`、`assumptions`、`request_id` 和 `ImaSource` 列表。来源包含 `source/title/chapter/page/snippet/confidence/metadata`，并可投影为阶段 0 的公共 `src.agents.evidence.models.ImaAnswer`。
 
 ## 配置
 
@@ -41,3 +41,5 @@ python -m pytest tests/integrations/ima tests/agents/contracts -q
 ```
 
 结果：`12 passed`。测试全部使用 Mock/标准库，不调用真实外部服务。
+
+\r\n

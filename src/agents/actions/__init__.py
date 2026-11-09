@@ -12,6 +12,7 @@ from .audit import AuditLog
 from .executor import MockExecutor, ExecutionError
 from .gateway import ActionGateway, ApprovalError
 from .parameter_actions import AspenParameterExecutor, BackupToken, parse_parameter_request, compare_results
+from src.agents.orchestration.parameter_impact import ParameterImpactPlan, SimulationPlan
 
 __all__ = [
     "ActionRequest", "ActionType", "ApprovalStatus", "ExecutionMode",
@@ -21,4 +22,5 @@ __all__ = [
     "ActionGateway", "ApprovalError",
     "AspenParameterExecutor", "BackupToken", "parse_parameter_request",
     "compare_results",
+    "ParameterImpactPlan", "SimulationPlan",
 ]

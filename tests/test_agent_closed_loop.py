@@ -270,11 +270,12 @@ def test_evidence_and_unknown_actions_rejected():
         validate_plan(ActionPlan(action="write_aspen"), state, LoopConfig(), set(), set())
 
 
-def test_cli_dry_run_does_not_import_com_or_mutate_config(tmp_path):
-    from src.main import main
+def test_removed_agent_cli_flag_is_rejected(tmp_path):
+    from src.main import _parse_args
     source = Path("cases/demo_case_2/pareto_config_epsd_aligned.yaml")
     before = source.read_bytes()
-    assert main([str(source), "--agent", "--dry-run", "--db", str(tmp_path / "sim.db")]) == 0
+    with pytest.raises(SystemExit):
+        _parse_args([str(source), "--agent", "--dry-run", "--db", str(tmp_path / "sim.db")])
     assert source.read_bytes() == before
     assert not (tmp_path / "sim.db").exists()
 

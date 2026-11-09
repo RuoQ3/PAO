@@ -373,8 +373,11 @@ def optimize_pareto_case(
     ParetoOptimizeResult
     """
     if config.agent_loop.get("enabled", False):
-        from .agent_entry import run_configured_agent
-        return run_configured_agent(driver, config)
+        # The enabled-loop branch is an internal workflow hook.  User-facing
+        # requests enter via LeadAgent, which creates the approval before this
+        # service is invoked.
+        from src.agents.orchestration.closed_loop.service import ClosedLoopService
+        return ClosedLoopService().run(driver=driver, config=config, approved=True)
 
     _validate_config(config)
 

@@ -9,9 +9,10 @@ class ApprovalError(RuntimeError): pass
 
 class ActionGateway:
     """Stateful approval gate. Execution is impossible before approval."""
-    def __init__(self, schema: ModelSchema, *, executor=None, audit=None, ttl_seconds: int = 3600, simulation_db=None):
+    def __init__(self, schema: ModelSchema, *, executor=None, audit=None, ttl_seconds: int = 3600, simulation_db=None, simulation_runner=None):
         self.schema = schema; self.executor = executor or MockExecutor(); self.audit = audit or AuditLog(); self.ttl_seconds = ttl_seconds
         self.simulation_db = simulation_db
+        self.simulation_runner = simulation_runner
         self._actions: dict[str, tuple[ActionRequest, ApprovalStatus, datetime, ActionPreview | None]] = {}
         self._backups: dict[str, object] = {}
     def submit(self, action: ActionRequest, *, actor="user") -> ValidationResult:
@@ -29,18 +30,26 @@ class ActionGateway:
 
     def preview_proposal(self, proposal):
         """Translate a Lead proposal to a validated preview without executing it."""
+        action_type = {"read": "inspect", "simulate_once": "run_simulation", "optimize": "run_optimization"}.get(proposal.action_type, proposal.action_type)
+        payload = dict(getattr(proposal, "payload", {}) or {})
         action = ActionRequest(
-            action_type=proposal.action_type,
+            action_type=action_type,
             target=proposal.target,
+            old_value=payload.get("old_value"), new_value=payload.get("new_value"),
+            unit=payload.get("unit"), model_id=payload.get("model_id"),
+            model_version=payload.get("model_version"), run_simulation=payload.get("run_simulation"),
             reason=proposal.reason,
             evidence=list(proposal.evidence_ids),
             risk=list(proposal.risks),
             requires_confirmation=proposal.requires_confirmation,
+            payload=payload,
         )
         result = self.submit(action, actor="lead_agent")
         if not result.valid or result.preview is None:
             return {"valid": False, "errors": list(result.errors), "warnings": list(result.warnings)}
-        return {"valid": True, "audit_id": action.audit_id, "preview": result.preview.to_dict()}
+        return {"valid": True, "audit_id": action.audit_id, "preview": result.preview.to_dict(),
+                "payload": payload, "evidence": list(proposal.evidence_ids), "risks": list(proposal.risks),
+                "target": proposal.target, "action_type": action_type}
     def preview(self, audit_id: str) -> ActionPreview:
         action, status, created, preview = self._get(audit_id); self._expire_if_needed(audit_id)
         _, status, _, preview = self._get(audit_id)
@@ -63,7 +72,29 @@ class ActionGateway:
             self._actions[audit_id] = (action, ApprovalStatus.FAILED, created, preview); self.audit.record(audit_id, AuditEventType.ERROR, status="failed", message="; ".join(result.errors)); raise ApprovalError("action invalid at execution: " + "; ".join(result.errors))
         try:
             if hasattr(self.executor, "backup"): self._backups[audit_id] = self.executor.backup(action)
-            output = self.executor.execute(action, preview=result.preview)
+            # A controlled parameter-impact plan is still dispatched through
+            # this gateway.  The runner is optional and injected by the host;
+            # without it the existing executor behavior is preserved.
+            if action.action_type.value == "run_simulation" and isinstance(action.payload.get("simulation_plan"), dict):
+                if self.simulation_runner is None:
+                    raise RuntimeError("已创建回测计划，但当前运行环境没有配置 Aspen simulation_runner。")
+                from src.agents.orchestration.parameter_impact import SimulationPlan
+                sim_plan = SimulationPlan.from_dict(action.payload["simulation_plan"])
+                sim_plan.approved = True
+                cases = self.simulation_runner.run(sim_plan)
+                if self.simulation_db is not None and hasattr(self.simulation_db, "save_cases"):
+                    self.simulation_db.save_cases([c.to_dict() for c in cases])
+                impact = action.payload.get("parameter_impact_plan") or {}
+                try:
+                    from src.agents.orchestration.parameter_impact import SensitivityAnalyzer
+                    parameters = [str(x.get("aspen_path") or x.get("name")) for x in impact.get("parameters", []) if isinstance(x, dict)]
+                    sensitivity = SensitivityAnalyzer().analyze(cases, metric=str(impact.get("metric") or "metric"), parameters=parameters)
+                except Exception as exc:
+                    sensitivity = {"error": f"sensitivity analysis failed: {type(exc).__name__}: {exc}"}
+                output = {"audit_id": action.audit_id, "status": "executed", "action_type": action.action_type.value,
+                          "simulation_cases": [c.to_dict() for c in cases], "sensitivity": sensitivity}
+            else:
+                output = self.executor.execute(action, preview=result.preview)
             if self.simulation_db is not None and hasattr(self.simulation_db, "save_action_audit"):
                 self.simulation_db.save_action_audit(action.audit_id, {
                     "action": action.to_dict(), "preview": result.preview.to_dict() if result.preview else None,

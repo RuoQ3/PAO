@@ -43,7 +43,10 @@ _log = logging.getLogger(__name__)
 # override=False：已有的系统环境变量优先于 .env，避免覆盖 CI/CD 注入的 key。
 
 def _load_dotenv_if_present(override: bool = False) -> None:
-    env_file = Path(__file__).parent.parent.parent / ".env"
+    # ``llm_client.py`` lives at ``src/agents/lead``; the project ``.env`` is
+    # four parents above the file.  The previous three-parent path resolved to
+    # ``src/.env`` and silently skipped the repository configuration.
+    env_file = Path(__file__).resolve().parents[3] / ".env"
     if not env_file.exists():
         return
     try:
@@ -51,7 +54,18 @@ def _load_dotenv_if_present(override: bool = False) -> None:
         load_dotenv(dotenv_path=env_file, override=override)
         _log.debug("已加载 .env（override=%s）：%s", override, env_file)
     except ImportError:
-        _log.debug("python-dotenv 未安装，跳过 .env 加载（可 pip install python-dotenv）")
+        # python-dotenv is optional; parse PAO's simple KEY=VALUE format when
+        # the optional package is absent.
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip().strip("\"'")
+            if name and (override or name not in os.environ):
+                os.environ[name] = value
+        _log.debug("python-dotenv unavailable; loaded simple .env values from %s", env_file)
 
 
 _load_dotenv_if_present()

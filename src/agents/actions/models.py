@@ -95,6 +95,7 @@ class ActionRequest:
     model_version: str | None = None
     # Optional per-action override.  ``None`` keeps the schema default.
     run_simulation: bool | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.action_type = ActionType(self.action_type)

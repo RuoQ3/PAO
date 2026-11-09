@@ -121,6 +121,203 @@ class ProcessContext:
     generated_at: str | None = None
     status: str = "ok"
     diagnostics: list[str] = field(default_factory=list)
+    # Canonical graph vocabulary.  ``equipment`` and ``streams`` remain the
+    # compatibility views used by existing agents; these appended fields keep
+    # positional construction of the historical dataclass compatible.
+    equipment_nodes: list[dict[str, Any]] = field(default_factory=list)
+    edges: list[dict[str, Any]] = field(default_factory=list)
+    compositions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+    facts: list[dict[str, Any]] = field(default_factory=list)
+    inferences: list[dict[str, Any]] = field(default_factory=list)
+
+    # The graph helpers intentionally operate on the normalized fields but
+    # fall back to legacy fields so contexts created by older clients remain
+    # fully usable.
+    def _nodes(self) -> list[dict[str, Any]]:
+        return list(self.equipment_nodes or self.equipment or [])
+
+    def _streams(self) -> list[dict[str, Any]]:
+        if self.streams:
+            return list(self.streams)
+        # Permit hand-authored canonical contexts that provide only ``edges``.
+        # The synthesized records deliberately retain the edge dictionary so
+        # callers can still inspect arbitrary metadata.
+        return [dict(edge, id=str(edge.get("id") or edge.get("stream_id") or edge.get("name")),
+                     name=str(edge.get("name") or edge.get("id") or edge.get("stream_id")),
+                     source=edge.get("source"), target=edge.get("target"),
+                     source_node=edge.get("source"), downstream=edge.get("target"),
+                     upstream=edge.get("source")) for edge in self.edges]
+
+    @staticmethod
+    def _same_id(item: dict[str, Any], value: str) -> bool:
+        needle = str(value).casefold()
+        return any(str(item.get(key, "")).casefold() == needle
+                   for key in ("id", "name", "label", "aspen_path"))
+
+    def get_equipment(self, equipment_id: str) -> dict[str, Any] | None:
+        return next((item for item in self._nodes() if self._same_id(item, equipment_id)), None)
+
+    def get_stream(self, stream_id: str) -> dict[str, Any] | None:
+        return next((item for item in self._streams() if self._same_id(item, stream_id)), None)
+
+    def _stream_source(self, stream: dict[str, Any]) -> str | None:
+        return stream.get("source") or stream.get("upstream")
+
+    def _stream_target(self, stream: dict[str, Any]) -> str | None:
+        return stream.get("target") or stream.get("downstream")
+
+    def downstream(self, equipment_id: str) -> list[str]:
+        """Return equipment IDs reached through outgoing streams."""
+        node = self.get_equipment(equipment_id)
+        if node is None:
+            return []
+        name = str(node.get("id") or node.get("name"))
+        result: list[str] = []
+        for stream in self._streams():
+            if str(self._stream_source(stream) or "").casefold() != name.casefold():
+                continue
+            target = self._stream_target(stream)
+            if target and target not in result:
+                result.append(str(target))
+        return result
+
+    def upstream(self, equipment_id: str) -> list[str]:
+        """Return equipment IDs feeding the requested equipment."""
+        node = self.get_equipment(equipment_id)
+        if node is None:
+            return []
+        name = str(node.get("id") or node.get("name"))
+        result: list[str] = []
+        for stream in self._streams():
+            if str(self._stream_target(stream) or "").casefold() != name.casefold():
+                continue
+            source = self._stream_source(stream)
+            if source and source not in result:
+                result.append(str(source))
+        return result
+
+    def trace_stream(self, stream_id: str) -> dict[str, Any] | None:
+        stream = self.get_stream(stream_id)
+        if stream is None:
+            return None
+        return {"stream": stream, "source": self._stream_source(stream),
+                "target": self._stream_target(stream),
+                "source_node": self.get_equipment(str(self._stream_source(stream))) if self._stream_source(stream) else None,
+                "target_node": self.get_equipment(str(self._stream_target(stream))) if self._stream_target(stream) else None}
+
+    def trace_path(self, start_id: str, end_id: str) -> list[dict[str, Any]]:
+        """Find a shortest equipment/stream path without guessing missing links."""
+        start = self.get_equipment(start_id)
+        end = self.get_equipment(end_id)
+        if start is None or end is None:
+            return []
+        start_name = str(start.get("id") or start.get("name"))
+        end_name = str(end.get("id") or end.get("name"))
+        queue: list[tuple[str, list[dict[str, Any]]]] = [(start_name, [start])]
+        visited = {start_name.casefold()}
+        while queue:
+            current, path = queue.pop(0)
+            for stream in self._streams():
+                if str(self._stream_source(stream) or "").casefold() != current.casefold():
+                    continue
+                target = self._stream_target(stream)
+                if not target:
+                    continue
+                next_path = path + [stream]
+                if str(target).casefold() == end_name.casefold():
+                    target_node = self.get_equipment(str(target))
+                    return next_path + ([target_node] if target_node else [])
+                key = str(target).casefold()
+                if key not in visited:
+                    visited.add(key)
+                    target_node = self.get_equipment(str(target))
+                    queue.append((str(target), next_path + ([target_node] if target_node else [])))
+        return []
+
+    def terminal_streams(self) -> list[dict[str, Any]]:
+        return [s for s in self._streams() if not self._stream_target(s)]
+
+    def boundary_nodes(self) -> list[dict[str, Any]]:
+        # A boundary node has an open side (feed/product/vent/unresolved
+        # connection), including a completely isolated equipment record.
+        result = []
+        for node in self._nodes():
+            name = str(node.get("id") or node.get("name") or "")
+            incoming = [s for s in self._streams() if str(self._stream_target(s) or "").casefold() == name.casefold()]
+            outgoing = [s for s in self._streams() if str(self._stream_source(s) or "").casefold() == name.casefold()]
+            open_incoming = any(not self._stream_source(s) for s in incoming)
+            open_outgoing = any(not self._stream_target(s) for s in outgoing)
+            if not incoming or not outgoing or open_incoming or open_outgoing:
+                result.append(node)
+        return result
+
+    def compare_compositions(self, input_stream: str, output_stream: str) -> dict[str, Any]:
+        left = self.get_stream(input_stream) or {}
+        right = self.get_stream(output_stream) or {}
+        def values(stream: dict[str, Any]) -> dict[str, float]:
+            raw = stream.get("composition") or stream.get("components") or []
+            if isinstance(raw, dict):
+                raw = [{"name": k, "value": v} for k, v in raw.items()]
+            result = {}
+            for item in raw if isinstance(raw, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or item.get("component") or item.get("id")
+                value = item.get("mole_fraction", item.get("mass_fraction", item.get("value")))
+                try:
+                    if name is not None and value is not None:
+                        result[str(name)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+            return result
+        a, b = values(left), values(right)
+        changes = []
+        for name in sorted(set(a) | set(b), key=str.casefold):
+            before, after = a.get(name), b.get(name)
+            delta = None if before is None or after is None else after - before
+            changes.append({"component": name, "input": before, "output": after,
+                            "delta": delta,
+                            "classification": ("unknown" if delta is None else
+                                "enriched" if delta > 1e-12 else
+                                "reduced" if delta < -1e-12 else "unchanged")})
+        return {"input_stream": input_stream, "output_stream": output_stream,
+                "changes": changes, "observed": bool(a or b),
+                "evidence_ids": list((left.get("evidence_ids") or []) + (right.get("evidence_ids") or []))}
+
+    def summarize_process(self) -> dict[str, Any]:
+        nodes = self._nodes()
+        return {
+            "model_id": self.model_id,
+            "entry_streams": [s for s in self._streams() if not self._stream_source(s)],
+            "major_stages": [n for n in nodes if n.get("role") not in {None, "unknown"}],
+            "separation_or_reaction_nodes": [n for n in nodes if str(n.get("block_type", "")).upper() in {"RCSTR", "RSTOIC", "FLASH2", "RADFRAC", "SEP"}],
+            "branches": [s for s in self._streams() if sum(1 for x in self._streams() if self._stream_source(x) == self._stream_source(s)) > 1],
+            "recirculation": [s for s in self._streams() if self._is_cycle_stream(s)],
+            "terminal_streams": self.terminal_streams(),
+            "confirmed_facts": list(self.facts),
+            "inferences": list(self.inferences),
+            "missing_information": list(self.diagnostics),
+        }
+
+    def _is_cycle_stream(self, stream: dict[str, Any]) -> bool:
+        source = self._stream_source(stream)
+        target = self._stream_target(stream)
+        if not source or not target:
+            return False
+        seen = {str(target).casefold()}
+        queue = [str(target)]
+        while queue:
+            current = queue.pop(0)
+            if current.casefold() == str(source).casefold():
+                return True
+            for candidate in self._streams():
+                if str(self._stream_source(candidate) or "").casefold() == current.casefold():
+                    nxt = self._stream_target(candidate)
+                    if nxt and str(nxt).casefold() not in seen:
+                        seen.add(str(nxt).casefold())
+                        queue.append(str(nxt))
+        return False
 
 
 @dataclass

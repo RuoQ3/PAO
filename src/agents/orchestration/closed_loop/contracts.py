@@ -5,6 +5,11 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+# Parameter-impact plans use the same approval boundary as the closed loop.
+# Re-exporting here keeps older integrations that import plan contracts from
+# this module source-compatible.
+from ..parameter_impact import ParameterImpactPlan, SimulationPlan
+
 
 def finite(value: Any) -> float:
     if isinstance(value, bool):

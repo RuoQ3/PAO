@@ -208,6 +208,16 @@ class ProcessCase:
     # manifest runtime 模式产出的语义字段集合，{block_name: SemanticBlock}
     # 非 manifest 模式时为空字典
     semantic_blocks: dict[str, SemanticBlock] = field(default_factory=dict)
+    # Controlled parameter-impact result metadata.  These fields are optional
+    # so historical ProcessCase payloads remain valid and compatible.
+    impact_inputs: dict[str, Any] = field(default_factory=dict)
+    impact_outputs: dict[str, Any] = field(default_factory=dict)
+    converged: bool | None = None
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    result_source: str | None = None
+    model_path: str | None = None
+    timestamp: str | None = None
 
     # ------------------------------------------------------------------ #
     # 便捷属性
@@ -444,6 +454,14 @@ class ProcessCase:
             "semantic_blocks": {
                 name: sb.to_dict() for name, sb in self.semantic_blocks.items()
             },
+            "impact_inputs": self.impact_inputs,
+            "impact_outputs": self.impact_outputs,
+            "converged": self.converged,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "result_source": self.result_source,
+            "model_path": self.model_path,
+            "timestamp": self.timestamp,
         }
 
     def summary(self) -> dict[str, Any]:
@@ -469,6 +487,14 @@ class ProcessCase:
             "objectives": {o.name: o.value for o in self.objectives},
             "constraints": {c.name: c.value for c in self.constraints},
             "tags": self.tags,
+            "impact_inputs": self.impact_inputs,
+            "impact_outputs": self.impact_outputs,
+            "converged": self.converged,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "result_source": self.result_source,
+            "model_path": self.model_path,
+            "timestamp": self.timestamp,
         }
 
 

@@ -3,12 +3,10 @@
 venv/
 env/
 .venv312/
-
 # 测试运行时产物（跟踪测试源码 .py，只忽略运行时产物）
 tests/__pycache__/
 tests/.pytest_cache/
 tests/**/__pycache__/
-
 # Python 编译缓存
 __pycache__/
 *.py[cod]
@@ -17,74 +15,58 @@ __pycache__/
 .pytest-tmp/
 .pycache-tmp/
 .Python
-tests/
-
 # 构建产物
 build/
 dist/
 *.egg-info/
 *.egg
-
 # 仿真输出数据库
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite-journal
-
 # 日志文件
 *.log
 logs/
-
 # Aspen Plus 临时/锁定文件
 *.def
 *.bak
 *.tmp
 *.temp
-
 # 仿真输出目录（保留目录结构，忽略内容）
 cases/*/output/
-
 # 缓存目录
 cache/
-
 # 图表输出
 *.png
 *.jpg
 *.jpeg
 *.svg
-
 # PDF 文档（大文件）
 *.pdf
 *.txt
-
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
 # Windows
 Thumbs.db
 Desktop.ini
 ehthumbs.db
-
 # 环境变量
 .env
 .env.local
-
 
 提示词/
 .claude/
 scripts/
 .pytest_cache/
 
-
 cases/demo_case_2/epsd/
 cases/demo_case_2/GLY2.1/
-
 cases/Aspen示例/
-
 frontend/
-
 backend/
+.pytest_tmp/

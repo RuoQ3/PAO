@@ -6,7 +6,7 @@
 
 当前系统可以分成四层：
 
-1. **入口与路由**：CLI 进入 `src/main.py`；Coordinator 按 `intent.py → planner.py → dispatcher.py` 完成意图识别、任务拆解和顺序分发。`ChatSessionState` 跨轮保存 Aspen、配置 YAML、结果 DB 等路径，不保存数值结果。
+1. **入口与路由**：CLI 进入 `src/main.py`；Lead Agent 通过 Orchestration Runtime 完成意图识别、任务拆解和受限分发。`ChatSessionState` 跨轮保存 Aspen、配置 YAML、结果 DB 等路径，不保存数值结果。
 2. **对话/状态机**：`src/agents/graph.py` 的 `PAOGraphState` 用基本 Python 类型连接 onboarding、人工确认、优化、分析和结束节点；LangGraph checkpoint 负责状态恢复，首次草案确认是现有 HITL 边界。
 3. **闭环优化**：YAML Agent 在 `agent_entry.py` 构造上下文和知识，在 `agent_optimize.py` 中执行 observe/decide/ask/evaluate/tell。`ActionPlan` 仅允许 `continue`、`set_region`、`probe`、`stop`，并由确定性校验器检查证据、边界、类型和预算。
 4. **执行与证据**：Aspen COM 由 `src/aspen_driver/` 封装；`run_case()` 产生 `ProcessCase`；checkpoint 是闭环恢复的权威记录，`SimulationDB` 是查询、报表和离线分析投影。
@@ -63,6 +63,12 @@ flowchart TD
 生命周期：单次请求创建 → 加入 `EvidenceBundle` → 写入对话审计/checkpoint（若上层选择持久化）→ 不可变引用。
 
 ### 3.2 `ProcessContext`
+
+流程图字段采用稳定的设备节点到物流边到设备节点关系。`equipment`、`streams`、`topology`、`variables` 等旧字段继续保留；新增的 `equipment_nodes`、`edges`、`compositions`、`conflicts`、`facts` 和 `inferences` 是规范化视图。每个节点带有 `id/name/kind/block_type/role/aspen_path/upstream_streams/downstream_streams/parameters/source/confidence`；每条物流带有 `id/name/source/target/aspen_path/stream_type/composition/temperature/pressure/flow/phase/source/confidence`。这里的 `source` 表示拓扑上游端点，证据来源保存在 `provenance_source/source_ref/evidence_ids` 中。
+
+角色只根据通用 Aspen `block_type` 保守推断（例如 `PUMP`、`MIXER`、`RCSTR`、`RSTOIC`、`FLASH2`、`RADFRAC`、`HEATER`、`COOLER`、`HEATX`、`SEP`）；未知类型为 `unknown`。角色推断和组成变化判断分别记录 `inference_method`、`confidence` 与 `evidence_ids`，组成富集或减少属于观察事实，不自动等同于确定的化学反应或产品语义。
+
+`ProcessContext` 提供只读的 `get_equipment`、`get_stream`、`downstream`、`upstream`、`trace_stream`、`trace_path`、`terminal_streams`、`boundary_nodes`、`summarize_process` 和 `compare_compositions`。这些方法支持分流、合流、循环、开放边界和未连接物流；缺失值保持为 `None`，冲突进入 `conflicts` 和 `diagnostics`。`ProcessContextBuilder` 和 `src.agents.context` 同时提供同名包装接口。
 
 | 字段 | 来源与说明 |
 |---|---|
@@ -124,7 +130,7 @@ flowchart TD
 
 `TechnicalAdvisor.advise(context, evidence) -> TechnicalAdvice` 只分析证据，不调用执行网关。它可以提出参数检查或实验建议，但不能直接修改 `ActionPlan`、YAML 或 Aspen。
 
-主编排 Agent（类型骨架中的 `ConversationOrchestrator`）负责：意图澄清、证据收集、冲突呈现、建议总结和生成 `UserAction` 提案。它可以复用 Coordinator 的 `IntentClassification/Plan/ExecutionState` 作为内部路由结果，但新公共契约不依赖这些类型。
+主编排 Agent（类型骨架中的 `ConversationOrchestrator`）负责：意图澄清、证据收集、冲突呈现、建议总结和生成 `UserAction` 提案。其路由结果只使用新架构的 TaskSpec/TaskResult 契约，不依赖已删除的旧 Coordinator 类型。
 
 `ActionGateway.preview/execute` 是唯一受控动作入口。网关必须重新读取上下文、校验来源和策略，并记录 action id、确认人、执行结果和失败原因。
 
@@ -176,3 +182,15 @@ python -m pytest tests/agents/contracts/test_models.py -q
 ```
 
 结果：4 passed。测试覆盖 IMA、ProcessContext、TechnicalAdvice、EvidenceBundle、UserAction 的嵌套序列化/反序列化、枚举边界和未知字段拒绝；不需要 Aspen、IMA 服务或外部 SDK。
+
+\r\n
+# Agent 入口收敛
+
+LeadAgent 是唯一用户可见的 Agent 入口。CLI 的 `--agent`、`--chat` 和
+`--unified-chat` 都创建 `ConversationSession`/`SessionState` 并交给
+LeadAgent；LeadAgent 负责上下文构建、意图识别、Subagent 路由及动作提案。
+
+闭环执行通过内部 `ClosedLoopService` 完成。ProcessDecisionAgent 不提供
+CLI/API 入口。任何修改、仿真或优化都必须经过 proposal、validation、preview、
+人工确认和 `ActionGateway.execute()`。普通 `python -m src.main <config.yaml>`
+是独立的确定性优化入口，不依赖 LeadAgent、LLM 或 Agent Runtime。

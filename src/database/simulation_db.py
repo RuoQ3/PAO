@@ -72,6 +72,14 @@ CREATE TABLE IF NOT EXISTS cases (
     blocks                TEXT    NOT NULL DEFAULT '{}',
     streams               TEXT    NOT NULL DEFAULT '{}',
     semantic_blocks       TEXT    NOT NULL DEFAULT '{}',
+    impact_inputs         TEXT    NOT NULL DEFAULT '{}',
+    impact_outputs        TEXT    NOT NULL DEFAULT '{}',
+    converged             INTEGER,
+    errors_json           TEXT    NOT NULL DEFAULT '[]',
+    warnings_json         TEXT    NOT NULL DEFAULT '[]',
+    result_source         TEXT,
+    model_path            TEXT,
+    result_timestamp      TEXT,
     created_at            TEXT    NOT NULL
 );
 
@@ -116,6 +124,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_case_tag ON tags (case_id, tag);
 _MIGRATIONS: list[tuple[str, str, str]] = [
     ("cases", "session_id",      "ALTER TABLE cases ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"),
     ("cases", "semantic_blocks", "ALTER TABLE cases ADD COLUMN semantic_blocks TEXT NOT NULL DEFAULT '{}'"),
+    ("cases", "impact_inputs", "ALTER TABLE cases ADD COLUMN impact_inputs TEXT NOT NULL DEFAULT '{}'"),
+    ("cases", "impact_outputs", "ALTER TABLE cases ADD COLUMN impact_outputs TEXT NOT NULL DEFAULT '{}'"),
+    ("cases", "converged", "ALTER TABLE cases ADD COLUMN converged INTEGER"),
+    ("cases", "errors_json", "ALTER TABLE cases ADD COLUMN errors_json TEXT NOT NULL DEFAULT '[]'"),
+    ("cases", "warnings_json", "ALTER TABLE cases ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'"),
+    ("cases", "result_source", "ALTER TABLE cases ADD COLUMN result_source TEXT"),
+    ("cases", "model_path", "ALTER TABLE cases ADD COLUMN model_path TEXT"),
+    ("cases", "result_timestamp", "ALTER TABLE cases ADD COLUMN result_timestamp TEXT"),
 ]
 
 # export_feasibility_dataset 只导出经过 Aspen 运行且产生有意义结果的状态，
@@ -137,6 +153,8 @@ _SUMMARY_COLS = (
     "has_constraints", "objectives_available", "constraints_available",
     "run_time", "source_filepath", "run_id", "notes",
     "design_vars", "objectives_json", "constraints_json", "tags_json",
+    "impact_inputs", "impact_outputs", "converged", "errors_json", "warnings_json",
+    "result_source", "model_path", "result_timestamp",
 )
 
 
@@ -181,6 +199,13 @@ class SimulationDB:
             if column not in existing:
                 self._conn.execute(alter_sql)
                 _log.info("数据库迁移：%s.%s 列已补齐。", table, column)
+
+    def _summary_columns(self) -> tuple[str, ...]:
+        try:
+            present = {row["name"] for row in self._conn.execute("PRAGMA table_info(cases)").fetchall()}
+        except sqlite3.Error:
+            present = set(_SUMMARY_COLS)
+        return tuple(col for col in _SUMMARY_COLS if col in present)
 
     # ------------------------------------------------------------------ #
     # 上下文管理器
@@ -276,9 +301,11 @@ class SimulationDB:
                 has_constraints, objectives_available, constraints_available,
                 run_time, source_filepath, run_id, notes,
                 design_vars, objectives_json, constraints_json, tags_json,
-                sim_result, blocks, streams, semantic_blocks, created_at
+                sim_result, blocks, streams, semantic_blocks,
+                impact_inputs, impact_outputs, converged, errors_json, warnings_json,
+                result_source, model_path, result_timestamp, created_at
             ) VALUES (
-                ?,?,?,?,  ?,?,?,  ?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,?,  ?
+                ?,?,?,?,  ?,?,?,  ?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,?,  ?,?,?,?,?,?,?,?,?
             )
             """,
             (
@@ -305,6 +332,14 @@ class SimulationDB:
                 json.dumps(d.get("blocks", {}),            ensure_ascii=False, default=str),
                 json.dumps(d.get("streams", {}),           ensure_ascii=False, default=str),
                 json.dumps(d.get("semantic_blocks", {}),   ensure_ascii=False, default=str),
+                json.dumps(d.get("impact_inputs", {}), ensure_ascii=False, default=str),
+                json.dumps(d.get("impact_outputs", {}), ensure_ascii=False, default=str),
+                None if d.get("converged") is None else int(bool(d.get("converged"))),
+                json.dumps(d.get("errors", []), ensure_ascii=False, default=str),
+                json.dumps(d.get("warnings", []), ensure_ascii=False, default=str),
+                d.get("result_source"),
+                d.get("model_path"),
+                d.get("timestamp"),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -396,7 +431,8 @@ class SimulationDB:
         list[dict]
             每行含摘要字段，JSON 列已解码。
         """
-        cols = ", ".join(f"cases.{c}" for c in _SUMMARY_COLS)
+        summary_cols = self._summary_columns()
+        cols = ", ".join(f"cases.{c}" for c in summary_cols)
         sql = f"SELECT {cols} FROM cases"
         conditions: list[str] = []
         params: list[Any] = []
@@ -520,7 +556,8 @@ class SimulationDB:
         list[dict]
             摘要字段 + ``objective_value: float``。
         """
-        cols = ", ".join(f"cases.{c}" for c in _SUMMARY_COLS)
+        summary_cols = self._summary_columns()
+        cols = ", ".join(f"cases.{c}" for c in summary_cols)
         sql = (
             f"SELECT {cols}, o.value AS objective_value "
             "FROM cases "
@@ -649,7 +686,7 @@ class SimulationDB:
         """将摘要列的 Row 转换为 dict，JSON 列解码。"""
         d: dict[str, Any] = {}
         for col in _SUMMARY_COLS:
-            d[col] = row[col]
+            d[col] = row[col] if col in row.keys() else ({} if col in {"impact_inputs", "impact_outputs"} else [] if col in {"errors_json", "warnings_json"} else None)
 
         # bool 列还原
         d["simulation_valid"] = bool(d["simulation_valid"])
@@ -664,6 +701,12 @@ class SimulationDB:
         d["objectives"]   = self._decode_json(d.pop("objectives_json"),   [])
         d["constraints"]  = self._decode_json(d.pop("constraints_json"),  [])
         d["tags"]         = self._decode_json(d.pop("tags_json"),         [])
+        d["impact_inputs"] = self._decode_json(d.pop("impact_inputs"), {})
+        d["impact_outputs"] = self._decode_json(d.pop("impact_outputs"), {})
+        d["converged"] = None if d.get("converged") is None else bool(d["converged"])
+        d["errors"] = self._decode_json(d.pop("errors_json"), [])
+        d["warnings"] = self._decode_json(d.pop("warnings_json"), [])
+        d["timestamp"] = d.pop("result_timestamp")
         return d
 
     def _row_to_full_dict(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -688,4 +731,11 @@ class SimulationDB:
         d["blocks"]            = self._decode_json(d.get("blocks"),            {})
         d["streams"]           = self._decode_json(d.get("streams"),           {})
         d["semantic_blocks"]   = self._decode_json(d.get("semantic_blocks"),   {})
+        d["impact_inputs"] = self._decode_json(d.get("impact_inputs"), {})
+        d["impact_outputs"] = self._decode_json(d.get("impact_outputs"), {})
+        d["converged"] = None if d.get("converged") is None else bool(d.get("converged"))
+        d["errors"] = self._decode_json(d.get("errors_json"), [])
+        d["warnings"] = self._decode_json(d.get("warnings_json"), [])
+        d["timestamp"] = d.get("result_timestamp")
+        d.pop("errors_json", None); d.pop("warnings_json", None); d.pop("result_timestamp", None)
         return d

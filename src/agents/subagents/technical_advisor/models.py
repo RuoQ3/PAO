@@ -31,6 +31,10 @@ class QuestionIntent:
     objectives: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
     clarifications: list[Clarification] = field(default_factory=list)
+    target_stream: str | None = None
+    target_component: str | None = None
+    metric: str | None = None
+    candidate_parameters: list[str] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:

@@ -5,6 +5,7 @@ from dataclasses import MISSING, asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any
 import json
+import math
 import uuid
 
 
@@ -13,6 +14,7 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
     PARTIAL = "partial"
     CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
 
 
 class ExecutionMode(str, Enum):
@@ -51,14 +53,37 @@ class JsonModel:
         if cls is TaskResult:
             data["status"] = TaskStatus(data.get("status", TaskStatus.COMPLETED))
             data["evidence"] = [Evidence.from_dict(x) if isinstance(x, dict) else x for x in data.get("evidence", [])]
+        elif cls is IntentSchema:
+            data["subagents"] = [SubagentRequest.from_dict(x) if isinstance(x, dict) else x for x in data.get("subagents", [])]
+        elif cls is Classification:
+            raw_intent = data.get("intent")
+            if isinstance(raw_intent, dict):
+                data["intent"] = IntentSchema.from_dict(raw_intent)
         elif cls is RuntimePolicy:
             data["mode"] = ExecutionMode(data.get("mode", ExecutionMode.STANDARD))
         elif cls is SessionState:
             data["mode"] = ExecutionMode(data.get("mode", ExecutionMode.STANDARD))
             data["task_results"] = [TaskResult.from_dict(x) if isinstance(x, dict) else x for x in data.get("task_results", [])]
+            intent = data.get("intent")
+            if isinstance(intent, dict):
+                data["intent"] = IntentSchema.from_dict(intent)
+            pending = data.get("pending_approval")
+            if isinstance(pending, dict):
+                proposal = pending.get("proposal")
+                if isinstance(proposal, dict):
+                    pending = dict(pending)
+                    pending["proposal"] = ActionProposal.from_dict(proposal)
+                data["pending_approval"] = ApprovalRequest.from_dict(pending)
         elif cls is Answer:
             data["evidence"] = [Evidence.from_dict(x) if isinstance(x, dict) else x for x in data.get("evidence", [])]
             data["task_results"] = [TaskResult.from_dict(x) if isinstance(x, dict) else x for x in data.get("task_results", [])]
+            approval = data.get("approval_request")
+            if isinstance(approval, dict):
+                approval = dict(approval)
+                proposal = approval.get("proposal")
+                if isinstance(proposal, dict):
+                    approval["proposal"] = ActionProposal.from_dict(proposal)
+                data["approval_request"] = ApprovalRequest.from_dict(approval)
         return cls(**data)
 
     @classmethod
@@ -76,6 +101,113 @@ class Evidence(JsonModel):
     confidence: float | None = None
 
 
+INTENTS = frozenset({
+    "chat", "project_query", "analysis", "modify_request", "simulation_request",
+    "optimization_request", "parameter_impact", "report_request", "code_request", "general_question",
+})
+PROJECT_SCOPES = frozenset({"none", "current_project", "current_case", "current_session", "external"})
+ACTION_TYPES = frozenset({"none", "read", "modify_file", "set_parameter", "simulate_once", "optimize", "modify_structure"})
+PRIORITIES = frozenset({"low", "normal", "high"})
+CONTEXT_REQUIREMENTS = frozenset({"process_context", "yaml", "node_db", "simulation_db", "history", "files", "none"})
+
+
+@dataclass
+class SubagentRequest(JsonModel):
+    name: str
+    task: str
+    priority: str = "normal"
+    parallel: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("subagent name must be a non-empty string")
+        if not isinstance(self.task, str):
+            raise TypeError("subagent task must be a string")
+        if self.priority not in PRIORITIES:
+            raise ValueError(f"invalid subagent priority: {self.priority!r}")
+        if type(self.parallel) is not bool:
+            raise TypeError("subagent parallel must be boolean")
+
+
+@dataclass
+class IntentSchema(JsonModel):
+    """Strict, provider-neutral intent contract emitted by the classifier."""
+
+    intent: str
+    task_type: str
+    project_scope: str
+    context_required: list[str] = field(default_factory=list)
+    subagents: list[SubagentRequest] = field(default_factory=list)
+    action_type: str = "none"
+    requires_confirmation: bool = False
+    confidence: float = 0.0
+    missing_information: list[str] = field(default_factory=list)
+    reason: str = ""
+    # Structured slots for parameter impact questions.  Kept optional so
+    # existing provider payloads and checkpoints remain compatible.
+    analysis: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.intent not in INTENTS:
+            raise ValueError(f"invalid intent: {self.intent!r}")
+        if not isinstance(self.task_type, str) or not self.task_type:
+            raise ValueError("task_type must be a non-empty string")
+        if self.project_scope not in PROJECT_SCOPES:
+            raise ValueError(f"invalid project_scope: {self.project_scope!r}")
+        if not isinstance(self.context_required, list) or not all(isinstance(x, str) for x in self.context_required):
+            raise TypeError("context_required must be a list of strings")
+        unknown_context = set(self.context_required) - CONTEXT_REQUIREMENTS
+        if unknown_context:
+            raise ValueError(f"invalid context_required: {sorted(unknown_context)}")
+        if "none" in self.context_required and len(self.context_required) > 1:
+            raise ValueError("context_required='none' cannot be combined with other context sources")
+        if not isinstance(self.subagents, list) or not all(isinstance(x, SubagentRequest) for x in self.subagents):
+            raise TypeError("subagents must be a list of SubagentRequest")
+        if self.action_type not in ACTION_TYPES:
+            raise ValueError(f"invalid action_type: {self.action_type!r}")
+        if type(self.requires_confirmation) is not bool:
+            raise TypeError("requires_confirmation must be boolean")
+        if (not isinstance(self.confidence, (int, float)) or isinstance(self.confidence, bool)
+                or not math.isfinite(float(self.confidence)) or not 0 <= self.confidence <= 1):
+            raise ValueError("confidence must be between 0 and 1")
+        if not isinstance(self.missing_information, list) or not all(isinstance(x, str) for x in self.missing_information):
+            raise TypeError("missing_information must be a list of strings")
+        if not isinstance(self.reason, str):
+            raise TypeError("reason must be a string")
+        if not isinstance(self.analysis, dict):
+            raise TypeError("analysis must be a mapping")
+        if self.action_type in {"modify_file", "set_parameter", "simulate_once", "optimize", "modify_structure"} and not self.requires_confirmation:
+            raise ValueError("mutating, simulation and optimization actions require confirmation")
+        if self.action_type in {"none", "read"} and self.requires_confirmation:
+            raise ValueError("read-only and no-op intents cannot require confirmation")
+        expected_action = {
+            "simulation_request": "simulate_once",
+            "optimization_request": "optimize",
+            "parameter_impact": "simulate_once",
+        }.get(self.intent)
+        if expected_action is not None and self.action_type != expected_action:
+            raise ValueError(f"{self.intent} must use action_type={expected_action}")
+        if self.intent == "modify_request" and self.action_type in {"none", "read"}:
+            raise ValueError("modify_request must declare a mutating action_type")
+        if self.missing_information and self.action_type not in {"none", "read"} and self.requires_confirmation is not True:
+            raise ValueError("incomplete action requests must remain pending and explicit")
+
+
+@dataclass
+class Classification(JsonModel):
+    """Classifier output plus explicit provenance for fallback auditing."""
+
+    intent: IntentSchema
+    classification_source: str = "llm"
+    fallback_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.classification_source not in {"llm", "rule_fallback"}:
+            raise ValueError("classification_source must be llm or rule_fallback")
+        if self.classification_source == "rule_fallback" and not self.fallback_reason:
+            raise ValueError("rule fallback requires a reason")
+
+
 @dataclass
 class TaskSpec(JsonModel):
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -86,8 +218,13 @@ class TaskSpec(JsonModel):
     tool_allowlist: list[str] = field(default_factory=list)
     max_steps: int = 8
     timeout_seconds: float = 60.0
-    budget: int = 8
+    # A bare TaskSpec consumes one budget unit. Callers that need a larger
+    # allowance must set it explicitly; this keeps small compatibility tasks
+    # from exhausting a runtime merely because max_steps is larger.
+    budget: int = 1
     allow_subtasks: bool = False
+    retry_attempts: int = 0
+    recursion_depth: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -123,17 +260,25 @@ class RuntimePolicy(JsonModel):
     allow_writes: bool = False
     require_risk_review: bool = True
     allow_subagent_delegation: bool = False
+    max_retries: int = 1
+    max_recursion_depth: int = 1
+    max_tool_calls_per_task: int = 32
 
     def __post_init__(self) -> None:
         self.max_tasks = max(1, int(self.max_tasks))
         self.max_concurrency = max(1, int(self.max_concurrency))
         self.max_steps_per_task = max(1, int(self.max_steps_per_task))
         self.total_budget = max(1, int(self.total_budget))
+        self.max_retries = max(0, int(self.max_retries))
+        self.max_recursion_depth = max(0, int(self.max_recursion_depth))
+        self.max_tool_calls_per_task = max(1, int(self.max_tool_calls_per_task))
         if self.mode == ExecutionMode.INSTANT:
             self.max_tasks = 1
             self.max_concurrency = 1
             self.allow_writes = False
             self.allow_subagent_delegation = False
+            self.max_retries = 0
+            self.max_recursion_depth = 0
         elif self.mode == ExecutionMode.BRIEF:
             self.max_tasks = min(self.max_tasks, 2)
             self.max_concurrency = min(self.max_concurrency, 2)
@@ -180,4 +325,11 @@ class SessionState(JsonModel):
     audit_events: list[dict[str, Any]] = field(default_factory=list)
     pending_approval: ApprovalRequest | None = None
     budget_used: int = 0
+    intent: IntentSchema | None = None
+    classification_source: str | None = None
+    fallback_reason: str | None = None
+    context_summary: dict[str, Any] = field(default_factory=dict)
+    context_sources: list[dict[str, Any]] = field(default_factory=list)
+    checkpoint_ref: str | None = None
+    runtime_state: dict[str, Any] = field(default_factory=dict)
 

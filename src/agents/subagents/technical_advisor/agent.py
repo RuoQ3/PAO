@@ -45,6 +45,10 @@ class TechnicalAdviceResult:
                 "objectives": self.intent.objectives,
                 "constraints": self.intent.constraints,
                 "clarifications": [c.__dict__ for c in self.intent.clarifications],
+                "target_stream": self.intent.target_stream,
+                "target_component": self.intent.target_component,
+                "metric": self.intent.metric,
+                "candidate_parameters": self.intent.candidate_parameters,
             },
             "ima_answer": None if self.ima_answer is None else {
                 "answer": self.ima_answer.answer,
@@ -140,17 +144,34 @@ class TechnicalAdvisor:
                 if stream_set.intersection(set(v.get("related_streams", [])))
             )
         missing: list[Clarification] = []
+        target_component = None
+        for token in re.findall(r"\b[A-Z][A-Z0-9_-]{1,15}\b", q):
+            if token not in {"ASPEN"} and token not in eq and token not in streams:
+                target_component = token
+        metric = ("mole_fraction" if any(x in low for x in ("mole fraction", "摩尔分数")) else
+                  "purity" if any(x in low for x in ("purity", "纯度")) else
+                  "energy" if any(x in low for x in ("energy", "能耗", "duty")) else None)
         if typ == QuestionType.EQUIPMENT_EXPLANATION and not eq:
             missing.append(Clarification("equipment", "请提供要解释的设备名称（例如 T1）或 Aspen 路径。"))
         if typ == QuestionType.STREAM_TRACE and not streams:
             missing.append(Clarification("stream", "请提供要追踪的物流名称（例如 D1）或 Aspen 路径。"))
         if typ == QuestionType.PARAMETER_IMPACT and not variables:
             missing.append(Clarification("variable", "请提供要评估的变量（例如 T1 回流比）。"))
+        if typ == QuestionType.PARAMETER_IMPACT and not eq:
+            missing.append(Clarification("equipment", "请提供目标设备名称。"))
+        if typ == QuestionType.PARAMETER_IMPACT and not streams:
+            missing.append(Clarification("target_stream", "请提供目标物流名称。"))
+        if typ == QuestionType.PARAMETER_IMPACT and not target_component:
+            missing.append(Clarification("target_component", "请提供目标组分。"))
+        if typ == QuestionType.PARAMETER_IMPACT and not metric:
+            missing.append(Clarification("metric", "请提供评价指标（如 mole_fraction、purity 或 energy）。"))
         if typ == QuestionType.MULTI_OBJECTIVE_TRADEOFF and len(objectives) < 2 and len(context.objectives) < 2:
             missing.append(Clarification("objectives", "请提供要比较的目标（例如 CAPEX、OPEX、纯度）。"))
         if typ == QuestionType.UNKNOWN:
             missing.append(Clarification("question_type", "请说明是设备、物流、参数影响、约束/收敛、多目标权衡还是实验建议。"))
-        return QuestionIntent(typ, list(dict.fromkeys(eq)), list(dict.fromkeys(streams)), list(dict.fromkeys(variables)), list(dict.fromkeys(objectives)), list(dict.fromkeys(constraints)), missing)
+        return QuestionIntent(typ, list(dict.fromkeys(eq)), list(dict.fromkeys(streams)), list(dict.fromkeys(variables)), list(dict.fromkeys(objectives)), list(dict.fromkeys(constraints)), missing,
+                             target_stream=streams[0] if streams else None, target_component=target_component, metric=metric,
+                             candidate_parameters=list(dict.fromkeys(variables)))
 
     # Public names used by callers that separate intent recognition from
     # advice generation.

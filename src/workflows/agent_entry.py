@@ -80,7 +80,14 @@ def validate_agent_config(config):
     return settings
 
 
-def run_configured_agent(driver, config):
+def run_configured_agent(driver, config, *, _internal: bool = False):
+    """Run the checkpointed loop as an internal service implementation.
+
+    User-facing callers must enter through ``LeadAgent``; this adapter remains
+    public only for orchestration/runtime integrations and tests.
+    """
+    if not _internal:
+        raise PermissionError("run_configured_agent is an internal LeadAgent service; use LeadAgent")
     from src.agents.orchestration.closed_loop.journal import decode_case
     from src.agents.orchestration.closed_loop.advisor import ProcessDecisionAgent
     from src.agents.orchestration.closed_loop.reporting import render_explanatory_report
