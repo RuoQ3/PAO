@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import math
+import logging
+import threading
 import re
 import shutil
 import statistics
@@ -390,11 +392,43 @@ class AspenSandboxRunner:
     BKP, runs one case and returns a ProcessCase or a serializable mapping.
     """
     def __init__(self, run_case: Callable[..., Any] | None = None, *, driver_factory: Callable[..., Any] | None = None,
-                 allowed_paths: Iterable[str] | None = None, require_path_whitelist: bool = True):
+                 allowed_paths: Iterable[str] | None = None, require_path_whitelist: bool = True,
+                 progress_callback: Callable[[dict[str, Any]], None] | None = None,
+                 progress_interval: float = 15.0):
         self.run_case_fn = run_case
         self.driver_factory = driver_factory
         self.allowed_paths = set(allowed_paths or ())
         self.require_path_whitelist = require_path_whitelist
+        self.progress_callback = progress_callback
+        self.progress_interval = progress_interval
+
+    def _notify(self, status: str, completed: int, total: int, started: float) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback({"status": status, "completed": completed, "total": total,
+                                    "elapsed_seconds": max(0.0, time.monotonic() - started)})
+        except Exception:
+            # A presentation failure must not invalidate an Aspen case.
+            logging.getLogger(__name__).exception("回测进度回调失败")
+
+    def _invoke_with_progress(self, model, inputs, plan, completed, started):
+        # Only the heartbeat runs on a helper thread. All COM work stays on
+        # the caller thread; stop/join prevents output after completion.
+        stop = threading.Event()
+        def heartbeat():
+            while not stop.wait(self.progress_interval):
+                self._notify("running", completed, len(plan.parameter_changes), started)
+        thread = None
+        if self.progress_callback is not None and self.progress_interval > 0:
+            thread = threading.Thread(target=heartbeat, name="pao-progress", daemon=True)
+            thread.start()
+        try:
+            return self._invoke(model, inputs, plan)
+        finally:
+            stop.set()
+            if thread is not None:
+                thread.join()
 
     def run(self, plan: SimulationPlan) -> list[ProcessCase]:
         if plan.requires_confirmation and not plan.approved:
@@ -431,30 +465,41 @@ class AspenSandboxRunner:
             shutil.copy2(plan.base_model, temp_model)
         plan.temporary_model = str(temp_model)
         results: list[ProcessCase] = []
+        started = time.monotonic()
+        total = len(plan.parameter_changes)
         try:
             for i, change in enumerate(plan.parameter_changes):
+                self._notify("started", len(results), total, started)
                 inputs = dict(change.get("inputs") or {})
                 unauthorized = [p for p in inputs if self.allowed_paths and p not in self.allowed_paths]
                 if unauthorized:
                     results.append(self._failed(change, "unauthorized Aspen path: " + ", ".join(unauthorized), model_path=temp_model))
+                    self._notify("failed", len(results), total, started)
                     if i == 0:
+                        self._notify("stopped", len(results), total, started)
                         break
                     continue
                 try:
-                    raw = self._invoke(temp_model, inputs, plan)
+                    raw = self._invoke_with_progress(temp_model, inputs, plan, len(results), started)
                     results.append(self._coerce(raw, change, temp_model, i, plan=plan))
                 except Exception as exc:
                     results.append(self._failed(change, f"Aspen run failed: {type(exc).__name__}: {exc}", model_path=temp_model))
+                metric = (plan.output_spec or {}).get("metric")
+                usable = results[-1].converged and (not metric or _finite(results[-1].impact_outputs.get(metric)))
+                self._notify("completed" if usable else "failed", len(results), total, started)
                 if i == 0:
                     baseline = results[-1]
                     metric = (plan.output_spec or {}).get("metric")
                     if not baseline.converged or (metric and not _finite(baseline.impact_outputs.get(metric))):
                         baseline.errors.append("基准预检失败，已停止后续扰动；请检查 Aspen 错误及目标指标提取。")
+                        self._notify("stopped", len(results), total, started)
                         break
         finally:
             # The temporary copy and all driver/COM resources are owned by this
             # scope; no COM object is returned or placed in a checkpoint.
             shutil.rmtree(temp_root, ignore_errors=True)
+        if len(results) == total:
+            self._notify("finished", len(results), total, started)
         return results
 
     def _invoke(self, model: Path, inputs: dict[str, Any], plan: SimulationPlan) -> Any:

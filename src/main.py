@@ -64,9 +64,9 @@ from pathlib import Path
 # 导致 UnicodeEncodeError；强制 stdout/stderr 走 UTF-8，不影响非 Windows 环境
 # （reconfigure 是幂等操作）。与 scripts/run_kinetics_advisor.py 的处理一致。
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 if hasattr(sys.stdin, "reconfigure"):
     # PowerShell may expose the console input stream with the legacy system
     # code page.  Agent prompts are sent to the LLM as UTF-8 JSON, so decode
@@ -74,9 +74,14 @@ if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
 
-def _setup_logging(level: str, log_file: Path | None = None) -> None:
+def _setup_logging(level: str, log_file: Path | None = None, *,
+                   conversation: bool = False, console_level: str | None = None,
+                   file_level: str | None = None) -> None:
     from src.utils.logger import setup_logging
-    setup_logging(level, log_file=log_file)
+    setup_logging(level, log_file=log_file,
+                  console_level=console_level or ("WARNING" if conversation else level),
+                  file_level=file_level or ("DEBUG" if conversation else level),
+                  user_console=conversation and console_level is None)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -87,6 +92,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("config", help="case_config.yaml 路径（--conversation 模式下作为 Aspen 文件目录提示）")
     parser.add_argument("--db",       default=None, help="结果数据库路径（.db）")
     parser.add_argument("--log",      default="INFO", help="日志级别（默认 INFO）")
+    parser.add_argument("--console-log", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        default=None, help="显式启用终端诊断及其级别；对话模式默认仅显示回答与进度")
+    parser.add_argument("--file-log", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        default=None, help="文件日志级别；对话模式默认 DEBUG，其他模式沿用 --log")
     parser.add_argument("--log-file", default=None, metavar="PATH",
                         help="日志文件路径（默认：与数据库同目录的 run.log）")
     parser.add_argument("--dry-run",  action="store_true", help="只打印配置摘要，不运行仿真")
@@ -249,6 +258,17 @@ def _load_var_metas(yaml_path: Path) -> tuple[list, dict, set]:
     return variables, var_types, integer_names
 
 
+def _print_backtest_progress(event: dict) -> None:
+    """Render bounded progress independently of diagnostic logging."""
+    status = event["status"]
+    completed, total = event["completed"], event["total"]
+    elapsed = event["elapsed_seconds"]
+    labels = {"started": "开始执行", "running": "运行中", "completed": "工况完成",
+              "failed": "工况失败", "stopped": "基准预检失败，已停止后续扰动",
+              "finished": "回测结束"}
+    print(f"回测进度 {completed}/{total}：{labels.get(status, status)}（已用时 {elapsed:.0f}s）", flush=True)
+
+
 def _run_unified_chat_loop(
     *, config_path: Path, yaml_path: Path | None, db_path: Path | None,
     node_db_path: Path | None, initial_intent: str, log: logging.Logger,
@@ -289,7 +309,8 @@ def _run_unified_chat_loop(
                          permissions={"inspect", "run_simulation"}, targets=("model", ""))
     sim_db = SimulationDB(db_path)
     runner = AspenSandboxRunner(driver_factory=lambda _path: __import__("src.aspen_driver.driver", fromlist=["AspenDriver"]).AspenDriver(),
-                                allowed_paths=set(params), require_path_whitelist=True)
+                                allowed_paths=set(params), require_path_whitelist=True,
+                                progress_callback=_print_backtest_progress)
     gateway = ActionGateway(schema, simulation_runner=runner, simulation_db=sim_db)
     session = ConversationSession(SessionState(), LeadAgent(
         policy=RuntimePolicy(allow_writes=False), context_builder=builder,
@@ -341,8 +362,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log_file = db_path.parent / "run.log"
 
-    _setup_logging(args.log, log_file=log_file)
+    _setup_logging(args.log, log_file=log_file, conversation=args.conversation,
+                   console_level=args.console_log, file_level=args.file_log)
     log = logging.getLogger(__name__)
+    if args.conversation and log_file is not None:
+        print(f"详细日志：{log_file.resolve()}", flush=True)
 
     # ── Agent 模式 + 裸 Aspen 文件（尚无配置 YAML）：走 Lead Agent 只读接入 ───
     # 必须在 load_optimize_config 之前分支：该函数假定输入是可解析的优化

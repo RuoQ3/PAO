@@ -56,10 +56,11 @@ class LeadAgent:
         intent = classification.intent
         session.intent = intent
         session.classification_source = classification.classification_source
+        session.classification_retry_count = classification.retry_count
         session.fallback_reason = classification.fallback_reason
         session.audit_events.append({
             "event": "intent_classified", "source": classification.classification_source,
-            "fallback_reason": classification.fallback_reason, "intent": intent.to_dict(),
+            "fallback_reason": classification.fallback_reason, "retry_count": classification.retry_count, "intent": intent.to_dict(),
         })
         if intent.intent == "parameter_impact":
             slots = dict(getattr(intent, "analysis", {}) or {})
@@ -270,6 +271,7 @@ class LeadAgent:
         facts: list[dict[str, Any]] = [{
             "kind": "intent_classification",
             "classification_source": classification.classification_source,
+            "retry_count": classification.retry_count,
             "fallback_reason": classification.fallback_reason,
             "intent": classification.intent.intent,
             "project_scope": classification.intent.project_scope,
@@ -297,7 +299,11 @@ class LeadAgent:
 
     @staticmethod
     def _fallback_notice(classification: Classification) -> str:
-        return f"当前处于规则降级模式（原因：{classification.fallback_reason or 'unknown'}）。"
+        reasons = {"llm_disabled": "未启用模型", "llm_key_missing": "未配置 API key",
+                   "request_timeout": "模型请求超时", "llm_api_failure": "模型服务不可用",
+                   "low_confidence": "意图不够明确", "invalid_json": "模型响应格式异常",
+                   "schema_validation_failed": "模型响应校验失败", "empty_model_result": "模型返回为空"}
+        return f"已切换规则模式（{reasons.get(classification.fallback_reason, '意图识别暂不可用')}）。"
 
     @staticmethod
     def _context_summary(context: Any) -> dict[str, Any]:
@@ -359,10 +365,11 @@ class LeadAgent:
         classification = self.intent_classifier.classify(question, session=session)
         session.intent = classification.intent
         session.classification_source = classification.classification_source
+        session.classification_retry_count = classification.retry_count
         session.fallback_reason = classification.fallback_reason
         session.audit_events.append({
             "event": "intent_classified", "source": classification.classification_source,
-            "fallback_reason": classification.fallback_reason, "intent": classification.intent.to_dict(),
+            "fallback_reason": classification.fallback_reason, "retry_count": classification.retry_count, "intent": classification.intent.to_dict(),
         })
         proposal = ActionProposal(
             action_type="run_optimization", target="model", reason=question,
@@ -489,14 +496,22 @@ class LeadAgent:
         else:
             conclusion = "有效工况不足以形成参数排序。"
         limitations = list(sensitivity.get("limitations") or [])
+        user_limitations = list(limitations)
+        failure_summaries = []
         for case in cases:
+            errors = case.get("errors") or []
+            if errors:
+                summary = (str(errors[0]).splitlines() or ["未知错误"])[0][:160]
+                if summary not in failure_summaries:
+                    failure_summaries.append(summary)
             for message in [*(case.get("errors") or []), *(case.get("warnings") or [])]:
                 if str(message) not in limitations:
                     limitations.append(str(message))
         limitations.append("结论只适用于本次扰动范围；不代表全局因果关系。")
         return {"observed_facts": facts, "mechanism_candidates": mechanism,
                 "backtest_conclusion": conclusion, "limitations": limitations,
-                "sensitivity": sensitivity}
+                "sensitivity": sensitivity, "user_limitations": user_limitations,
+                "failure_summaries": failure_summaries[:3]}
 
     @staticmethod
     def _is_general(question: str) -> bool:
