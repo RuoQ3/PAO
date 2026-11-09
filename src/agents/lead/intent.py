@@ -12,6 +12,7 @@ from src.agents.orchestration.models import (
     SubagentRequest,
 )
 from . import llm_client
+from .intent_response_adapter import IntentResponseAdapter
 
 
 _PROJECT_HINTS = (
@@ -37,7 +38,8 @@ class IntentClassifier:
     def __init__(self, *, llm_config: Any = None, llm_call: Callable[..., str] | None = None,
                  confidence_threshold: float = 0.55, logger: Any = None, enabled: bool = True):
         self.llm_config = llm_config
-        self.llm_call = llm_call or llm_client.chat
+        self.llm_call = llm_call or llm_client.chat_json
+        self.response_adapter = IntentResponseAdapter()
         self.confidence_threshold = float(confidence_threshold)
         self.logger = logger or logging.getLogger(__name__)
         self.enabled = enabled
@@ -90,23 +92,15 @@ class IntentClassifier:
             trace["raw_response"] = raw
             self.logger.debug("intent raw response attempt=%s: %r", attempt, raw)
             try:
-                if not isinstance(raw, str) or not raw.strip():
-                    raise ValueError("empty_model_result")
-                payload = self._validate_provider_payload(self._parse_json_response(raw))
-                intent = IntentSchema.from_dict(payload)
+                intent = self.response_adapter.parse(raw)
             except (ValueError, TypeError, KeyError) as exc:
                 error = {"code": self._reason_code(exc), "message": str(exc)}
                 trace["error"] = error
                 self.logger.warning("intent validation failed attempt=%s: %s", attempt, error)
                 if attempt == 1:
                     return fallback(error["code"], 1)
-                request = json.dumps({
-                    "request_type": "repair_intent_json", "original_question": question,
-                    "conversation_focus": focus, "invalid_response": raw,
-                    "validation_error": error,
-                    "instruction": "Return only the corrected complete JSON object. No explanation or Markdown. "
-                                   "Keep the original user intent; do not invent missing slots or bypass confirmation.",
-                }, ensure_ascii=False)
+                request = self.response_adapter.build_repair_request(
+                    question=question, focus=focus, raw=raw, error=error)
                 self.logger.debug("intent repair request: %s", request)
                 continue
             if intent.confidence < self.confidence_threshold:
@@ -115,59 +109,6 @@ class IntentClassifier:
             return finish(Classification(intent=intent,
                 classification_source="llm_repaired" if attempt else "llm"), attempt)
         raise AssertionError("unreachable classification state")
-
-    @staticmethod
-    def _parse_json_response(raw: str) -> dict[str, Any]:
-        """Parse a provider response while tolerating common JSON fences.
-
-        The contract remains strict after extraction: the decoded value must
-        be an object and IntentSchema still rejects unknown fields and invalid
-        enum/confirmation combinations.
-        """
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-            text = re.sub(r"\s*```$", "", text).strip()
-        value = json.loads(text)
-        if not isinstance(value, dict):
-            raise TypeError("intent response must be a JSON object")
-        return value
-
-    @staticmethod
-    def _validate_provider_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        """Validate the wire contract without coercing invalid provider fields."""
-        required = {"intent", "task_type", "project_scope", "context_required", "subagents",
-                    "action_type", "requires_confirmation", "confidence", "missing_information", "reason", "analysis"}
-        missing = required - payload.keys()
-        if missing:
-            raise ValueError("missing required fields: " + ", ".join(sorted(missing)))
-        for key in ("intent", "task_type", "project_scope", "action_type", "reason"):
-            if not isinstance(payload[key], str):
-                raise TypeError(f"{key} must be a string")
-        for key in ("context_required", "missing_information"):
-            if not isinstance(payload[key], list) or not all(isinstance(x, str) for x in payload[key]):
-                raise TypeError(f"{key} must be a list of strings")
-        if not isinstance(payload["subagents"], list) or not all(isinstance(x, dict) for x in payload["subagents"]):
-            raise TypeError("subagents must be a list of objects")
-        analysis = payload["analysis"]
-        if not isinstance(analysis, dict):
-            raise TypeError("analysis must be an object, not " + type(analysis).__name__)
-        if payload["intent"] == "parameter_impact":
-            slots = {"equipment", "target_stream", "target_component", "metric", "candidate_parameters"}
-            absent = slots - analysis.keys()
-            if absent:
-                raise ValueError("analysis missing required slots: " + ", ".join(sorted(absent)))
-            for key in slots - {"candidate_parameters"}:
-                value = analysis[key]
-                if value is not None and not isinstance(value, str):
-                    raise TypeError(f"analysis.{key} must be a string or null")
-                if not value and key not in payload["missing_information"]:
-                    raise ValueError(f"missing_information must include unresolved slot: {key}")
-            if not isinstance(analysis["candidate_parameters"], list) or not all(isinstance(x, str) for x in analysis["candidate_parameters"]):
-                raise TypeError("analysis.candidate_parameters must be a list of strings")
-        elif analysis:
-            raise ValueError("analysis must be {} for ordinary intents")
-        return payload
 
     @staticmethod
     def _system_prompt() -> str:
@@ -188,7 +129,11 @@ class IntentClassifier:
             "All five analysis keys are required for parameter_impact; candidate_parameters is an array of strings. "
             "For unresolved scalar slots use null and list their key in missing_information; never invent values. "
             "Input may be a repair_intent_json request containing an invalid response and validation errors. "
-            "Return only a corrected COMPLETE JSON object, no explanation and no Markdown."
+            "Return only a corrected COMPLETE JSON object, no explanation and no Markdown. "
+            'Example JSON for a greeting: {"intent":"chat","task_type":"chat",'
+            '"project_scope":"none","context_required":[],"subagents":[],"action_type":"none",'
+            '"requires_confirmation":false,"confidence":0.95,"missing_information":[], '
+            '"reason":"The user greets the assistant.","analysis":{}}'
         )
 
     @staticmethod

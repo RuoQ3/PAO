@@ -248,7 +248,16 @@ def _is_reasoning_model(cfg: LLMConfig) -> bool:
     return "reasoner" in m or "v4" in m or "-r1" in m or "r1-" in m
 
 
-def chat(cfg: LLMConfig, system: str, user: str) -> str:
+def chat_json(cfg: LLMConfig, system: str, user: str) -> str:
+    """Request native JSON objects on DeepSeek; other providers retain text transport.
+
+    Callers supply the JSON contract in their prompt and validate the response.
+    JSON mode guarantees neither business validity nor a nonempty response.
+    """
+    return chat(cfg, system, user, json_mode=True)
+
+
+def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> str:
     """单轮对话：发送 system + user 消息，返回纯文本回复。
 
     对 deepseek 推理模型（v4-pro/reasoner/r1 等），自动把 system 内容
@@ -265,12 +274,15 @@ def chat(cfg: LLMConfig, system: str, user: str) -> str:
         messages = ([{"role": "user", "content": f"[System instructions]\n{system}\n\n[User message]\n{user}"}]
                     if _is_reasoning_model(cfg) and system else
                     [{"role": "system", "content": system}, {"role": "user", "content": user}])
-        request_body = json.dumps({
+        body = {
             "model": cfg.model,
             "messages": messages,
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
-        }).encode("utf-8")
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        request_body = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{base_url}/chat/completions", data=request_body,
             headers={"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"},
@@ -285,7 +297,12 @@ def chat(cfg: LLMConfig, system: str, user: str) -> str:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"DeepSeek API unavailable ({type(exc).__name__})") from None
         try:
-            return str(payload["choices"][0]["message"]["content"])
+            content = payload["choices"][0]["message"]["content"]
+            if content is None:
+                return ""
+            if not isinstance(content, str):
+                raise TypeError("chat content must be text")
+            return content
         except (KeyError, IndexError, TypeError):
             raise RuntimeError("DeepSeek API returned an invalid chat response") from None
 
