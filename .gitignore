@@ -45,7 +45,6 @@ cache/
 *.svg
 # PDF 文档（大文件）
 *.pdf
-*.txt
 # IDE
 .vscode/
 .idea/
