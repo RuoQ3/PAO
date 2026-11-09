@@ -88,7 +88,7 @@ class LeadAgent:
                                            ("target_component", slots.get("target_component")), ("metric", slots.get("metric"))) if not value]
             if missing:
                 return Answer(
-                    text="需要补充参数影响分析所需信息：" + "；".join(missing),
+                    text=(self._fallback_notice(classification) if classification.classification_source == "rule_fallback" else "") + "需要补充参数影响分析所需信息：" + "；".join({"metric": "评价指标（摩尔分数、纯度或回收率）", "equipment": "设备", "target_stream": "目标物流", "target_component": "目标组分"}.get(x, x) for x in missing),
                     facts=self._classification_facts(classification),
                     uncertainties=["未提供设备、目标物流、目标组分或评价指标，未进行任何 Aspen 操作。"],
                 )
@@ -170,7 +170,7 @@ class LeadAgent:
             session.context_sources = loaded.sources
             param_lines = "\n".join(f"- {p.get('name')} ({p.get('aspen_path')})：基准 {p.get('baseline')}，范围 [{p.get('lower')}, {p.get('upper')}]" for p in impact.parameters) or "- 未发现具有完整基准值和边界的可调参数"
             cases = len((simulation.parameter_changes if simulation else []))
-            return Answer(text=(f"我可以对 {slots['equipment']} 做局部参数回测。\n\n目标：\n- 目标物流：{slots['target_stream']}\n- 目标组分：{slots['target_component']}\n- 指标：{slots['metric']}\n\n候选参数：\n{param_lines}\n\n计划：\n- 共 {cases} 个有限工况，使用基准附近局部扰动\n- 输出：{', '.join(impact.expected_outputs)}\n\n限制：\n- " + "\n- ".join(impact.diagnostics or ["结论仅适用于本次扰动范围"]) + "\n\n请确认后执行。"),
+            return Answer(text=((self._fallback_notice(classification) if classification.classification_source == "rule_fallback" else "") + f"我可以对 {slots['equipment']} 做局部参数回测。\n\n目标：\n- 目标物流：{slots['target_stream']}\n- 目标组分：{slots['target_component']}\n- 指标：{slots['metric']}\n\n候选参数：\n{param_lines}\n\n计划：\n- 共 {cases} 个有限工况，使用基准附近局部扰动\n- 输出：{', '.join(impact.expected_outputs)}\n\n限制：\n- " + "\n- ".join(impact.diagnostics or ["结论仅适用于本次扰动范围"]) + "\n\n请确认后执行。"),
                           facts=self._classification_facts(classification), recommendations=[proposal.to_dict()], approval_request=approval)
         if intent.action_type in {"modify_file", "set_parameter", "simulate_once", "optimize", "modify_structure"}:
             payload = {"question": question, "intent": intent.to_dict()}
@@ -444,8 +444,15 @@ class LeadAgent:
             approval.status = "rejected"
             session.pending_approval = None
             return Answer(text="Action request rejected.", approval_request=approval)
-        self.action_gateway.approve(audit_id, actor="user")
-        result = self.action_gateway.execute(audit_id, actor="lead_agent")
+        try:
+            self.action_gateway.approve(audit_id, actor="user")
+            result = self.action_gateway.execute(audit_id, actor="lead_agent")
+        except Exception as exc:
+            approval.status = "failed"
+            session.pending_approval = None
+            return Answer(text=f"动作未完成：{type(exc).__name__}: {exc}",
+                          uncertainties=["执行失败；请诊断原因后重新创建计划。"],
+                          approval_request=approval)
         if isinstance(result, dict) and approval.proposal.payload.get("parameter_impact_plan"):
             result = dict(result)
             result["answer"] = self._render_parameter_impact_result(
@@ -464,16 +471,28 @@ class LeadAgent:
             "equipment": plan.get("equipment_id"), "target_stream": plan.get("target_stream"),
             "target_component": plan.get("target_component"), "metric": plan.get("metric"),
         }
-        facts = [{"layer": "observed_fact", "case_count": len(cases), "valid_case_count": len(valid), **slots}]
+        facts = [{"layer": "observed_fact", "case_count": len(cases),
+                  "converged_case_count": len(valid),
+                  "planned_case_count": result.get("planned_case_count", len(cases)),
+                  "skipped_case_count": result.get("skipped_case_count", 0),
+                  "valid_case_count": sensitivity.get("effective_case_count", 0), **slots}]
         mechanism = ["回流比、进料板位置和再沸器负荷等机理候选需结合具体参数和流程证据核验。"]
         ranking = sensitivity.get("parameter_rank") or []
-        if len(valid) <= 1:
-            conclusion = "无法根据当前单点结果判断参数显著性。"
+        if sensitivity.get("error"):
+            conclusion = "敏感性分析失败：" + str(sensitivity["error"])
+        elif sensitivity.get("effective_case_count", 0) == 0:
+            conclusion = "没有可用于分析的有效目标指标，无法判断参数影响。"
+        elif sensitivity.get("conclusion_type") == "insufficient_data":
+            conclusion = "有效独立工况不足，无法判断参数影响。"
         elif ranking:
             conclusion = "；".join(f"{x.get('parameter')}：{x.get('direction')}，局部敏感性 {x.get('sensitivity', 0):.4g}" for x in ranking)
         else:
             conclusion = "有效工况不足以形成参数排序。"
         limitations = list(sensitivity.get("limitations") or [])
+        for case in cases:
+            for message in [*(case.get("errors") or []), *(case.get("warnings") or [])]:
+                if str(message) not in limitations:
+                    limitations.append(str(message))
         limitations.append("结论只适用于本次扰动范围；不代表全局因果关系。")
         return {"observed_facts": facts, "mechanism_candidates": mechanism,
                 "backtest_conclusion": conclusion, "limitations": limitations,

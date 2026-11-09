@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import logging
 from typing import Any, Callable
 
 from src.agents.orchestration.models import (
@@ -38,7 +39,7 @@ class IntentClassifier:
         self.llm_config = llm_config
         self.llm_call = llm_call or llm_client.chat
         self.confidence_threshold = float(confidence_threshold)
-        self.logger = logger
+        self.logger = logger or logging.getLogger(__name__)
         self.enabled = enabled
 
     def classify(self, question: str, *, session: Any = None) -> Classification:
@@ -107,7 +108,7 @@ class IntentClassifier:
         return (
             "Classify the PAO user message. Return one JSON object only, with exactly these fields: "
             "intent, task_type, project_scope, context_required, subagents, action_type, "
-            "requires_confirmation, confidence, missing_information, reason. "
+            "requires_confirmation, confidence, missing_information, reason, analysis. "
             "subagents is a list of {name,task,priority,parallel}. "
             "Allowed intent: chat, project_query, analysis, parameter_impact, modify_request, simulation_request, "
             "optimization_request, report_request, code_request, general_question. "

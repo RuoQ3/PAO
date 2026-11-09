@@ -302,8 +302,10 @@ def _run_unified_chat_loop(
             return True
         result = session.submit(text)
         print(result.text)
-        if result.recommendations:
-            print("??/??:", result.recommendations)
+        if result.recommendations and result.approval_request is None:
+            print("建议：")
+            for recommendation in result.recommendations:
+                print("-", recommendation)
         return False
 
     try:
@@ -316,7 +318,7 @@ def _run_unified_chat_loop(
                 print("\n已退出")
                 return 0
             if run_turn(text):
-                print("???")
+                print("已退出")
                 return 0
     finally:
         sim_db.close()
