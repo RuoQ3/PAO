@@ -69,6 +69,11 @@ def resolve_output_spec(context: Any, *, metric: str, stream_id: str | None,
 def extract_output_spec(raw_outputs: Mapping[str, Any], spec: OutputSpec | Mapping[str, Any]) -> dict[str, Any]:
     """Extract a logical metric from a complete, already-authorized result."""
     s = spec if isinstance(spec, Mapping) else spec.to_dict()
+    if s.get("extractor") == "scalar":
+        paths = s.get("aspen_paths") or []
+        value = raw_outputs.get(paths[0]) if len(paths) == 1 else None
+        value = value.get("value") if isinstance(value, Mapping) else getattr(value, "value", value)
+        return {str(s["metric"]): value} if _finite(value) else {}
     stream_id, component = s.get("stream_id"), s.get("component")
     stream_data = raw_outputs.get(stream_id, raw_outputs) if stream_id else raw_outputs
     # Runners may return a complete snapshot under ``streams`` or use Aspen
@@ -354,6 +359,12 @@ def design_perturbations(plan: ParameterImpactPlan, *, relative_steps: Iterable[
                 inputs[p["aspen_path"]] = value
                 cases.append({"case_id": uuid.uuid4().hex, "inputs": inputs,
                               "changed_parameter": p["aspen_path"], "delta": value - p["baseline"]})
+    # Clipping different step sizes can produce identical inputs. Count the
+    # distinct design points before applying the evaluation budget.
+    unique = {}
+    for case in cases:
+        unique.setdefault(tuple(sorted(case["inputs"].items())), case)
+    cases = list(unique.values())
     if len(cases) > plan.max_cases:
         raise ValueError(f"perturbation design requires {len(cases)} cases, exceeds max_cases={plan.max_cases}")
     return cases
@@ -426,12 +437,20 @@ class AspenSandboxRunner:
                 unauthorized = [p for p in inputs if self.allowed_paths and p not in self.allowed_paths]
                 if unauthorized:
                     results.append(self._failed(change, "unauthorized Aspen path: " + ", ".join(unauthorized), model_path=temp_model))
+                    if i == 0:
+                        break
                     continue
                 try:
                     raw = self._invoke(temp_model, inputs, plan)
                     results.append(self._coerce(raw, change, temp_model, i, plan=plan))
                 except Exception as exc:
                     results.append(self._failed(change, f"Aspen run failed: {type(exc).__name__}: {exc}", model_path=temp_model))
+                if i == 0:
+                    baseline = results[-1]
+                    metric = (plan.output_spec or {}).get("metric")
+                    if not baseline.converged or (metric and not _finite(baseline.impact_outputs.get(metric))):
+                        baseline.errors.append("基准预检失败，已停止后续扰动；请检查 Aspen 错误及目标指标提取。")
+                        break
         finally:
             # The temporary copy and all driver/COM resources are owned by this
             # scope; no COM object is returned or placed in a checkpoint.
@@ -447,7 +466,16 @@ class AspenSandboxRunner:
         try:
             driver.connect(); driver.open(str(model))
             from src.workflows.run_case import RunCaseConfig, run_case
-            cfg = RunCaseConfig(output_paths=list(plan.expected_outputs), timeout=plan.timeout_seconds)
+            # Composition is a subtree, not a scalar Value node. Let the
+            # stream extractor read it, while retaining full-flow convergence checks.
+            spec = plan.output_spec or {}
+            stream_id = spec.get("stream_id")
+            composition = str(spec.get("extractor", "")).startswith("stream_component_")
+            cfg = RunCaseConfig(
+                output_paths=[] if composition else list(plan.expected_outputs),
+                extract_streams=[stream_id] if composition and stream_id else None,
+                timeout=plan.timeout_seconds,
+            )
             return run_case(driver, inputs, cfg)
         finally:
             for name in ("disconnect", "close"):
@@ -466,22 +494,22 @@ class AspenSandboxRunner:
             raw.timestamp = datetime.now(timezone.utc).isoformat()
             raw.converged = raw.status in (CaseStatus.SUCCESS, CaseStatus.WARNINGS)
             raw.result_source = raw.result_source or "aspen_sandbox"
-            # A ProcessCase from the legacy run_case path has its stream
-            # snapshot available; expose a minimal metric map for analysis.
-            if not raw.impact_outputs:
-                stream_data = {k: v.to_dict() for k, v in raw.streams.items()}
-                raw.impact_outputs = {"streams": stream_data}
-                if raw.streams:
-                    stream = raw.streams.get(getattr(raw, "target_stream", None)) or next(iter(raw.streams.values()))
-                    components = getattr(stream, "components", []) or []
-                    raw.impact_outputs.setdefault("flow", getattr(stream, "total_mole_flow", None))
-                    target_component = getattr(raw, "target_component", None)
-                    if target_component:
-                        for component in components:
-                            if getattr(component, "component", None) == target_component:
-                                raw.impact_outputs.setdefault("mole_fraction", getattr(component, "mole_frac", None))
-            raw.errors = list(raw.errors or ([raw.notes] if raw.notes and not raw.converged else []))
-            raw.warnings = list(raw.warnings or [])
+            # The plan, never an arbitrary first stream, owns the target.
+            spec = (plan.output_spec if plan else None) or {}
+            stream_data = {k: v.to_dict() for k, v in raw.streams.items()}
+            raw.impact_outputs["streams"] = stream_data
+            if spec:
+                raw.impact_outputs.update(extract_output_spec(
+                    (getattr(raw.sim_result, "outputs", {}) or {}) if spec.get("extractor") == "scalar"
+                    else {"streams": stream_data}, spec))
+                metric = spec.get("metric")
+                if not _finite(raw.impact_outputs.get(metric)):
+                    raw.warnings.append(f"目标指标不可用：{spec.get('stream_id')}/{spec.get('component')}/{metric}")
+            raw.iteration = iteration
+            sim = raw.sim_result
+            raw.errors = list(raw.errors or ([sim.error] if sim and sim.error else
+                                           [raw.notes] if raw.notes and not raw.converged else []))
+            raw.warnings = list(raw.warnings or []) + list(getattr(sim, "warnings", []) or [])
             return raw
         data = dict(raw or {}) if isinstance(raw, Mapping) else {}
         converged = bool(data.get("converged", data.get("success", bool(data.get("outputs")))))
@@ -536,64 +564,70 @@ class FakeAspenSandboxRunner(AspenSandboxRunner):
                          require_path_whitelist=False)
 
 
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
 class SensitivityAnalyzer:
-    """Read-only local slope and correlation analysis for sandbox results."""
+    """Analyze each one-factor neighborhood against its valid baseline."""
     def analyze(self, results: list[ProcessCase], *, metric: str, parameters: list[str]) -> dict[str, Any]:
-        def out(case: ProcessCase) -> Any:
-            payload = getattr(case, "impact_outputs", {}) or {}
-            value: Any = payload.get(metric)
+        def out(case):
+            payload = case.impact_outputs or {}
+            value = payload.get(metric)
             if value is None and "." in metric:
-                cur: Any = payload
+                value = payload
                 for part in metric.split("."):
-                    if isinstance(cur, Mapping): cur = cur.get(part)
-                    else: cur = None; break
-                value = cur
-            if value is None and payload.get("metric") == metric: value = payload.get("value")
+                    value = value.get(part) if isinstance(value, Mapping) else None
+            if value is None and payload.get("metric") == metric:
+                value = payload.get("value")
             return value
-        valid = [(c, out(c)) for c in results if getattr(c, "converged", c.status in (CaseStatus.SUCCESS, CaseStatus.WARNINGS)) and out(c) is not None]
-        baseline_case = next((c for c in results if getattr(c, "impact_inputs", {}).get("_baseline") or c.case_id == "baseline"), results[0] if results else None)
+
+        def converged(case):
+            return case.converged if case.converged is not None else case.status in (CaseStatus.SUCCESS, CaseStatus.WARNINGS)
+
+        valid = [(c, float(out(c))) for c in results if converged(c) and _finite(out(c))]
+        baseline_case = next((c for c in results if c.case_id == "baseline"), results[0] if results else None)
         baseline = out(baseline_case) if baseline_case else None
-        report: dict[str, Any] = {"metric": metric, "baseline": baseline, "parameter_rank": [], "limitations": [],
-                                  "sample_count": len(valid), "effective_case_count": len(valid),
-                                  "missing_output_count": len(results) - len(valid),
-                                  "convergence_rate": len([c for c in results if getattr(c, "converged", False)]) / max(1, len(results)),
-                                  "conclusion_type": "insufficient_data"}
-        if len(valid) <= 1:
-            report["limitations"].append("无法根据当前单点结果判断参数显著性。")
-        elif len(valid) == 2:
-            report["conclusion_type"] = "directional_only"
-        elif len(valid) <= 4:
-            report["conclusion_type"] = "preliminary_local_association"
+        report = {"metric": metric, "baseline": baseline if _finite(baseline) else None,
+                  "parameter_rank": [], "limitations": [], "sample_count": len(valid),
+                  "effective_case_count": len(valid),
+                  "failed_case_count": sum(not converged(c) for c in results),
+                  "missing_output_count": sum(bool(converged(c)) and not _finite(out(c)) for c in results),
+                  "convergence_rate": sum(bool(converged(c)) for c in results) / max(1, len(results)),
+                  "conclusion_type": "insufficient_data"}
+        if baseline_case is None or not converged(baseline_case) or not _finite(baseline):
+            report["limitations"].append("基准工况未收敛或目标指标缺失，不能进行局部敏感性排序。")
         else:
-            report["conclusion_type"] = "local_sensitivity_ranking"
-        for parameter in parameters:
-            pairs = []
-            for c, y in valid:
-                x = (getattr(c, "impact_inputs", {}) or c.design_vars).get(parameter)
-                if isinstance(x, (int, float)) and isinstance(y, (int, float)) and math.isfinite(float(x)) and math.isfinite(float(y)):
-                    pairs.append((float(x), float(y)))
-            if not pairs:
-                continue
-            xs, ys = zip(*pairs)
-            slope = _slope(xs, ys)
-            corr = _pearson(xs, ys)
-            rank_corr = _spearman(xs, ys)
-            x_range = max(xs) - min(xs) if len(xs) > 1 else 0.0
-            y_range = max(ys) - min(ys) if len(ys) > 1 else 0.0
-            sensitivity = abs(slope) * x_range / max(abs(float(baseline or statistics.mean(ys))), 1e-12)
-            report["parameter_rank"].append({"parameter": parameter, "sensitivity": sensitivity,
-                "direction": "positive" if slope > 0 else "negative" if slope < 0 else "flat",
-                "perturbation_range": [min(xs), max(xs)], "metric_change": y_range,
-                "local_slope": slope, "pearson": corr, "spearman": rank_corr,
-                "sample_count": len(pairs), "convergence_rate": len(pairs) / max(1, len(results)),
-                "confidence": "high" if len(pairs) >= 5 else "medium" if len(pairs) >= 3 else "low"})
-            if len(pairs) < 2:
-                report["limitations"].append(f"{parameter} 有效样本不足")
-        report["parameter_rank"].sort(key=lambda x: x["sensitivity"], reverse=True)
-        if not any((getattr(c, "impact_outputs", {}) or {}).get("flow") is not None for c in results):
-            report["limitations"].append("未计算回收率，因为缺少流量数据。")
-        report["uncertainty"] = report["limitations"][:]
-        report["limitations"].append("局部回测不能证明全局因果关系；范围不足时不能声称显著影响。")
+            base_inputs = baseline_case.impact_inputs or baseline_case.design_vars
+            for parameter in parameters:
+                pairs = {}
+                for case, y in valid:
+                    inputs = case.impact_inputs or case.design_vars
+                    # Require the same complete input vector except this factor.
+                    if set(inputs) != set(base_inputs) or any(inputs[k] != v for k, v in base_inputs.items() if k != parameter):
+                        continue
+                    x = inputs.get(parameter)
+                    if _finite(x):
+                        pairs.setdefault(float(x), y)
+                if len(pairs) < 2:
+                    report["limitations"].append(f"{parameter} 独立有效取值不足，无法排序。")
+                    continue
+                xs, ys = zip(*sorted(pairs.items()))
+                slope = _slope(xs, ys)
+                sensitivity = abs(slope) * (max(xs) - min(xs)) / max(abs(float(baseline)), 1e-12)
+                report["parameter_rank"].append({
+                    "parameter": parameter, "sensitivity": sensitivity,
+                    "direction": "positive" if slope > 0 else "negative" if slope < 0 else "flat",
+                    "perturbation_range": [min(xs), max(xs)], "metric_change": max(ys) - min(ys),
+                    "local_slope": slope, "pearson": _pearson(xs, ys), "spearman": _spearman(xs, ys),
+                    "sample_count": len(pairs), "unique_value_count": len(pairs),
+                    "confidence": "not_estimated",
+                })
+            report["parameter_rank"].sort(key=lambda x: x["sensitivity"], reverse=True)
+            if report["parameter_rank"]:
+                report["conclusion_type"] = "local_sensitivity_ranking"
+        report["limitations"].append("排序仅反映各参数本次扰动范围内的变化，不代表全局重要性或统计显著性。")
+        report["uncertainty"] = list(report["limitations"])
         return report
 
 

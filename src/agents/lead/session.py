@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 import re
+import json
 
-from src.agents.orchestration.models import ExecutionMode, SessionState
+from src.agents.orchestration.models import Answer, ExecutionMode, SessionState
 
 
 @dataclass
@@ -12,18 +13,39 @@ class ConversationSession:
     state: SessionState
     lead: Any
 
-    def submit(self, text: str):
+    def submit(self, text: str) -> Answer:
         self.state.history.append({"role": "user", "content": text})
         if text.strip().casefold() in {"确认", "确认执行", "confirm", "yes", "批准"} and self.state.pending_approval is not None:
             result = self.lead.confirm_action(self.state, approved=True)
-            assistant_text = getattr(result, "text", None) or ("参数影响回测已执行。" if isinstance(result, dict) else str(result))
-            self.state.history.append({"role": "assistant", "content": assistant_text})
-            return result
+            answer = self._action_answer(result)
+            self.state.history.append({"role": "assistant", "content": answer.text})
+            return answer
         self._update_focus_from_turn(text)
         answer = self.lead.answer(text, self.state)
-        self._update_focus_from_turn(getattr(answer, "text", ""), answer=answer)
         self.state.history.append({"role": "assistant", "content": answer.text})
         return answer
+
+    @staticmethod
+    def _action_answer(result: Any) -> Answer:
+        """Adapt the gateway payload once, at the conversation boundary."""
+        if isinstance(result, Answer):
+            return result
+        if not isinstance(result, dict):
+            raise TypeError(f"Unsupported action result: {type(result).__name__}")
+        report = result.get("answer") or {}
+        if isinstance(report, dict) and "backtest_conclusion" in report:
+            facts = list(report.get("observed_facts") or [])
+            limitations = list(report.get("limitations") or [])
+            lines = ["参数影响回测结果："]
+            for fact in facts:
+                lines.append(f"已运行 {fact.get('case_count', 0)} 个工况，收敛 {fact.get('converged_case_count', 0)} 个，目标指标有效 {fact.get('valid_case_count', 0)} 个，未执行 {fact.get('skipped_case_count', 0)} 个。")
+            lines.append(str(report["backtest_conclusion"]))
+            lines.extend("限制：" + str(x) for x in limitations)
+            return Answer(text="\n".join(lines),
+                          facts=[*facts, {"kind": "action_result", "result": result}],
+                          uncertainties=limitations)
+        return Answer(text="动作执行结果：" + json.dumps(result, ensure_ascii=False, default=str),
+                      facts=[{"kind": "action_result", "result": result}])
 
     def _update_focus_from_turn(self, text: str, *, answer: Any = None) -> None:
         """Persist explicit conversation targets; never scan arbitrary history."""

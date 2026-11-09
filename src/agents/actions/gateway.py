@@ -92,7 +92,9 @@ class ActionGateway:
                 except Exception as exc:
                     sensitivity = {"error": f"sensitivity analysis failed: {type(exc).__name__}: {exc}"}
                 output = {"audit_id": action.audit_id, "status": "executed", "action_type": action.action_type.value,
-                          "simulation_cases": [c.to_dict() for c in cases], "sensitivity": sensitivity}
+                          "simulation_cases": [c.to_dict() for c in cases], "sensitivity": sensitivity,
+                          "planned_case_count": len(sim_plan.parameter_changes),
+                          "skipped_case_count": max(0, len(sim_plan.parameter_changes) - len(cases))}
             else:
                 output = self.executor.execute(action, preview=result.preview)
             if self.simulation_db is not None and hasattr(self.simulation_db, "save_action_audit"):
