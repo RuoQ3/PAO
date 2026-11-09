@@ -622,6 +622,25 @@ def _values_match(requested: Any, actual: Any, rtol: float) -> tuple[bool, str]:
         return match, ("" if match else f"值不相等：{requested!r} != {actual!r}")
 
 
+def _decode_history_text(data: bytes) -> str:
+    """Decode Aspen's UTF-8/BOM or local Windows history without lossy replacement."""
+    import locale
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    encodings = ["utf-8-sig"]
+    local = locale.getpreferredencoding(False)
+    if local.casefold().replace("-", "") not in {"utf8", "ascii", "ansix3.41968"}:
+        encodings.append(local)
+    encodings.append("gb18030")
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # Retain undecodable byte values for diagnosis instead of writing U+FFFD.
+    return data.decode("utf-8", errors="backslashreplace")
+
+
 def _read_history_diagnostics(source_filepath: Any, max_items: int = 20) -> list[str]:
     """
     Extract high-signal Aspen input translation diagnostics from the latest .his.
@@ -640,7 +659,7 @@ def _read_history_diagnostics(source_filepath: Any, max_items: int = 20) -> list
         if not history_files:
             return []
         latest = max(history_files, key=lambda p: p.stat().st_mtime)
-        lines = latest.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = _decode_history_text(latest.read_bytes()).splitlines()
     except Exception as exc:  # noqa: BLE001 - diagnostics must not break a run
         return [f"Aspen history diagnostics unavailable: {exc}"]
 

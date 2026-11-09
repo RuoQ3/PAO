@@ -26,6 +26,7 @@ def _payload(**updates):
         "confidence": 0.95,
         "missing_information": [],
         "reason": "The user asks about the current process.",
+        "analysis": {},
     }
     payload.update(updates)
     return payload
@@ -44,7 +45,7 @@ def test_json_fenced_provider_response_is_parsed_but_schema_remains_strict():
     assert result.classification_source == "llm"
 
 
-def test_common_provider_scalar_context_and_missing_fields_are_normalized():
+def test_provider_scalar_fields_require_repair_instead_of_silent_normalization():
     payload = _payload(
         intent="general_question",
         task_type="clarification",
@@ -56,9 +57,9 @@ def test_common_provider_scalar_context_and_missing_fields_are_normalized():
         missing_information="",
     )
     result = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: __import__("json").dumps(payload)).classify("hello")
-    assert result.classification_source == "llm"
-    assert result.intent.context_required == []
-    assert result.intent.missing_information == []
+    assert result.classification_source == "rule_fallback"
+    assert result.retry_count == 1
+    assert result.fallback_reason == "schema_validation_failed"
 
 
 @pytest.mark.parametrize("raw,reason", [("not json", "invalid_json"), ("", "empty_model_result")])

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from datetime import datetime, timedelta, timezone
 from .audit import AuditLog
 from .executor import MockExecutor
@@ -84,6 +85,11 @@ class ActionGateway:
                 cases = self.simulation_runner.run(sim_plan)
                 if self.simulation_db is not None and hasattr(self.simulation_db, "save_cases"):
                     self.simulation_db.save_cases([c.to_dict() for c in cases])
+                for case in cases:
+                    if case.errors or case.warnings:
+                        logging.getLogger(__name__).warning(
+                            "回测工况诊断 case_id=%s errors=%s warnings=%s",
+                            case.case_id, case.errors, case.warnings)
                 impact = action.payload.get("parameter_impact_plan") or {}
                 try:
                     from src.agents.orchestration.parameter_impact import SensitivityAnalyzer

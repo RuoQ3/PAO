@@ -40,7 +40,13 @@ class ConversationSession:
             for fact in facts:
                 lines.append(f"已运行 {fact.get('case_count', 0)} 个工况，收敛 {fact.get('converged_case_count', 0)} 个，目标指标有效 {fact.get('valid_case_count', 0)} 个，未执行 {fact.get('skipped_case_count', 0)} 个。")
             lines.append(str(report["backtest_conclusion"]))
-            lines.extend("限制：" + str(x) for x in limitations)
+            # Full diagnostics stay in structured facts/uncertainties and the
+            # file log. Terminal text contains only bounded user summaries.
+            lines.extend("失败原因：" + str(x) for x in report.get("failure_summaries", []))
+            brief_limits = report.get("user_limitations", limitations)
+            lines.extend("限制：" + str(x).splitlines()[0][:160] for x in brief_limits[:3])
+            if limitations or report.get("failure_summaries"):
+                lines.append("详细诊断请查看日志文件。")
             return Answer(text="\n".join(lines),
                           facts=[*facts, {"kind": "action_result", "result": result}],
                           uncertainties=limitations)

@@ -210,6 +210,10 @@ def setup_logging(
     backup_count: int = 3,
     use_color: bool | None = None,
     suppress: list[str] | None = None,
+    *,
+    console_level: str | int | None = None,
+    file_level: str | int | None = None,
+    user_console: bool = False,
 ) -> None:
     """
     配置 PAO 全局日志系统，替代 main.py 中的 logging.basicConfig()。
@@ -222,6 +226,9 @@ def setup_logging(
     backup_count : 保留的历史日志文件数（默认 3，即最多保留 .1/.2/.3）
     use_color    : 是否启用彩色控制台输出（None 表示自动检测 TTY）
     suppress     : 额外需要静默到 WARNING 的第三方 logger 名称列表
+    console_level: 控制台独立级别，未指定时沿用 level
+    file_level   : 文件独立级别，未指定时沿用 level
+    user_console : 仅将带 pao_user=True 的日志发送到控制台；完整诊断仍写文件
 
     行为
     ----
@@ -234,17 +241,28 @@ def setup_logging(
     if isinstance(level, str):
         level = getattr(logging, level.upper(), logging.INFO)
 
+    console_level = level if console_level is None else console_level
+    file_level = level if file_level is None else file_level
+    if isinstance(console_level, str):
+        console_level = logging._nameToLevel[console_level.upper()]
+    if isinstance(file_level, str):
+        file_level = logging._nameToLevel[file_level.upper()]
     root = logging.getLogger()
-    root.setLevel(level)
+    root.setLevel(min(console_level, file_level) if log_file is not None else console_level)
     # 清除已有 handler，防止 basicConfig 或多次调用导致重复输出
-    root.handlers.clear()
-
-    # 注册上下文注入 filter（作用于根 logger，所有子 logger 均继承）
-    root.addFilter(_ContextFilter())
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+        handler.close()
+    for filt in root.filters[:]:
+        if isinstance(filt, _ContextFilter):
+            root.removeFilter(filt)
 
     # 控制台 handler（stderr，避免与 Aspen COM stdout 混淆）
     console = logging.StreamHandler(sys.stderr)
-    console.setLevel(level)
+    console.setLevel(console_level)
+    console.addFilter(_ContextFilter())
+    if user_console:
+        console.addFilter(lambda record: bool(getattr(record, "pao_user", False)))
     _color = use_color if use_color is not None else _supports_color(sys.stderr)
     console.setFormatter(ColorFormatter(use_color=_color))
     root.addHandler(console)
@@ -259,7 +277,8 @@ def setup_logging(
             backupCount=backup_count,
             encoding="utf-8",
         )
-        fh.setLevel(level)
+        fh.setLevel(file_level)
+        fh.addFilter(_ContextFilter())
         fh.setFormatter(ColorFormatter(use_color=False))
         root.addHandler(fh)
 

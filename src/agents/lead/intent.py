@@ -1,4 +1,4 @@
-﻿"""Structured intent classification for the single PAO LeadAgent entry."""
+"""Structured intent classification for the single PAO LeadAgent entry."""
 from __future__ import annotations
 
 import json
@@ -43,27 +43,78 @@ class IntentClassifier:
         self.enabled = enabled
 
     def classify(self, question: str, *, session: Any = None) -> Classification:
+        attempts = []
+
+        def finish(result, retries=0):
+            result.retry_count = retries
+            if session is not None:
+                session.intent = result.intent
+                session.classification_source = result.classification_source
+                session.fallback_reason = result.fallback_reason
+                session.classification_retry_count = retries
+                session.audit_events.append({
+                    "event": "intent_classification_trace", "classification_source": result.classification_source,
+                    "fallback_reason": result.fallback_reason, "retry_count": retries, "attempts": attempts,
+                })
+            self.logger.debug("intent classification trace: %s", {
+                "source": result.classification_source, "fallback_reason": result.fallback_reason,
+                "retry_count": retries, "attempts": attempts})
+            return result
+
+        def fallback(reason, retries=0):
+            return finish(self._fallback(question or "", reason, session=session), retries)
+
         if not isinstance(question, str) or not question.strip():
-            return self._fallback(question or "", "empty_message", session=session)
+            return fallback("empty_message")
         if not self.enabled:
-            return self._fallback(question, "llm_disabled", session=session)
+            return fallback("llm_disabled")
         try:
             cfg = self.llm_config or llm_client.load_llm_config()
             if not llm_client.is_configured(cfg):
-                return self._fallback(question, "llm_key_missing", session=session)
-            raw = self.llm_call(cfg, system=self._system_prompt(), user=question)
-            if not isinstance(raw, str) or not raw.strip():
-                raise ValueError("empty_model_result")
-            payload = self._normalize_provider_payload(self._parse_json_response(raw))
-            intent = IntentSchema.from_dict(payload)
+                return fallback("llm_key_missing")
+        except Exception as exc:
+            self.logger.exception("intent classifier configuration failed")
+            return fallback(self._reason_code(exc))
+
+        focus = ((getattr(session, "runtime_state", {}) or {}).get("conversation_focus") or {})
+        request = json.dumps({"question": question, "conversation_focus": focus}, ensure_ascii=False)
+        for attempt in range(2):
+            trace = {"attempt": attempt, "request": request}
+            attempts.append(trace)
+            try:
+                raw = self.llm_call(cfg, system=self._system_prompt(), user=request)
+            except Exception as exc:
+                trace["error"] = {"code": self._reason_code(exc), "message": str(exc)}
+                self.logger.exception("intent provider request failed (attempt=%s)", attempt)
+                return fallback(self._reason_code(exc), attempt)
+            trace["raw_response"] = raw
+            self.logger.debug("intent raw response attempt=%s: %r", attempt, raw)
+            try:
+                if not isinstance(raw, str) or not raw.strip():
+                    raise ValueError("empty_model_result")
+                payload = self._validate_provider_payload(self._parse_json_response(raw))
+                intent = IntentSchema.from_dict(payload)
+            except (ValueError, TypeError, KeyError) as exc:
+                error = {"code": self._reason_code(exc), "message": str(exc)}
+                trace["error"] = error
+                self.logger.warning("intent validation failed attempt=%s: %s", attempt, error)
+                if attempt == 1:
+                    return fallback(error["code"], 1)
+                request = json.dumps({
+                    "request_type": "repair_intent_json", "original_question": question,
+                    "conversation_focus": focus, "invalid_response": raw,
+                    "validation_error": error,
+                    "instruction": "Return only the corrected complete JSON object. No explanation or Markdown. "
+                                   "Keep the original user intent; do not invent missing slots or bypass confirmation.",
+                }, ensure_ascii=False)
+                self.logger.debug("intent repair request: %s", request)
+                continue
             if intent.confidence < self.confidence_threshold:
-                return self._fallback(question, "low_confidence", session=session)
-            return Classification(intent=intent, classification_source="llm")
-        except Exception as exc:  # provider, parse and schema failures are explicit fallbacks
-            reason = str(exc) or type(exc).__name__
-            if self.logger is not None:
-                self.logger.warning("intent classifier fallback: %s", reason)
-            return self._fallback(question, self._reason_code(exc), session=session)
+                trace["error"] = {"code": "low_confidence", "message": "confidence below threshold"}
+                return fallback("low_confidence", attempt)
+            return finish(Classification(intent=intent,
+                classification_source="llm_repaired" if attempt else "llm"), attempt)
+        raise AssertionError("unreachable classification state")
 
     @staticmethod
     def _parse_json_response(raw: str) -> dict[str, Any]:
@@ -83,25 +134,40 @@ class IntentClassifier:
         return value
 
     @staticmethod
-    def _normalize_provider_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        """Normalize two common provider type slips before strict validation.
-
-        DeepSeek occasionally emits ``false``/``true`` for the list-valued
-        context field and a scalar string for ``missing_information``.  These
-        conversions preserve the meaning of those fields; all enum values,
-        unknown keys, confirmation rules, and confidence bounds remain
-        enforced by ``IntentSchema``.
-        """
-        data = dict(payload)
-        context = data.get("context_required")
-        if isinstance(context, bool):
-            data["context_required"] = ["process_context"] if context else []
-        missing = data.get("missing_information")
-        if isinstance(missing, str):
-            data["missing_information"] = [missing] if missing else []
-        elif missing is None:
-            data["missing_information"] = []
-        return data
+    def _validate_provider_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate the wire contract without coercing invalid provider fields."""
+        required = {"intent", "task_type", "project_scope", "context_required", "subagents",
+                    "action_type", "requires_confirmation", "confidence", "missing_information", "reason", "analysis"}
+        missing = required - payload.keys()
+        if missing:
+            raise ValueError("missing required fields: " + ", ".join(sorted(missing)))
+        for key in ("intent", "task_type", "project_scope", "action_type", "reason"):
+            if not isinstance(payload[key], str):
+                raise TypeError(f"{key} must be a string")
+        for key in ("context_required", "missing_information"):
+            if not isinstance(payload[key], list) or not all(isinstance(x, str) for x in payload[key]):
+                raise TypeError(f"{key} must be a list of strings")
+        if not isinstance(payload["subagents"], list) or not all(isinstance(x, dict) for x in payload["subagents"]):
+            raise TypeError("subagents must be a list of objects")
+        analysis = payload["analysis"]
+        if not isinstance(analysis, dict):
+            raise TypeError("analysis must be an object, not " + type(analysis).__name__)
+        if payload["intent"] == "parameter_impact":
+            slots = {"equipment", "target_stream", "target_component", "metric", "candidate_parameters"}
+            absent = slots - analysis.keys()
+            if absent:
+                raise ValueError("analysis missing required slots: " + ", ".join(sorted(absent)))
+            for key in slots - {"candidate_parameters"}:
+                value = analysis[key]
+                if value is not None and not isinstance(value, str):
+                    raise TypeError(f"analysis.{key} must be a string or null")
+                if not value and key not in payload["missing_information"]:
+                    raise ValueError(f"missing_information must include unresolved slot: {key}")
+            if not isinstance(analysis["candidate_parameters"], list) or not all(isinstance(x, str) for x in analysis["candidate_parameters"]):
+                raise TypeError("analysis.candidate_parameters must be a list of strings")
+        elif analysis:
+            raise ValueError("analysis must be {} for ordinary intents")
+        return payload
 
     @staticmethod
     def _system_prompt() -> str:
@@ -109,6 +175,9 @@ class IntentClassifier:
             "Classify the PAO user message. Return one JSON object only, with exactly these fields: "
             "intent, task_type, project_scope, context_required, subagents, action_type, "
             "requires_confirmation, confidence, missing_information, reason, analysis. "
+            "analysis MUST be an object (never string, array or null); ordinary intents return analysis: {}. "
+            "context_required and missing_information are arrays of strings; requires_confirmation is boolean; "
+            "confidence is a finite number between 0 and 1; reason is a string. "
             "subagents is a list of {name,task,priority,parallel}. "
             "Allowed intent: chat, project_query, analysis, parameter_impact, modify_request, simulation_request, "
             "optimization_request, report_request, code_request, general_question. "
@@ -116,7 +185,10 @@ class IntentClassifier:
             "Allowed action_type: none, read, modify_file, set_parameter, simulate_once, optimize, modify_structure. "
             "Any modify, simulation, optimization, parameter impact or structure action requires_confirmation=true. "
             "For parameter_impact, put slots in analysis: equipment, target_stream, target_component, metric, candidate_parameters. "
-            "Use missing_information when required details are absent; never invent them."
+            "All five analysis keys are required for parameter_impact; candidate_parameters is an array of strings. "
+            "For unresolved scalar slots use null and list their key in missing_information; never invent values. "
+            "Input may be a repair_intent_json request containing an invalid response and validation errors. "
+            "Return only a corrected COMPLETE JSON object, no explanation and no Markdown."
         )
 
     @staticmethod
@@ -156,18 +228,6 @@ class IntentClassifier:
             analysis=analysis,
         )
         result = Classification(intent=schema, classification_source="rule_fallback", fallback_reason=reason)
-        if session is not None:
-            session.intent = schema
-            session.classification_source = "rule_fallback"
-            session.fallback_reason = reason
-            events = getattr(session, "audit_events", None)
-            if events is not None:
-                events.append({
-                    "event": "intent_classified",
-                    "source": "rule_fallback",
-                    "fallback_reason": reason,
-                    "intent": schema.to_dict(),
-                })
         return result
 
     @staticmethod

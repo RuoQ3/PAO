@@ -200,10 +200,13 @@ class Classification(JsonModel):
     intent: IntentSchema
     classification_source: str = "llm"
     fallback_reason: str | None = None
+    retry_count: int = 0
 
     def __post_init__(self) -> None:
-        if self.classification_source not in {"llm", "rule_fallback"}:
-            raise ValueError("classification_source must be llm or rule_fallback")
+        if type(self.retry_count) is not int or self.retry_count not in (0, 1):
+            raise ValueError("retry_count must be 0 or 1")
+        if self.classification_source not in {"llm", "llm_repaired", "rule_fallback"}:
+            raise ValueError("classification_source must be llm, llm_repaired or rule_fallback")
         if self.classification_source == "rule_fallback" and not self.fallback_reason:
             raise ValueError("rule fallback requires a reason")
 
@@ -327,6 +330,7 @@ class SessionState(JsonModel):
     budget_used: int = 0
     intent: IntentSchema | None = None
     classification_source: str | None = None
+    classification_retry_count: int = 0
     fallback_reason: str | None = None
     context_summary: dict[str, Any] = field(default_factory=dict)
     context_sources: list[dict[str, Any]] = field(default_factory=list)
