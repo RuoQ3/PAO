@@ -240,6 +240,8 @@ def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set, list[dict[str, 
 
     for dv in cfg.get("design_variables", []):
         dv_type = dv.get("type", "continuous")
+        if dv_type not in {"continuous", "integer", "fixed", "derived"}:
+            raise ValueError(f"unsupported design variable type: {dv_type!r}")
         if dv_type == "derived":
             frac_path = str(dv["name"])
             target_path = str(dv["target_path"])
@@ -291,10 +293,26 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     optimizer.type = "bayesian"（默认）→ OptimizeCaseConfig（单目标）
     optimizer.type = "pareto_bayesian"  → ParetoOptimizeCaseConfig（多目标）
     """
+    import math
+    options = cfg.get("optimizer") or {}
+    if not isinstance(options, dict):
+        raise ValueError("optimizer must be a mapping")
+    for key in ("n_initial_points", "n_iterations", "n_initial_min"):
+        if key in options and (type(options[key]) is not int or options[key] < (0 if key == "n_iterations" else 1)):
+            raise ValueError(f"optimizer.{key} has invalid integer value")
+    for key in ("xi", "kappa", "hv_margin"):
+        if key in options and (type(options[key]) not in (float, int) or not math.isfinite(options[key]) or options[key] < 0):
+            raise ValueError(f"optimizer.{key} must be finite and nonnegative")
+    if "random_seed" in options and options["random_seed"] is not None and type(options["random_seed"]) is not int:
+        raise ValueError("optimizer.random_seed must be an integer or null")
     opt_type = cfg.get("optimizer", {}).get("type", "bayesian")
+    if opt_type not in {"bayesian", "pareto_bayesian"}:
+        raise ValueError(f"unsupported optimizer.type: {opt_type!r}")
     if opt_type == "pareto_bayesian":
         return _build_pareto_optimize_config(cfg, run_cfg)
 
+    if _parse_surrogate_model(options) in {"qEHVI", "NEHVI"}:
+        raise ValueError("qEHVI/NEHVI require pareto_bayesian and multiple objectives")
     from ..workflows.optimize_case import OptimizeCaseConfig
 
     opt = cfg.get("optimizer", {})
@@ -309,17 +327,12 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     if not objs:
         raise ValueError("配置缺少 objectives 字段，至少需要一个目标函数。")
     primary = objs[0]
-    if len(objs) > 1:
-        _log.warning(
-            "配置包含 %d 个目标函数，当前贝叶斯优化仅支持单目标，"
-            "使用第一个目标 '%s'，其余忽略。如需多目标优化，请设置 optimizer.type: pareto_bayesian。",
-            len(objs), primary["name"],
-        )
+    if len(objs) != 1:
+        raise ValueError("bayesian requires exactly one objective; use pareto_bayesian explicitly")
 
     acq_raw = str(opt.get("acquisition_function", "EI")).upper()
     if acq_raw not in ("EI", "UCB", "PI"):
-        _log.warning("acquisition_function '%s' 不合法，回退到 EI。", acq_raw)
-        acq_raw = "EI"
+        raise ValueError(f"unsupported acquisition_function: {acq_raw!r}")
 
     surrogate_model = _parse_surrogate_model(opt)
 
@@ -392,6 +405,9 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
         acquisition     = acq_raw,  # type: ignore[arg-type]
         surrogate_model = surrogate_model,  # type: ignore[arg-type]
         random_seed     = opt.get("random_seed"),
+        n_initial_min   = int(opt.get("n_initial_min", 3)),
+        xi              = float(opt.get("xi", 0.01)),
+        kappa           = float(opt.get("kappa", 1.96)),
         integer_var_paths  = integer_paths,
         derived_var_specs  = derived_var_specs,
         feasibility_filter = _parse_feasibility_filter(
@@ -425,13 +441,11 @@ def _build_pareto_optimize_config(cfg: dict, run_cfg: Any) -> Any:
 
     scalarization = str(opt.get("scalarization", "weighted_sum"))
     if scalarization not in ("weighted_sum", "chebyshev"):
-        _log.warning("scalarization '%s' 不合法，回退到 weighted_sum。", scalarization)
-        scalarization = "weighted_sum"
+        raise ValueError(f"unsupported scalarization: {scalarization!r}")
 
     acq_raw = str(opt.get("acquisition_function", "EI")).upper()
     if acq_raw not in ("EI", "UCB", "PI"):
-        _log.warning("acquisition_function '%s' 不合法，回退到 EI。", acq_raw)
-        acq_raw = "EI"
+        raise ValueError(f"unsupported acquisition_function: {acq_raw!r}")
 
     surrogate_model = _parse_surrogate_model(opt)
 

@@ -1,5 +1,8 @@
 """Persistent observe/decide/ask/evaluate/tell loop with one Aspen writer."""
 from __future__ import annotations
+from src.agents.actions.authorization import authorized_workflow
+from src.agents.errors import AgentUnavailableError, unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured, redact
 
 import hashlib
 import json
@@ -9,7 +12,7 @@ import random
 import uuid
 from dataclasses import asdict, replace
 
-from src.agents.orchestration.closed_loop.advisor import ProcessDecisionAgent, fallback_plan
+from src.agents.orchestration.closed_loop.advisor import ProcessDecisionAgent
 from src.agents.orchestration.closed_loop.technical_advisor import consult
 from src.agents.orchestration.closed_loop.analysis import (
     build_analysis_report,
@@ -129,10 +132,7 @@ def _finish_action(state, config):
     before, after = decision["before"], _metrics(state, config)
     objective_gain = ((after["hypervolume"] or 0) > (before["hypervolume"] or 0) + 1e-10)
     gain = objective_gain or after["feasible_count"] > before["feasible_count"]
-    # A rejected LLM proposal is a protocol failure, not evidence that the
-    # experiment itself stagnated.  Do not let malformed JSON or an invalid
-    # action/field combination consume the stagnation patience; the fallback
-    # still runs a safe experiment and the next decision gets a fresh chance.
+    # Only executed, validated decisions contribute experimental outcomes.
     stagnation_counted = not bool(decision.get("rejection"))
     if stagnation_counted:
         state["stagnation_count"] = 0 if gain else state["stagnation_count"] + 1
@@ -180,12 +180,11 @@ def _choose_plan(state, config, settings, agent, context, knowledge, technical_a
     rejected = None
     try:
         plan, source = agent.propose(snapshot)
+        if source not in {"llm", "llm_repaired"}:
+            raise unavailable("agent_output_invalid", stage="closed_loop_source")
         validate_plan(plan, state, settings, config.integer_var_paths, {r["id"] for r in knowledge})
     except Exception as exc:
-        rejected = f"{type(exc).__name__}: {exc}"[:1000]
-        _log.warning("Agent proposal rejected; using deterministic fallback: %s", rejected)
-        plan, source = fallback_plan(snapshot, settings.batch_size), "rules:rejected_proposal"
-        validate_plan(plan, state, settings, config.integer_var_paths, {r["id"] for r in knowledge})
+        raise failure_from(exc, "closed_loop_plan_validation") from None
     decision = {"id": str(uuid.uuid4()), "plan": plan.to_dict(), "source": source,
                 "rejection": rejected, "before": snapshot["metrics"],
                 "before_analysis": snapshot["analysis_report"],
@@ -325,6 +324,7 @@ def _verification_candidate(state, config, settings):
     return valid[min(range(len(scores)), key=scores.__getitem__)][0]
 
 
+@authorized_workflow
 def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path,
                         context: dict, knowledge: list[dict], resume=False, agent=None,
                         evaluator=None, session_factory=ParetoSearchSession,
@@ -361,8 +361,20 @@ def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path
             raise ValueError("Checkpoint exists; use --resume or a new checkpoint path")
         if resume and state is None:
             raise ValueError("No checkpoint exists to resume")
+        if state is not None and (state.get("agent_unavailable") or
+                any(d.get("source") not in {"llm", "llm_repaired"} for d in state.get("decisions", [])) or
+                (state.get("active_plan") and not state.get("decisions"))):
+            raise unavailable("agent_output_invalid", stage="closed_loop_restore")
         if state is not None and (state.get("version") != 1 or state["fingerprint"] != fingerprint):
             raise ValueError("Configuration/model/knowledge changed; start a new checkpoint")
+        if resume and state.get("active_plan"):
+            try:
+                validate_plan(ActionPlan.parse(state["active_plan"]), state, settings,
+                              config.integer_var_paths, {r["id"] for r in knowledge})
+            except Exception as exc:
+                raise failure_from(exc, "closed_loop_restore") from None
+            if state.get("phase") == "search" and state.get("status") != "done":
+                state["batch_remaining"] = 0
         if state is None:
             initial = {p: config.reference_values.get(p, (lo + hi) / 2) for p, (lo, hi) in hard.items()}
             for key, value in initial.items():
@@ -420,7 +432,13 @@ def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path
                     elif len(state["decisions"]) >= settings.max_decisions:
                         reason = "decision_budget"
                     else:
-                        plan = _choose_plan(state, config, settings, agent, context, knowledge, technical_advisor)
+                        try:
+                            plan = _choose_plan(state, config, settings, agent, context, knowledge, technical_advisor)
+                        except AgentUnavailableError as error:
+                            state.update(agent_unavailable=True, unavailable_error=error.to_dict(),
+                                         status="unavailable", active_plan=None, batch_remaining=0)
+                            journal.save(state)
+                            raise
                         journal.save(state)
                         _log.info("Agent decision %d [%s]: %s", len(state["decisions"]),
                                   state["decisions"][-1]["source"], plan.hypothesis)
@@ -482,6 +500,11 @@ def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path
                                        design_vars=actual, tags=tags, notes=f"Preflight rejected: {blocked}")
                 else:
                     case = evaluator(driver, actual, run_config, pending["iteration"], tags)
+            except AgentUnavailableError as error:
+                state.update(agent_unavailable=True, unavailable_error=error.to_dict(),
+                             status="unavailable", active_plan=None, batch_remaining=0)
+                journal.save(state)
+                raise
             except Exception as exc:
                 case = ProcessCase(status=CaseStatus.SIM_FAILED, iteration=pending["iteration"],
                                    design_vars=actual, tags=tags, notes=f"Evaluation error: {type(exc).__name__}: {exc}")

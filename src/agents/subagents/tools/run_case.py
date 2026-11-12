@@ -189,71 +189,7 @@ def _impl_run_case(
     iteration: int,
 ) -> str:
     """run_case_tool 的核心实现，出错时返回 '错误：' 字符串。"""
-    # 1. 解析配置路径
-    try:
-        yaml_path = _common._resolve_config_path(config_path)
-    except FileNotFoundError as exc:
-        return f"错误：{exc}"
-
-    # 2. 按需导入运行时依赖
-    err = _common._import_run_time_deps()
-    if err:
-        return err
-
-    # 3. 加载 OptimizeCaseConfig
-    try:
-        opt_cfg, sim_filepath, driver_kwargs = _common._load_optimize_config(yaml_path)
-    except (FileNotFoundError, KeyError, ValueError, TypeError) as exc:
-        return f"错误：配置加载失败 [{type(exc).__name__}] — {exc}"
-    except Exception as exc:
-        return f"错误：配置加载时出现意外错误 — {exc}"
-
-    # 4. 解析设计变量
-    design_vars_override, parse_err = _parse_design_vars_json(design_vars_json)
-    if parse_err:
-        return f"错误：{parse_err}"
-
-    if design_vars_override:
-        base = _build_initial_design_vars(opt_cfg)
-        base.update(design_vars_override)
-        design_vars_raw = base
-    else:
-        design_vars_raw = _build_initial_design_vars(opt_cfg)
-
-    # 5. apply derived + repair
-    try:
-        design_vars = _apply_derived_and_repair(opt_cfg, design_vars_raw)
-    except Exception as exc:
-        return f"错误：变量预处理失败（repair/apply_derived）— {exc}"
-
-    # 6. 连接 Aspen 并运行
-    try:
-        with _common._AspenDriver(**driver_kwargs) as driver:
-            driver.open(sim_filepath)
-            case = _common._run_case_fn(
-                driver=driver,
-                design_vars=design_vars,
-                config=opt_cfg.run_config,
-                iteration=iteration,
-                tags=["agent_run_case"],
-            )
-    except FileNotFoundError as exc:
-        return f"错误：Aspen 仿真文件不存在 — {exc}"
-    except Exception as exc:
-        return f"错误：Aspen 连接或运行失败 [{type(exc).__name__}] — {exc}"
-
-    # 7. 格式化报告
-    try:
-        report = _fmt_case_summary(case)
-    except Exception as exc:
-        _log.exception("格式化 run_case 报告时出现意外错误")
-        return f"错误：格式化报告时出现意外错误 — {exc}"
-
-    _log.info(
-        "run_case_tool: 完成单次运行 case_id=%s status=%s run_time=%.1fs",
-        case.case_id, case.status.value, case.run_time,
-    )
-    return report
+    raise PermissionError('Direct execution tool disabled; submit a complete plan to ActionGateway for preview and approval')
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,5 @@
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +60,6 @@ def test_selected_file_is_read_only_and_provenance_tracked():
 def test_lead_persists_context_summary_and_sources():
     builder = Builder()
     state = SessionState()
-    LeadAgent(context_builder=builder, use_llm=False).answer("设备有哪些？", state)
+    LeadAgent(context_builder=builder, **fake_kwargs()).answer("设备有哪些？", state)
     assert state.context_summary["equipment"] == 1
     assert isinstance(state.context_sources, list)

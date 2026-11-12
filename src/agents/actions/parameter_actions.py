@@ -100,28 +100,10 @@ class AspenParameterExecutor:
                 "path": action.target, "value": self.driver.get_value(action.target)}
 
     def execute(self, action: ActionRequest, *, preview: Any) -> dict[str, Any]:
-        if action.action_type != ActionType.SET_PARAMETER:
-            raise RuntimeError("受控 Aspen 执行器只支持白名单参数修改")
-        before = self.driver.get_value(action.target)
-        self.driver.set_value(action.target, action.new_value)
-        after = self.driver.get_value(action.target)
-        if after != action.new_value:
-            raise RuntimeError(f"写入校验失败: requested={action.new_value!r}, actual={after!r}")
-        result: dict[str, Any] = {"audit_id": action.audit_id, "status": "executed",
-                                  "target": action.target, "old_value": before,
-                                  "new_value": after, "backup": self._tokens.get(action.audit_id).__dict__ if action.audit_id in self._tokens else None}
-        if preview.will_run_simulation and self.run_once:
-            result["simulation"] = self.run_once(action)
-        return result
+        raise PermissionError("Standalone parameter executor disabled; use an approved explicit simulation plan")
 
     def rollback(self, token: Any) -> None:
-        backup = Path(token["backup"] if isinstance(token, dict) else token.backup)
-        source = Path(token["source"] if isinstance(token, dict) else token.source)
-        if not backup.exists():
-            raise RuntimeError("备份文件不存在，无法回滚")
-        shutil.copy2(backup, source)
-        if isinstance(token, dict) and token.get("path") in self._values:
-            self.driver.set_value(token["path"], self._values[token["path"]])
+        raise PermissionError("Rollback requires a new ActionGateway plan and approval")
         # A real live COM document should be reopened by the owner after file rollback.
 
 

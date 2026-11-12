@@ -130,6 +130,9 @@ class ProcessContext:
     conflicts: list[dict[str, Any]] = field(default_factory=list)
     facts: list[dict[str, Any]] = field(default_factory=list)
     inferences: list[dict[str, Any]] = field(default_factory=list)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    dependency_versions: dict[str, Any] = field(default_factory=dict)
+    configuration: dict[str, Any] = field(default_factory=dict)
 
     # The graph helpers intentionally operate on the normalized fields but
     # fall back to legacy fields so contexts created by older clients remain
@@ -267,17 +270,23 @@ class ProcessContext:
                 value = item.get("mole_fraction", item.get("mass_fraction", item.get("value")))
                 try:
                     if name is not None and value is not None:
-                        result[str(name)] = float(value)
+                        basis = ("mole_fraction" if "mole_fraction" in item else
+                                 "mass_fraction" if "mass_fraction" in item else stream.get("composition_basis", "unknown"))
+                        result[str(name)] = (float(value), basis)
                 except (TypeError, ValueError):
                     continue
             return result
         a, b = values(left), values(right)
         changes = []
         for name in sorted(set(a) | set(b), key=str.casefold):
-            before, after = a.get(name), b.get(name)
-            delta = None if before is None or after is None else after - before
+            before_record, after_record = a.get(name), b.get(name)
+            before = before_record[0] if before_record else None
+            after = after_record[0] if after_record else None
+            basis = before_record[1] if before_record else "unknown"
+            comparable = before_record and after_record and basis == after_record[1] and basis != "unknown"
+            delta = after - before if comparable else None
             changes.append({"component": name, "input": before, "output": after,
-                            "delta": delta,
+                            "delta": delta, "basis": basis,
                             "classification": ("unknown" if delta is None else
                                 "enriched" if delta > 1e-12 else
                                 "reduced" if delta < -1e-12 else "unchanged")})

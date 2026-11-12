@@ -4,7 +4,7 @@ llm_client.py — PAO 大模型客户端（多 provider，密钥仅来自环境�
 设计原则：
   - API key 绝不写进代码或 YAML，只从环境变量读取。
   - 多 provider 可切换：PAO_LLM_PROVIDER = anthropic | openai | deepseek。
-  - 缺 key 时 is_configured() 返回 False，由上层降级，绝不在此抛错或伪装。
+  - 缺 key 时 is_configured() 返回 False，由上层停止请求，绝不在此抛错或伪装。
   - provider SDK 延迟导入（lazy import），未选用的 provider 不需要安装。
 
 环境变量约定：
@@ -31,7 +31,8 @@ import os
 import json
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from src.agents.errors import fail_closed, unavailable
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -51,12 +52,12 @@ def _load_dotenv_if_present(override: bool = False) -> None:
         return
     try:
         from dotenv import load_dotenv
-        load_dotenv(dotenv_path=env_file, override=override)
+        load_dotenv(dotenv_path=env_file, override=override, encoding="utf-8-sig")
         _log.debug("已加载 .env（override=%s）：%s", override, env_file)
     except ImportError:
         # python-dotenv is optional; parse PAO's simple KEY=VALUE format when
         # the optional package is absent.
-        for raw in env_file.read_text(encoding="utf-8").splitlines():
+        for raw in env_file.read_text(encoding="utf-8-sig").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -89,7 +90,7 @@ class LLMConfig:
     provider: str
     model: str
     api_key_env: str
-    api_key: str | None
+    api_key: str | None = field(repr=False)
     temperature: float = 0.2
     max_tokens: int = 2048
 
@@ -144,7 +145,7 @@ def load_llm_config(
         model:    覆盖 PAO_LLM_MODEL；None 时读环境变量，再缺省为 provider 默认模型。
 
     Returns:
-        LLMConfig。未知 provider 回退到默认 provider 并告警。
+        LLMConfig。未知 provider 立即失败。
         api_key 仅从对应环境变量读取，缺失时为 None（由 is_configured 判定）。
     """
     # 每次调用重新加载 .env（override=True：.env 优先于系统环境变量）
@@ -158,11 +159,7 @@ def load_llm_config(
 
     prov = (provider or os.environ.get("PAO_LLM_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
     if prov not in _PROVIDER_DEFAULTS:
-        _log.warning(
-            "未知 PAO_LLM_PROVIDER=%r，回退到 %s。支持：%s",
-            prov, _DEFAULT_PROVIDER, sorted(_PROVIDER_DEFAULTS),
-        )
-        prov = _DEFAULT_PROVIDER
+        raise unavailable("llm_provider_unavailable", stage="provider_config")
 
     default_model, key_env = _PROVIDER_DEFAULTS[prov]
     chosen_model = (model or os.environ.get("PAO_LLM_MODEL") or default_model).strip()
@@ -179,14 +176,16 @@ def load_llm_config(
 
 
 def is_configured(cfg: LLMConfig) -> bool:
-    """是否具备调用大模型的条件（当前仅要求 api_key 存在）。"""
-    return bool(cfg.api_key)
+    """Require an explicitly supported provider and a nonempty credential."""
+    return (getattr(cfg, "provider", None) in _PROVIDER_DEFAULTS
+            and isinstance(getattr(cfg, "api_key", None), str) and bool(cfg.api_key.strip()))
 
 
 # ---------------------------------------------------------------------------
 # Chat 模型构造与调用
 # ---------------------------------------------------------------------------
 
+@fail_closed("llm_provider_initialization")
 def build_chat_model(cfg: LLMConfig):
     """按 provider 延迟导入并构造 LangChain Chat 模型。
 
@@ -205,6 +204,8 @@ def build_chat_model(cfg: LLMConfig):
                 model=cfg.model,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
+                max_retries=0,
+                timeout=20,
                 api_key=cfg.api_key,
             )
         if cfg.provider == "openai":
@@ -213,6 +214,8 @@ def build_chat_model(cfg: LLMConfig):
                 model=cfg.model,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
+                max_retries=0,
+                timeout=20,
                 api_key=cfg.api_key,
             )
         if cfg.provider == "deepseek":
@@ -221,16 +224,14 @@ def build_chat_model(cfg: LLMConfig):
                 model=cfg.model,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
+                max_retries=0,
+                timeout=20,
                 api_key=cfg.api_key,
             )
     except ImportError as exc:
-        raise RuntimeError(
-            f"provider={cfg.provider} 的 SDK 未安装或导入失败 — {exc}"
-        ) from exc
+        raise unavailable("llm_provider_unavailable", stage="llm_provider_initialization", cause=exc) from None
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"构造 {cfg.provider} Chat 模型失败 [{type(exc).__name__}] — {exc}"
-        ) from exc
+        raise unavailable("llm_provider_unavailable", stage="llm_provider_initialization", cause=exc) from None
 
     raise RuntimeError(f"不支持的 provider：{cfg.provider!r}")
 
@@ -257,6 +258,7 @@ def chat_json(cfg: LLMConfig, system: str, user: str) -> str:
     return chat(cfg, system, user, json_mode=True)
 
 
+@fail_closed("llm_request")
 def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> str:
     """单轮对话：发送 system + user 消息，返回纯文本回复。
 
@@ -264,8 +266,10 @@ def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> 
     合并进 user 消息，因为这类模型不支持 SystemMessage（传入会返回空）。
 
     Raises:
-        RuntimeError: 未配置 / 构造失败 / 调用失败（由上层降级处理）。
+        RuntimeError: 未配置 / 构造失败 / 调用失败（由上层停止请求）。
     """
+    if not is_configured(cfg):
+        raise unavailable("llm_not_configured", stage="llm_request")
     # DeepSeek exposes an OpenAI-compatible endpoint. Use the standard library
     # transport so the selected provider works when its optional LangChain
     # adapter is not installed.
@@ -282,7 +286,7 @@ def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> 
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        request_body = json.dumps(body).encode("utf-8")
+        request_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             f"{base_url}/chat/completions", data=request_body,
             headers={"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"},
@@ -294,7 +298,9 @@ def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> 
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"DeepSeek API returned HTTP {exc.code}") from None
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except TimeoutError:
+            raise unavailable("llm_timeout", stage="llm_request") from None
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"DeepSeek API unavailable ({type(exc).__name__})") from None
         try:
             content = payload["choices"][0]["message"]["content"]
@@ -320,9 +326,8 @@ def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> 
     try:
         resp = model.invoke(messages)
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"大模型调用失败 [{type(exc).__name__}] — {exc}"
-        ) from exc
+        from src.agents.errors import failure_from
+        raise failure_from(exc, "llm_request") from None
 
     content = getattr(resp, "content", resp)
     if isinstance(content, list):

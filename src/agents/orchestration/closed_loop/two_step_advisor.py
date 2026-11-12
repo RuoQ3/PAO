@@ -1,33 +1,7 @@
-"""
-two_step_advisor.py — 两阶段决策流程
-
-设计思路：
------------
-当前问题：LLM 一次性生成完整 ActionPlan 时，容易同时填写互斥字段（如 search_region 和 candidate），
-         导致协议违反率高达 40%。
-
-解决方案：将决策拆分为两个独立步骤：
-         Step 1: 决定动作类型（continue/set_region/probe/stop）
-         Step 2: 根据类型生成对应参数
-
-优势：
------
-1. 减少字段混淆：每步的输出结构更简单
-2. 提高成功率：LLM 协议违反率预期降低至 < 10%
-3. 易于调试：可以单独观察每一步的决策
-4. 灵活降级：任一步失败都可以回退到规则决策
-
-使用：
------
-    agent = TwoStepDecisionAgent(llm_config=cfg)
-    action, source = agent.propose(snapshot)
-
-    if source == "llm:two_step":
-        print("LLM 成功决策")
-    else:
-        print("回退到规则决策")
-"""
+"""Two-step decision making. Either step fails the entire request."""
 from __future__ import annotations
+from src.agents.errors import AgentUnavailableError, unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured, redact
 
 import json
 import logging
@@ -194,48 +168,22 @@ class TwoStepDecisionAgent:
     工作流程：
     1. Step 1: 分析状态 → 选择动作类型
     2. Step 2: 根据类型 → 生成具体参数
-    3. 任一步失败 → 回退到规则决策
+    3. 任一步失败 → 终止当前 Agent 请求
 
     Args:
-        llm_config: LLM 配置（None 时直接使用规则降级）
+        llm_config: LLM 配置（None 时加载配置；不可用则失败）
     """
 
     def __init__(self, llm_config=None):
         self.llm_config = llm_config
 
+    @fail_closed("closed_loop_two_step")
     def propose(self, snapshot: dict) -> tuple[Action, str]:
-        """
-        两阶段生成决策。
-
-        Args:
-            snapshot: 当前优化状态快照（包含历史、边界、预算等）
-
-        Returns:
-            (Action, source) 元组
-            - Action: 具体的动作对象（ContinueAction/SetRegionAction/ProbeAction/StopAction）
-            - source: 决策来源（"llm:two_step" 或 "rules:fallback"）
-        """
-        from src.agents.lead.llm_client import is_configured, load_llm_config
-
-        cfg = self.llm_config or load_llm_config()
-        if not is_configured(cfg):
-            _log.info("LLM 未配置，直接使用规则降级")
-            return self._fallback(snapshot), "rules:fallback"
-
-        try:
-            # Step 1: 选择动作类型
-            action_type = self._step1_select_action(cfg, snapshot)
-            _log.info("Step 1 选择动作类型：%s", action_type)
-
-            # Step 2: 生成具体参数
-            action = self._step2_generate_params(cfg, snapshot, action_type)
-            _log.info("Step 2 生成参数完成：%s", action.__class__.__name__)
-
-            return action, "llm:two_step"
-
-        except Exception as exc:
-            _log.warning("Two-step 决策失败，回退到规则：%s", exc, exc_info=True)
-            return self._fallback(snapshot), "rules:fallback"
+        cfg = configured(self.llm_config)
+        action_type = self._step1_select_action(cfg, snapshot)
+        from .contracts import ActionPlan
+        action = self._step2_generate_params(cfg, snapshot, action_type)
+        return ActionPlan.parse(action.to_legacy_plan()), "llm"
 
     def _step1_select_action(
         self, cfg, snapshot: dict
@@ -262,17 +210,19 @@ class TwoStepDecisionAgent:
         }
 
         raw = chat(cfg, system=STEP1_SYSTEM_PROMPT, user=json.dumps(step1_input, ensure_ascii=False))
-        _log.debug("Step 1 LLM 原始输出：%s", raw[:200])
+        _log.debug("Step 1 LLM 原始输出：%s", redact(raw, cfg), extra={"pao_file_only": True})
 
         # 解析 JSON
-        data = json.loads(self._extract_json(raw))
-        action_type = data.get("action_type", "continue")
-        reasoning = data.get("reasoning", "")
+        data = json.loads(redact(raw, cfg))
+        action_type = data["action_type"]
+        reasoning = data["reasoning"]
+        if set(data) != {"action_type", "reasoning"} or not isinstance(reasoning, str) or not reasoning.strip():
+            raise ValueError("Invalid action selection")
 
         if action_type not in {"continue", "set_region", "probe", "stop"}:
             raise ValueError(f"无效的 action_type: {action_type!r}")
 
-        _log.debug("Step 1 推理：%s", reasoning)
+        _log.debug("Step 1 推理：%s", redact(reasoning, cfg), extra={"pao_file_only": True})
         return action_type
 
     def _step2_generate_params(
@@ -299,48 +249,23 @@ class TwoStepDecisionAgent:
 
         # 调用 LLM（需要序列化 snapshot，将 set 转换为 list）
         snapshot_serializable = self._make_serializable(snapshot)
+        prompt += " Return all protocol fields: action, hypothesis, evidence_case_ids, knowledge_ids, search_region, candidate, batch_size, expected_effect, initialization, repeat. Empty maps are required for inapplicable fields."
         raw = chat(cfg, system=prompt, user=json.dumps(snapshot_serializable, ensure_ascii=False))
-        _log.debug("Step 2 LLM 原始输出：%s", raw[:200])
+        _log.debug("Step 2 LLM 原始输出：%s", redact(raw, cfg), extra={"pao_file_only": True})
 
         # 解析并构造对应的 Action
-        data = json.loads(self._extract_json(raw))
+        data = json.loads(redact(raw, cfg))
 
-        # 根据类型构造 Action 对象
-        if action_type == "continue":
-            return ContinueAction(
-                hypothesis=data["hypothesis"],
-                evidence_case_ids=data.get("evidence_case_ids", []),
-                knowledge_ids=data.get("knowledge_ids", []),
-                batch_size=data.get("batch_size", 5),
-                expected_effect=data.get("expected_effect", "objective"),
-                initialization=data.get("initialization", "reset"),
-            )
-        elif action_type == "set_region":
-            return SetRegionAction(
-                hypothesis=data["hypothesis"],
-                evidence_case_ids=data.get("evidence_case_ids", []),
-                knowledge_ids=data.get("knowledge_ids", []),
-                search_region=data.get("search_region", {}),
-                batch_size=data.get("batch_size", 5),
-                expected_effect=data.get("expected_effect", "convergence"),
-                initialization=data.get("initialization", "reset"),
-            )
-        elif action_type == "probe":
-            return ProbeAction(
-                hypothesis=data["hypothesis"],
-                evidence_case_ids=data.get("evidence_case_ids", []),
-                knowledge_ids=data.get("knowledge_ids", []),
-                candidate=data.get("candidate", {}),
-                repeat=data.get("repeat", False),
-                expected_effect=data.get("expected_effect", "information"),
-                initialization=data.get("initialization", "reset"),
-            )
-        else:  # stop
-            return StopAction(
-                hypothesis=data["hypothesis"],
-                evidence_case_ids=data.get("evidence_case_ids", []),
-                knowledge_ids=data.get("knowledge_ids", []),
-            )
+        from .action_types import parse_action_from_dict
+        from .contracts import ActionPlan, LoopConfig, validate_plan
+        if data.get("action") != action_type:
+            raise ValueError("Decision steps disagree")
+        action = parse_action_from_dict(data)
+        validate_plan(ActionPlan.parse(data),
+            {"observations": snapshot.get("recent_observations", []), "hard_bounds": snapshot["hard_bounds"]},
+            LoopConfig(batch_size=snapshot["batch_size_limit"]),
+            set(snapshot.get("integer_paths", [])), {r["id"] for r in snapshot.get("knowledge", [])})
+        return action
 
     def _extract_json(self, text: str) -> str:
         """
@@ -410,34 +335,3 @@ class TwoStepDecisionAgent:
                 lines.append(f"  {key}: {val}")
 
         return "\n".join(lines)
-
-    def _fallback(self, snapshot: dict) -> Action:
-        """
-        规则降级（复用现有 fallback_plan 逻辑）。
-
-        当 LLM 不可用或失败时使用确定性规则生成决策。
-        """
-        from .advisor import fallback_plan
-
-        legacy_plan = fallback_plan(snapshot, snapshot.get("batch_size_limit", 5))
-
-        # 转换为新的 Action 类型
-        if legacy_plan.action == "set_region":
-            return SetRegionAction(
-                hypothesis=legacy_plan.hypothesis,
-                evidence_case_ids=legacy_plan.evidence_case_ids,
-                knowledge_ids=legacy_plan.knowledge_ids,
-                search_region=legacy_plan.search_region,
-                batch_size=legacy_plan.batch_size,
-                expected_effect=legacy_plan.expected_effect,
-                initialization=legacy_plan.initialization,
-            )
-        else:  # continue
-            return ContinueAction(
-                hypothesis=legacy_plan.hypothesis,
-                evidence_case_ids=legacy_plan.evidence_case_ids,
-                knowledge_ids=legacy_plan.knowledge_ids,
-                batch_size=legacy_plan.batch_size,
-                expected_effect=legacy_plan.expected_effect,
-                initialization=legacy_plan.initialization,
-            )

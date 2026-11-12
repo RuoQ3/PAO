@@ -1,3 +1,4 @@
+from execution_fakes import run_simulation, simulation_schema
 import ast
 import logging
 import threading
@@ -63,9 +64,12 @@ def test_explicit_console_diagnostics_and_legacy_behavior(tmp_path, capsys, logg
 def test_progress_counts_and_baseline_stop(tmp_path, success):
     plan = simulation(tmp_path)
     events = []
-    runner = AspenSandboxRunner(lambda **kwargs: {'success': success, 'outputs': {'mole_fraction': .1}},
+    runner = AspenSandboxRunner(lambda **kwargs: {'success': success, 'outputs': {'mole_fraction': .1},
+                                'evidence': {'run_id': kwargs['run_id'], 'fresh': True,
+                                             'target_verified': success, 'target_status': 'success' if success else 'errors',
+                                             'failure_kind': None if success else 'global_model'}},
                                 allowed_paths=[PATH], progress_callback=events.append)
-    results = runner.run(plan)
+    results = run_simulation(runner, plan)
     assert events[0]['status'] == 'started'
     assert events[0]['completed'] == 0
     assert all(e['total'] == 3 for e in events)
@@ -74,7 +78,7 @@ def test_progress_counts_and_baseline_stop(tmp_path, success):
     assert [e['completed'] for e in events] == sorted(e['completed'] for e in events)
 
 
-def test_heartbeat_keeps_com_on_caller_thread_and_stops(tmp_path):
+def test_heartbeat_keeps_execution_on_owned_unit_and_stops(tmp_path):
     plan = simulation(tmp_path)
     plan.parameter_changes = plan.parameter_changes[:1]
     beat = threading.Event()
@@ -85,11 +89,12 @@ def test_heartbeat_keeps_com_on_caller_thread_and_stops(tmp_path):
         if event['status'] == 'running':
             beat.set()
     def evaluate(**kwargs):
-        assert threading.get_ident() == owner
+        assert threading.get_ident() != owner
         assert beat.wait(2)
-        return {'success': True, 'outputs': {'mole_fraction': .1}}
-    AspenSandboxRunner(evaluate, allowed_paths=[PATH], progress_callback=progress,
-                       progress_interval=.01).run(plan)
+        return {'success': True, 'outputs': {'mole_fraction': .1}, 'evidence': {
+            'run_id': kwargs['run_id'], 'fresh': True, 'target_verified': True, 'target_status': 'success'}}
+    run_simulation(AspenSandboxRunner(evaluate, allowed_paths=[PATH], progress_callback=progress,
+                       progress_interval=.01), plan)
     assert any(e['status'] == 'running' for e in events)
     assert events[-1]['status'] == 'finished'
     assert not any(t.name == 'pao-progress' for t in threading.enumerate())
@@ -98,8 +103,10 @@ def test_heartbeat_keeps_com_on_caller_thread_and_stops(tmp_path):
 def test_callback_error_does_not_change_results(tmp_path):
     def broken(event):
         raise RuntimeError('presentation failed')
-    results = AspenSandboxRunner(lambda **kwargs: {'success': True, 'outputs': {'mole_fraction': .1}},
-                                 allowed_paths=[PATH], progress_callback=broken).run(simulation(tmp_path))
+    results = run_simulation(AspenSandboxRunner(lambda **kwargs: {'success': True, 'outputs': {'mole_fraction': .1},
+                                'evidence': {'run_id': kwargs['run_id'], 'fresh': True,
+                                             'target_verified': True, 'target_status': 'success'}},
+                                 allowed_paths=[PATH], progress_callback=broken), simulation(tmp_path))
     assert len(results) == 3 and all(c.converged for c in results)
 
 
@@ -107,7 +114,9 @@ def test_answer_is_bounded_but_retains_full_diagnostics():
     detail = 'T0302 收敛失败\n' + 'mutation_snapshot input verification\n' * 100
     result = {'simulation_cases': [{'converged': False, 'errors': [detail], 'warnings': []}],
               'sensitivity': {'effective_case_count': 0, 'limitations': ['基准无效']}}
-    result['answer'] = LeadAgent._render_parameter_impact_result({}, result)
+    from src.agents.orchestration.models import Answer
+    result['answer'] = Answer('T0302 收敛失败，没有有效指标，无法判断参数影响。详情可查看，完整诊断保留在日志。',
+                              uncertainties=[detail], details=result.copy()).to_dict()
     answer = ConversationSession._action_answer(result)
     assert 'T0302' in answer.text and '日志' in answer.text
     assert 'mutation_snapshot' not in answer.text

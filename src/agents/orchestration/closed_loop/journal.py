@@ -56,6 +56,11 @@ def decode_case(row: dict) -> ProcessCase:
         constraints=[ConstraintValue(**{k: c[k] for k in ("name", "value", "satisfied", "error")
                                        if k in c}) for c in row["constraints"]],
         tags=row.get("tags", []), notes=row.get("notes", ""), run_id=row.get("run_id"),
+        session_id=row.get("session_id", ""), impact_inputs=dict(row.get("impact_inputs") or {}),
+        impact_outputs=dict(row.get("impact_outputs") or {}), converged=row.get("converged"),
+        errors=list(row.get("errors") or []), warnings=list(row.get("warnings") or []),
+        result_source=row.get("result_source"), execution_algorithm=row.get("execution_algorithm"),
+        model_path=row.get("model_path"), timestamp=row.get("timestamp"),
     )
 
 

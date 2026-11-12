@@ -96,6 +96,23 @@ def validate_action(action: ActionRequest, schema: ModelSchema, *, actor: str = 
                 if spec.integer and math.ceil(lo) > math.floor(hi): errors.append(f"no integer in interval: {path}")
             will_run = False
     elif kind in {ActionType.RUN_SIMULATION, ActionType.RUN_OPTIMIZATION}:
+        if kind == ActionType.RUN_SIMULATION and isinstance(action.payload.get("simulation_plan"), dict):
+            try:
+                from src.agents.orchestration.parameter_impact import SimulationPlan
+                plan = SimulationPlan.from_dict(action.payload["simulation_plan"])
+                plan.validate_execution()
+                from .plans import simulation_scope
+                simulation_scope(plan, schema)
+            except (ValueError, TypeError, KeyError, OSError, PermissionError) as exc:
+                errors.append(f"invalid simulation plan: {exc}")
+        elif kind == ActionType.RUN_OPTIMIZATION and isinstance(action.payload.get("optimization_plan"), dict):
+            try:
+                from .plans import validate_optimization_plan
+                validate_optimization_plan(action.payload["optimization_plan"], schema)
+            except (ValueError, TypeError, KeyError, OSError, PermissionError) as exc:
+                errors.append(f"invalid optimization plan: {exc}")
+        else:
+            errors.append("complete execution plan required: base model, explicit inputs/scope, outputs, total budget and limits")
         if action.target not in {schema.identity.model_id, "model", ""}: errors.append("run target does not match model")
         will_run = True
     if action.execution_mode.value == "automatic" and action.requires_confirmation: warnings.append("automatic mode still requires explicit confirmation")
@@ -111,5 +128,6 @@ def validate_action(action: ActionRequest, schema: ModelSchema, *, actor: str = 
         value_type=spec.value_type if spec else None,
         writable=bool(spec.writable) if spec else True,
         backup_required=kind == ActionType.SET_PARAMETER,
+        execution_plan=__import__('copy').deepcopy(action.payload),
     ) if not errors else None
     return ValidationResult(not errors, errors, warnings, preview)

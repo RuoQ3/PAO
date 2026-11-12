@@ -1,4 +1,6 @@
 """Adapter and real urllib request construction, with no external API calls."""
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 import io
 import json
 
@@ -71,7 +73,7 @@ def test_native_json_mode_on_initial_and_repair_requests(monkeypatch, bad):
     repair = json.loads(calls[1]['messages'][-1]['content'])
     assert repair['request_type'] == 'repair_intent_json'
     assert repair['conversation_focus'] == {'equipment': 'T0301'}
-    assert state.audit_events[-1]['attempts'][0]['error']['message']
+    assert state.audit_events[-1]['attempts'][0]['error']['cause_type']
 
 
 def test_native_json_mode_valid_response_needs_no_retry(monkeypatch):
@@ -85,11 +87,10 @@ def test_native_json_mode_valid_response_needs_no_retry(monkeypatch):
 
 def test_native_json_mode_stops_after_failed_repair(monkeypatch):
     calls = transport(monkeypatch, ['{', '{'])
-    result = IntentClassifier(llm_config=config()).classify('分析 T0301 参数影响')
-    assert result.classification_source == 'rule_fallback'
-    assert result.fallback_reason == 'invalid_json'
-    assert result.retry_count == 1 and len(calls) == 2
-    assert result.intent.requires_confirmation is True
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=config()).classify('分析 T0301 参数影响')
+    assert error.value.code == 'llm_repair_failed'
+    assert error.value.retry_count == 1 and len(calls) == 2
 
 
 def test_normal_chat_does_not_enable_json_mode(monkeypatch):

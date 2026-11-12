@@ -1,5 +1,9 @@
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from pathlib import Path
 from types import SimpleNamespace
+import json
+from src.agents.orchestration.closed_loop.contracts import ActionPlan
 
 import pytest
 
@@ -36,28 +40,11 @@ def fake_run(driver, design_vars, run_config, iteration=0, tags=None, run_id=Non
 
 
 def test_existing_optimizer_entry_routes_to_loop_and_report(tmp_path, monkeypatch):
-    import src.workflows.agent_optimize as loop
-    from src.agents.orchestration.closed_loop.advisor import fallback_plan
-    monkeypatch.setattr(loop, "run_case", fake_run)
-    monkeypatch.setattr(ProcessDecisionAgent, "propose", lambda self, snap: (fallback_plan(snap, 2), "test"))
     config = cfg(tmp_path)
-    result = optimize_pareto_case(None, config)
-    assert result.n_total == 5 and result.n_success == 5
-    assert result.first_front
-    assert "completed_verified" in result.early_stop_reason
-    assert (tmp_path / "agent.report.json").exists()
-    assert (tmp_path / "agent.report.md").exists()
-    report = (tmp_path / "agent.report.md").read_text(encoding="utf-8")
-    assert "## 一、执行摘要" in report
-    assert "## 二、已经完成的工作" in report
-    assert "## 四、专业建议" in report
-    assert "## 五、结论边界" in report
-    assert "```json" not in report
-    assert "隐藏思维" not in report
-    assert len(report.splitlines()) < 180
-    config.agent_resume = True
-    monkeypatch.setattr(loop, "run_case", lambda *a, **kw: pytest.fail("terminal resume must not run"))
-    assert optimize_pareto_case(None, config).n_total == 5
+    with pytest.raises(PermissionError, match="ActionGateway"):
+        optimize_pareto_case(None, config)
+    assert not (tmp_path / "agent.report.json").exists()
+
 
 
 def test_skopt_uses_outside_region_history_without_rejecting(caplog):
@@ -86,12 +73,12 @@ def test_incremental_session_keeps_all_observations_across_regions():
 def test_llm_json_proposal_is_used_and_malformed_response_is_rejected(monkeypatch):
     from src.agents import llm_client
     monkeypatch.setattr(llm_client, "is_configured", lambda cfg: True)
-    monkeypatch.setattr(llm_client, "chat", lambda *a, **kw: '{"action":"probe","candidate":{"x":0.6}}')
+    monkeypatch.setattr(llm_client, "chat", lambda *a, **kw: json.dumps(ActionPlan(action="probe", candidate={"x": .6}).to_dict()))
     agent = ProcessDecisionAgent(llm_config=SimpleNamespace())
     plan, source = agent.propose({"recent_observations": []})
     assert source == "llm" and plan.candidate == {"x": 0.6}
     monkeypatch.setattr(llm_client, "chat", lambda *a, **kw: '```invalid JSON```')
-    with pytest.raises(ValueError):
+    with pytest.raises(AgentUnavailableError):
         agent.propose({})
 
 
@@ -100,7 +87,7 @@ def test_llm_proposal_retries_invalid_shape_and_accepts_fenced_json(monkeypatch)
 
     responses = iter([
         '```json\n{"action":"continue","search_region":{"x":[0.2,0.8]}}\n```',
-        '前置说明\n{"action":"continue","search_region":{}}\n',
+        '```json\n' + json.dumps(ActionPlan().to_dict()) + '\n```',
     ])
     calls = []
 
@@ -113,7 +100,7 @@ def test_llm_proposal_retries_invalid_shape_and_accepts_fenced_json(monkeypatch)
     agent = ProcessDecisionAgent(llm_config=SimpleNamespace())
     plan, source = agent.propose({"recent_observations": [], "batch_size_limit": 1})
 
-    assert source == "llm:retry"
+    assert source == "llm_repaired"
     assert plan.action == "continue"
     assert plan.search_region == {}
     assert len(calls) == 2
@@ -123,7 +110,7 @@ def test_llm_proposal_retries_invalid_shape_and_accepts_fenced_json(monkeypatch)
 def test_action_plan_response_parser_tolerates_preamble():
     plan = parse_action_plan_response(
         "根据当前证据，建议继续采样。\n"
-        '{"action":"probe","candidate":{"x":0.6}}\n'
+        + json.dumps(ActionPlan(action="probe", candidate={"x": .6}).to_dict())
     )
     assert plan.action == "probe"
     assert plan.candidate == {"x": 0.6}
@@ -148,31 +135,9 @@ def test_graph_preserves_confirmation_and_skips_final_manual_loop(monkeypatch):
 
 
 def test_graph_optimization_forwards_agent_settings(tmp_path, monkeypatch):
-    from src.agents import graph
-    from src.agents.subagents.tools import _common
-    config = cfg(tmp_path)
-    seen = []
-    class Driver:
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-        def open(self, path): pass
-    monkeypatch.setattr(_common, "_import_pareto_deps", lambda: None)
-    monkeypatch.setattr(_common, "_load_optimize_config", lambda p: (config, Path("mock.bkp"), {}))
-    monkeypatch.setattr(_common, "_AspenDriver", Driver)
-    monkeypatch.setattr(_common, "_resolve_config_path", lambda p: Path(p))
-    def optimize(**kw):
-        seen.append(kw["config"])
-        return SimpleNamespace(early_stop_reason="evaluation_budget:completed_verified")
-    monkeypatch.setattr(_common, "_optimize_pareto_fn", optimize)
-    from src.agents.subagents.tools import optimize_pareto
-    monkeypatch.setattr(optimize_pareto, "_fmt_pareto_result_summary", lambda *a: "ok")
-    result = graph.optimization_node(graph.PAOGraphState(
-        config_yaml_path=str(tmp_path / "cfg.yaml"), agent_loop={"enabled": True, "max_evaluations": 6},
-        agent_checkpoint_path=str(tmp_path / "custom.db"), agent_resume=True,
-    ))
-    assert seen[0].agent_loop["max_evaluations"] == 6
-    assert seen[0].agent_resume
-    assert result["termination_reason"].endswith("completed_verified")
+    from src.agents.orchestration.graph import optimization_node
+    with pytest.raises(PermissionError, match="disabled"):
+        optimization_node(None)
 
 
 def test_config_fingerprints_custom_objectives_and_model():

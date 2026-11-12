@@ -194,44 +194,17 @@ def parse_action_from_dict(data: dict) -> Action:
         >>> isinstance(action, ContinueAction)
         True
     """
-    action_type = data.get("action", "continue")
-
-    if action_type == "continue":
-        return ContinueAction(
-            hypothesis=data["hypothesis"],
-            evidence_case_ids=data.get("evidence_case_ids", []),
-            knowledge_ids=data.get("knowledge_ids", []),
-            batch_size=data.get("batch_size", 5),
-            expected_effect=data.get("expected_effect", "feasibility"),
-            initialization=data.get("initialization", "reset"),
-        )
-    elif action_type == "set_region":
-        return SetRegionAction(
-            hypothesis=data["hypothesis"],
-            evidence_case_ids=data.get("evidence_case_ids", []),
-            knowledge_ids=data.get("knowledge_ids", []),
-            search_region=data.get("search_region", {}),
-            batch_size=data.get("batch_size", 5),
-            expected_effect=data.get("expected_effect", "feasibility"),
-            initialization=data.get("initialization", "reset"),
-        )
-    elif action_type == "probe":
-        return ProbeAction(
-            hypothesis=data["hypothesis"],
-            evidence_case_ids=data.get("evidence_case_ids", []),
-            knowledge_ids=data.get("knowledge_ids", []),
-            candidate=data.get("candidate", {}),
-            repeat=data.get("repeat", False),
-            expected_effect=data.get("expected_effect", "information"),
-            initialization=data.get("initialization", "reset"),
-        )
-    elif action_type == "stop":
-        return StopAction(
-            hypothesis=data["hypothesis"],
-            evidence_case_ids=data.get("evidence_case_ids", []),
-            knowledge_ids=data.get("knowledge_ids", []),
-            expected_effect=data.get("expected_effect", "feasibility"),
-            initialization=data.get("initialization", "reset"),
-        )
-    else:
-        raise ValueError(f"未知的 action 类型：{action_type!r}")
+    from .contracts import ActionPlan
+    plan = ActionPlan.parse(data)
+    if plan.action != "set_region" and plan.search_region or plan.action != "probe" and plan.candidate:
+        raise ValueError("Action parameters do not match action type")
+    common = {k: data[k] for k in ("hypothesis", "evidence_case_ids", "knowledge_ids", "expected_effect", "initialization")}
+    if plan.action == "continue":
+        return ContinueAction(**common, batch_size=plan.batch_size)
+    if plan.action == "set_region":
+        return SetRegionAction(**common, batch_size=plan.batch_size, search_region=plan.search_region)
+    if plan.action == "probe":
+        if plan.batch_size != 1:
+            raise ValueError("Probe requires batch_size 1")
+        return ProbeAction(**common, candidate=plan.candidate, repeat=plan.repeat)
+    return StopAction(**common)

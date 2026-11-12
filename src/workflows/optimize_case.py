@@ -33,8 +33,8 @@ Phase 2 — 贝叶斯优化循环（共 n_iterations - n_initial 次）：
 代理模型后端
 -----------
 默认使用 scikit-optimize（skopt）的高斯过程回归。
-若未安装 skopt，自动回退到随机采样并记录 WARNING。
-若未安装 numpy，LHS 采样退化为均匀随机采样。
+若未安装所选算法的 skopt 后端，真实执行前停止。
+未安装 numpy 时使用相同的纯 Python 分层 LHS。
 
 失败工况处理
 -----------
@@ -72,6 +72,7 @@ Phase 2 — 贝叶斯优化循环（共 n_iterations - n_initial 次）：
     print(f"最优参数：{result.best_case.design_vars}")
 """
 from __future__ import annotations
+from src.agents.actions.authorization import authorized_workflow, ExecutionBoundaryError
 
 import logging
 import random as _random
@@ -312,6 +313,7 @@ class OptimizeResult:
 # 主入口
 # ---------------------------------------------------------------------------
 
+@authorized_workflow
 def optimize_case(
     driver: AspenDriver,
     config: OptimizeCaseConfig,
@@ -337,6 +339,8 @@ def optimize_case(
     OptimizeResult
     """
     _validate_config(config)
+    from src.agents.actions.plans import preflight_optimizer
+    preflight_optimizer(config)
 
     paths = list(config.param_bounds.keys())
     bounds = [config.param_bounds[p] for p in paths]
@@ -448,6 +452,8 @@ def optimize_case(
             _log.info("  → status=%s, success=%s, run_time=%.1fs",
                       case.status.value, case.success, case.run_time)
             break
+        except ExecutionBoundaryError:
+            raise
         except Exception as exc:
             _log.warning(
                 "初始 DOE [%d/%d]：run_case() 意外异常（已隔离）：%s",
@@ -500,7 +506,7 @@ def optimize_case(
         if n_success_so_far < config.n_initial_min:
             _log.warning(
                 "初始 DOE 成功样本数 %d < n_initial_min=%d，"
-                "贝叶斯优化循环将以随机采样替代高斯过程。",
+                "继续算法定义的初始采样，达到样本阈值后使用指定后端。",
                 n_success_so_far, config.n_initial_min,
             )
 
@@ -728,6 +734,8 @@ def optimize_case(
                 _log.info("  → status=%s, success=%s, run_time=%.1fs",
                           case.status.value, case.success, case.run_time)
                 break
+            except ExecutionBoundaryError:
+                raise
             except Exception as exc:
                 _log.warning(
                     "贝叶斯优化 [%d/%d]：run_case() 意外异常（已隔离）：%s",
@@ -938,7 +946,7 @@ def _lhs_sample(
     每个维度分成 n 个等间隔区间，每个区间内随机取一个点，
     并对各维度独立随机排列，保证样本在参数空间中均匀分布。
 
-    若 numpy 不可用，退化为均匀随机采样（仍可用，但空间覆盖性较差）。
+    若 numpy 不可用，使用纯 Python 的相同分层 LHS 定义。
     """
     d = len(bounds)
     if _HAS_NUMPY:
@@ -1033,6 +1041,8 @@ def _save_case(db: Any, case: ProcessCase) -> None:
         return
     try:
         db.save_case(case.to_dict())
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:
         _log.warning("工况 '%s' 保存到数据库失败（已忽略）：%s", case.case_id, exc)
 
@@ -1048,6 +1058,8 @@ def _fire_callback(
         return
     try:
         callback(case, idx, total)
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:
         _log.warning("on_case_complete 回调异常（已忽略）：%s", exc)
 

@@ -258,7 +258,13 @@ def setup_logging(
             root.removeFilter(filt)
 
     # 控制台 handler（stderr，避免与 Aspen COM stdout 混淆）
+    try:
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, OSError, ValueError):
+        pass
     console = logging.StreamHandler(sys.stderr)
+    console.addFilter(lambda record: not getattr(record, "pao_file_only", False))
     console.setLevel(console_level)
     console.addFilter(_ContextFilter())
     if user_console:

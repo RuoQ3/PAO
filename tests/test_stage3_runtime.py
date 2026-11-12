@@ -1,6 +1,9 @@
 """Stage 3 bounded orchestration tests with fake Subagents."""
 from __future__ import annotations
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 
+import pytest
 import asyncio
 import time
 
@@ -19,10 +22,10 @@ def test_retry_is_bounded_and_audit_records_attempts():
         return TaskResult(task.task_id, task.agent, summary="recovered")
 
     runtime = OrchestrationRuntime({"flaky": flaky}, policy=RuntimePolicy(max_retries=2, total_budget=2))
-    result = runtime.run([TaskSpec(agent="flaky", retry_attempts=2, budget=2)])[0]
-    assert result.status is TaskStatus.COMPLETED
-    assert calls == [1, 2]
-    assert any(e["event"] == "task_retry" for e in runtime.audit)
+    with pytest.raises(AgentUnavailableError):
+        runtime.run([TaskSpec(agent="flaky", retry_attempts=2, budget=2)])
+    assert calls == [1]
+    assert not any(e["event"] == "task_retry" for e in runtime.audit)
 
 
 def test_timeout_is_structured_and_does_not_block_other_task():
@@ -34,19 +37,17 @@ def test_timeout_is_structured_and_does_not_block_other_task():
         return TaskResult(task.task_id, task.agent, summary="ok")
 
     runtime = OrchestrationRuntime({"slow": slow, "fast": fast}, policy=RuntimePolicy(max_concurrency=2, total_budget=2))
-    slow_result, fast_result = runtime.run([
-        TaskSpec(agent="slow", timeout_seconds=0.02), TaskSpec(agent="fast")
-    ])
-    assert slow_result.status is TaskStatus.TIMEOUT
-    assert fast_result.status is TaskStatus.COMPLETED
+    with pytest.raises(AgentUnavailableError) as error:
+        runtime.run([TaskSpec(agent="slow", timeout_seconds=.02), TaskSpec(agent="fast")])
+    assert error.value.code == 'subagent_timeout'
 
 
 def test_cancel_before_dispatch_is_structured():
     task = TaskSpec(agent="worker")
     runtime = OrchestrationRuntime({"worker": lambda task, **_: TaskResult(task.task_id, task.agent, summary="bad")})
     runtime.cancel(task.task_id)
-    result = runtime.run([task])[0]
-    assert result.status is TaskStatus.CANCELLED
+    with pytest.raises(AgentUnavailableError):
+        runtime.run([task])
     assert any(e["event"] == "task_cancel_requested" for e in runtime.audit)
 
 
@@ -59,9 +60,8 @@ def test_recursion_and_duplicate_signature_are_rejected():
     deep = TaskSpec(agent="worker", prompt="deep", recursion_depth=2)
     one = TaskSpec(agent="worker", prompt="same")
     two = TaskSpec(agent="worker", prompt="same")
-    results = runtime.run([deep, one, two])
-    assert results[0].status is TaskStatus.CANCELLED
-    assert results[2].status is TaskStatus.CANCELLED
+    with pytest.raises(AgentUnavailableError):
+        runtime.run([deep, one, two])
     assert any(e["event"] == "task_loop_detected" for e in runtime.audit)
 
 

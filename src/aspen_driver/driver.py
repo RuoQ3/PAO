@@ -76,21 +76,11 @@ class AspenDriver:
     # ------------------------------------------------------------------ #
 
     def connect(self) -> None:
-        """
-        创建 Aspen Plus ActiveX Automation Server 实例。
+        """Create a dedicated DispatchEx application on its owned COM STA.
 
-        在 STA 专用后台线程中执行 EnsureDispatch，触发 win32com gencache，
-        填充 win32com.client.constants（含 HAPAttributeNumber 枚举），
-        并将已验证的常量存入 self._hap_constants。
-
-        Parameters（构造时传入）
-        -------------------------
-        require_type_library:
-            True：EnsureDispatch 失败时直接抛出 AspenConnectionError，
-                  适用于需要可靠节点元数据（info()）的场景。
-            False（默认）：EnsureDispatch 失败时回退到 Dispatch 并记录
-                  WARNING，self._hap_constants 保持 None，
-                  AspenNode.info() 调用时会抛出 AspenNodeError。
+        HAP constants must already be available from an installed type library.
+        Missing constants remain explicit; no user instance or shared cache is
+        modified to recover them.
         """
         if self._app is not None:
             return
@@ -113,68 +103,12 @@ class AspenDriver:
         注意：CoInitialize() 已由 ComApartment._run_loop() 处理，此处不调用。
         此方法只能通过 _com_apt.submit() 在 STA 线程内调用，不可直接调用。
         """
-        gencache_ok = False
-        try:
-            self._app = win32com.client.gencache.EnsureDispatch(self._prog_id)
-            gencache_ok = True
-        except AttributeError as gc_exc:
-            # win32com gen_py 缓存损坏（CLSIDToPackageMap 缺失等），清除后重试。
-            # 常见于 pywin32 升级后或缓存文件被部分删除的情况。
-            _log.warning(
-                "EnsureDispatch('%s') 遇到缓存损坏错误（%s），尝试清除 gen_py 缓存后重试。",
-                self._prog_id, gc_exc,
-            )
-            try:
-                import shutil, os, sys, tempfile
-                gen_py_dir = os.path.join(tempfile.gettempdir(), "gen_py")
-                if os.path.isdir(gen_py_dir):
-                    shutil.rmtree(gen_py_dir)
-                    _log.info("已清除 gen_py 缓存目录：%s", gen_py_dir)
-                # 磁盘缓存删除后，Python 内存中仍持有旧模块引用，
-                # 必须同步清除，否则重试时仍会拿到损坏的过期模块。
-                stale = [k for k in list(sys.modules.keys()) if "gen_py" in k]
-                for k in stale:
-                    del sys.modules[k]
-                if stale:
-                    _log.info("已从 sys.modules 清除 %d 个过期 gen_py 条目。", len(stale))
-                win32com.client.gencache.is_readonly = False
-                self._app = win32com.client.gencache.EnsureDispatch(self._prog_id)
-                gencache_ok = True
-                _log.info("清除缓存后 EnsureDispatch 成功。")
-            except Exception as retry_exc:
-                gc_exc = retry_exc
-                if self._require_type_library:
-                    raise AspenTypeLibraryError(
-                        f"EnsureDispatch 失败，无法加载 Aspen type library：{gc_exc}。"
-                        "若不需要节点元数据（info()），可设置 require_type_library=False。"
-                    ) from gc_exc
-                _log.warning(
-                    "清除缓存后 EnsureDispatch 仍失败（%s），回退到 Dispatch。"
-                    "hap_constants 将不可用，AspenNode.info() 调用时会抛出错误。",
-                    gc_exc,
-                )
-                self._app = win32com.client.Dispatch(self._prog_id)
-        except Exception as gc_exc:
-            if self._require_type_library:
-                raise AspenTypeLibraryError(
-                    f"EnsureDispatch 失败，无法加载 Aspen type library：{gc_exc}。"
-                    "若不需要节点元数据（info()），可设置 require_type_library=False。"
-                ) from gc_exc
-            _log.warning(
-                "EnsureDispatch('%s') 失败（%s），回退到 Dispatch。"
-                "hap_constants 将不可用，AspenNode.info() 调用时会抛出错误。"
-                "运行 scripts/verify_hap_constants.py 诊断。",
-                self._prog_id, gc_exc,
-            )
-            self._app = win32com.client.Dispatch(self._prog_id)
-
-        if gencache_ok:
-            self._hap_constants = self._load_hap_constants_from_cache()
-            if self._require_type_library and self._hap_constants is None:
-                raise AspenTypeLibraryError(
-                    "EnsureDispatch 成功，但 HAP 常量加载不完整。"
-                    "运行 scripts/verify_hap_constants.py 诊断缺失的常量。"
-                )
+        # DispatchEx requests a new application object, never the ROT instance
+        # potentially owned by the user. Do not delete shared gen_py caches.
+        self._app = win32com.client.DispatchEx(self._prog_id)
+        self._hap_constants = self._load_hap_constants_from_cache()
+        if self._require_type_library and self._hap_constants is None:
+            raise AspenTypeLibraryError("HAP constants unavailable for dedicated instance")
 
         self._configure_application()
 
@@ -198,26 +132,37 @@ class AspenDriver:
         return None
 
     def disconnect(self) -> None:
-        """释放 COM 对象并关闭 Aspen Plus 实例。"""
+        """Close only our DispatchEx instance; report every cleanup failure."""
+        errors = []
         if self._app is not None:
             try:
-                self._com_apt.submit(self._close_application)
-            except Exception:
-                pass
-            finally:
-                self._app = None
-                self._filepath = None
-                self._hap_constants = None
-                self._mutation_count = 0
-        # 停止 STA 线程（CoUninitialize 在线程内执行）
-        self._com_apt.shutdown()
+                self._com_apt.submit(self._close_application, timeout=2.0, cleanup=True)
+            except Exception as exc:
+                errors.append(str(exc))
+        try:
+            self._com_apt.shutdown(timeout=2.0)
+        except Exception as exc:
+            errors.append(str(exc))
+        if errors:
+            self._needs_recovery = True
+            raise AspenRunError("cleanup incomplete: " + "; ".join(errors))
+        self._app = None
+        self._filepath = None
+        self._hap_constants = None
+        self._mutation_count = 0
 
     def __enter__(self) -> AspenDriver:
         self.connect()
         return self
 
-    def __exit__(self, *_: Any) -> None:
-        self.disconnect()
+    def __exit__(self, exc_type, primary, traceback) -> None:
+        try:
+            self.disconnect()
+        except Exception as cleanup:
+            if primary is None:
+                raise
+            primary.cleanup_errors = list(getattr(primary, "cleanup_errors", [])) + [str(cleanup)]
+            _log.error("cleanup incomplete after primary failure: %s", cleanup)
 
     # ------------------------------------------------------------------ #
     # 文件操作
@@ -227,6 +172,8 @@ class AspenDriver:
         """
         打开 Aspen Plus 仿真文件（.bkp / .apw / .apwz）。
         """
+        from src.agents.actions.authorization import check_model_open
+        check_model_open(filepath)
         self._require_connection()
         path = Path(filepath).resolve()
         if not path.exists():
@@ -243,30 +190,11 @@ class AspenDriver:
 
     def save(self, filepath: str | Path | None = None, overwrite: bool = True) -> None:
         """保存仿真文件。若不指定路径则保存到当前打开的文件。"""
-        self._require_connection()
-        target = Path(filepath).resolve() if filepath else self._filepath
-        if target is None:
-            raise AspenFileError("未指定保存路径，且当前没有打开的文件。")
-
-        try:
-            if filepath is None or target == self._filepath:
-                self._com_apt.submit(lambda: self._app.Save())
-            else:
-                self._com_apt.submit(lambda: self._app.SaveAs(str(target), overwrite))
-                self._filepath = target
-        except Exception as exc:
-            raise AspenFileError(f"保存失败：{exc}") from exc
+        raise PermissionError("Saving Aspen documents requires a separate approved file-write plan; disabled")
 
     def write_archive(self, filepath: str | Path, save_children: bool = True) -> None:
         """导出 Aspen Plus backup/archive 文件。"""
-        self._require_connection()
-        target = Path(filepath).resolve()
-        try:
-            self._com_apt.submit(
-                lambda: self._app.WriteArchive2(str(target), int(save_children))
-            )
-        except Exception as exc:
-            raise AspenFileError(f"导出 archive 文件失败：{exc}") from exc
+        raise PermissionError("Writing Aspen archives requires a separate approved file-write plan; disabled")
 
     # ------------------------------------------------------------------ #
     # 仿真控制
@@ -274,6 +202,8 @@ class AspenDriver:
 
     def reinit(self) -> None:
         """重新初始化仿真（清除结果，保留输入）。"""
+        from src.agents.actions.authorization import require_authorization
+        require_authorization()
         self._require_connection()
         try:
             self._com_apt.submit(lambda: self._app.Reinit())
@@ -281,27 +211,28 @@ class AspenDriver:
             raise AspenRunError(f"重新初始化失败：{exc}") from exc
 
     def run(self, timeout: float = _RUN_TIMEOUT) -> None:
-        """运行仿真，阻塞直到完成或超时。
+        """Run on the owned STA with cooperative Stop at the deadline.
 
-        整个运行循环（Run2 启动、IsRunning 轮询、PumpWaitingMessages）
-        在 STA 线程内完成，调用线程只阻塞等待最终结果。
-
-        com_timeout = timeout + 30s，为 Stop() 和清理留出余量。
-
-        超时或启动失败时，除抛出异常外还会置 _needs_recovery=True，
-        提示上层在下一次运行前调用 recover() 重建 COM 连接——
-        因为超时后 Aspen 引擎常处于不一致状态，后续 Run2 会连续抛
-        COM 异常（DISP_E_EXCEPTION），不重建连接则整轮 DOE 全部报废。
+        Timeout/start failure marks the unit unknown. No automatic reconnect
+        or retry is allowed. The caller's bounded wait and cleanup status are
+        tracked separately by ExecutionUnit; Stop return is not termination.
         """
+        from src.agents.actions.authorization import check_run
+        grant = check_run(started=False)
         self._require_connection()
         import pythoncom as _pythoncom  # 在 STA 线程内使用，不在模块顶部导入
         com_timeout = timeout + 30.0
 
         def _run_on_com_thread() -> None:
+            request = getattr(self, "stop_requested", None)
+            if grant.closed or request is not None and request.is_set() or time.monotonic() >= grant.deadline:
+                raise AspenRunError("execution deadline/stop reached before engine start; model not run")
             engine = self._app.Engine
             _log.debug("driver.run: 调用 Run2(True)，IsRunning=%s",
                        self._engine_is_running(engine))
             try:
+                # Count the engine invocation itself, even if its outcome is unknown.
+                grant.started_runs += 1
                 engine.Run2(True)
             except Exception as exc:
                 # Run2 启动即抛异常，通常是上一次超时残留的坏连接
@@ -318,11 +249,11 @@ class AspenDriver:
                     _pythoncom.PumpWaitingMessages()
                 except Exception:
                     pass
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= deadline or getattr(self, "stop_requested", None) is not None and self.stop_requested.is_set():
                     try:
                         engine.Stop()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        raise AspenRunError(f"deadline exceeded; stop failed; execution unknown: {exc}") from exc
                     raise AspenRunTimeoutError(timeout)
                 time.sleep(self._POLL_INTERVAL)
                 poll_count += 1
@@ -434,6 +365,8 @@ class AspenDriver:
 
     def set_value(self, path: str, value: Any) -> None:
         """向指定树路径写入值（FindNode + 赋值在 STA 线程内原子执行）。"""
+        from src.agents.actions.authorization import check_write
+        check_write(path, value)
         def _do() -> None:
             node = self._app.Tree.FindNode(path)
             if node is None:
@@ -520,57 +453,16 @@ class AspenDriver:
 
     @property
     def needs_recovery(self) -> bool:
-        """
-        底层 COM/引擎是否处于需要重建的不一致状态。
-
-        在仿真超时或 Run2 启动异常后置为 True。上层运行循环应在每次
-        run 前检查此标志,为 True 时先调用 recover(),避免坏连接导致
-        后续所有仿真连锁失败(DISP_E_EXCEPTION)。
-        """
+        """Unknown execution/COM state; this driver must not be reused."""
         return self._needs_recovery
 
     def recover(self) -> bool:
-        """
-        重建 Aspen COM 连接并重新打开当前文件，清除 needs_recovery 标志。
-
-        用于超时/COM 崩溃后的执行层自愈：彻底断开旧连接（释放损坏的 COM
-        对象和 STA 线程），重新创建 ComApartment，再 connect() + open()。
-        整个过程与具体工艺无关。
-
-        Returns
-        -------
-        bool
-            True  恢复成功，可继续运行后续工况。
-            False 恢复失败（连接或打开文件抛异常），调用方应终止本轮优化。
-            无论成败，_needs_recovery 都会被清零（失败时由上层据返回值终止）。
-        """
-        saved_filepath = self._filepath
-        _log.warning(
-            "driver.recover: 检测到 COM 需恢复，开始重建连接(file=%s)。",
-            saved_filepath,
-        )
-        # 先彻底断开旧连接，释放可能损坏的 COM 对象并停止 STA 线程
-        try:
-            self.disconnect()
-        except Exception as exc:  # noqa: BLE001
-            _log.warning("driver.recover: disconnect 阶段异常（已忽略，继续重连）：%s", exc)
-
-        # disconnect() 已 shutdown 旧 _com_apt；创建新实例供下次 connect() 使用
-        self._com_apt = ComApartment()
-        self._needs_recovery = False
-        try:
-            self.connect()
-            if saved_filepath is not None:
-                self.open(saved_filepath)
-            _log.info("driver.recover: COM 连接已重建，文件已重新打开。")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            _log.error("driver.recover: 重建连接失败，本轮优化应终止：%s", exc)
-            return False
+        raise AspenRunError("unknown execution cannot be retried or reconnected automatically; inspect resources and approve a new plan")
 
     def clear_recovery_flag(self) -> None:
-        """手动清除 needs_recovery 标志（上层已用其他方式处理时使用）。"""
-        self._needs_recovery = False
+        """Unknown units cannot be made reusable by clearing a boolean."""
+        if self._needs_recovery:
+            raise AspenRunError("unknown execution cannot be cleared; inspect resources and create a new approved unit")
 
     def _require_connection(self) -> None:
         if self._app is None:
@@ -621,8 +513,9 @@ class AspenDriver:
             try:
                 call()
                 return
-            except Exception:
-                continue
+            except Exception as exc:
+                last_error = exc
+        raise AspenRunError(f"application close failed: {last_error}")
 
     def _release_com(self) -> None:
         """已废弃：CoInitialize/CoUninitialize 改由 ComApartment 内部管理。保留为空操作确保兼容性。"""

@@ -1,21 +1,4 @@
-"""
-tools.py — BoundaryAdvisor agent 的确定性工具函数。
-
-职责（不含任何 LLM 调用，纯计算/解析/文本写回，便于单测）：
-  - VarMeta：单个变量的输入元信息容器。
-  - build_variables_block：把变量元信息渲染成给 LLM 的文本清单。
-  - parse_llm_boundary_json：稳健解析 LLM 返回的 JSON（容忍代码围栏/前后缀）。
-  - heuristic_k：无 LLM（缺 key 或调用失败）时的规则兜底，从单位+初始值推断 k。
-  - bounds_from_k：把 k_lo/k_hi + 初始值 + 全局边界 换算成最终搜索边界。
-  - plan_yaml_edits / apply_yaml_edits：文本级精确改写 YAML 边界,保留全部注释。
-
-设计原则：
-  - 所有函数对缺失字段、异常输入都返回安全默认值，绝不抛异常给上层。
-  - heuristic_k 与 SYSTEM_PROMPT 的物理规则保持一致，作为 LLM 不可用时的退路，
-    保证 boundary_advisor 在无网络/无 key 环境下仍能产出合理边界。
-  - YAML 写回用文本级正则替换(非 yaml.dump),只改边界数值行,
-    完整保留用户文件里的注释、缩进、MATLAB 对齐说明等。
-"""
+"""Read-only evidence formatting and explicit numerical tools; no Agent fallback."""
 from __future__ import annotations
 
 import json
@@ -83,107 +66,13 @@ def build_variables_block(variables: list[VarMeta]) -> str:
 # 解析 LLM JSON
 # ---------------------------------------------------------------------------
 
-def parse_llm_boundary_json(text: str) -> dict | None:
-    """稳健解析 LLM 返回的边界 JSON。
-
-    容忍以下情况：
-      - 回复被 ```json ... ``` 代码围栏包裹
-      - JSON 前后有少量散文
-    解析失败返回 None(由上层降级到 heuristic_k)。
-    """
-    if not text or not text.strip():
-        return None
-
-    # 去掉 markdown 代码围栏
-    cleaned = text.strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL)
-    if fence:
-        cleaned = fence.group(1)
-    else:
-        # 截取第一个 { 到最后一个 } 之间的内容
-        lo = cleaned.find("{")
-        hi = cleaned.rfind("}")
-        if lo != -1 and hi != -1 and hi > lo:
-            cleaned = cleaned[lo:hi + 1]
-
-    try:
-        obj = json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError) as exc:
-        _log.warning("boundary_advisor：LLM JSON 解析失败：%s", exc)
-        return None
-
-    if not isinstance(obj, dict) or "variables" not in obj:
-        _log.warning("boundary_advisor：LLM JSON 缺少 'variables' 字段。")
-        return None
-    return obj
 
 
-def extract_k_map(parsed: dict) -> dict[str, tuple[float, float]]:
-    """从解析后的 JSON 提取 {name: (k_lo, k_hi)}，并裁剪到 [1.2, 5.0]。
-
-    非法/缺失项跳过,由上层用 heuristic_k 补齐。
-    """
-    result: dict[str, tuple[float, float]] = {}
-    for item in parsed.get("variables", []):
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if not name:
-            continue
-        try:
-            k_lo = float(item.get("k_lo"))
-            k_hi = float(item.get("k_hi"))
-        except (TypeError, ValueError):
-            continue
-        k_lo = _clamp(k_lo, 1.2, 5.0)
-        k_hi = _clamp(k_hi, 1.2, 5.0)
-        result[str(name)] = (k_lo, k_hi)
-    return result
 
 
 # ---------------------------------------------------------------------------
-# 规则兜底（无 LLM 时使用，与 SYSTEM_PROMPT 物理规则一致）
 # ---------------------------------------------------------------------------
 
-def heuristic_k(v: VarMeta) -> tuple[float, float, str]:
-    """无 LLM 时,从单位+初始值规则推断 (k_lo, k_hi, reason)。
-
-    与 SYSTEM_PROMPT 的物理规则保持一致,保证降级路径也产出合理边界。
-    """
-    unit = (v.unit or "").lower()
-    role = (v.semantic_role or "").lower()
-    iv = v.initial_value
-
-    # 压力：从单位 + 初始值量级判断真空/常压/加压
-    if "atm" in unit or "bar" in unit or "pa" in unit or "psi" in unit or "pressure" in role:
-        if iv is not None and _to_atm_like(iv, unit) < 0.5:
-            return 2.0, 2.5, "压力单位但初值远低于常压,判真空操作,高敏感,小 k 锁初值"
-        return 2.5, 3.0, "压力变量,中等 k"
-
-    # 回流比
-    if "reflux" in role or "basis_rr" in v.name.lower() or "rr" == role:
-        if iv is not None and iv < 1.0:
-            return 2.0, 2.5, "低回流比系统,对分离/能耗高敏感,小 k"
-        return 2.5, 3.0, "回流比变量,中等偏小 k"
-
-    # 塔板数
-    if "nstage" in v.name.lower() or "nstage" in role or "stage" in role and v.var_type == "integer":
-        return 3.0, 3.0, "塔板数对收敛相对迟钝,较大 k 保留探索"
-
-    # 进料板比例 / 位置
-    if "feed" in role or "frac" in v.name.lower() or "feed_stage" in role:
-        return 2.5, 2.5, "进料位置受塔板数约束,中等 k"
-
-    # 流量（杠杆变量,保守）
-    if "flow" in role or "kmol" in unit or "kg/hr" in unit or "mol/s" in unit or "sol" in v.name.lower():
-        return 2.0, 2.5, "流量常为可行域杠杆变量,保守小 k"
-
-    # 温度
-    if "temperature" in role or unit in ("c", "k", "f", "°c", "°k", "°f"):
-        return 2.5, 3.0, "温度变量,中等 k"
-
-    # 默认：中等保守
-    return 2.5, 2.5, "未识别类型,取中等保守 k"
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +97,7 @@ def bounds_from_k(
       - var_type == "derived",或全局边界落在 [0,1] 内(归一化变量)→ 用对称偏移。
       - 初始值 <= 0 或缺失 → 用对称偏移(以全局中点或初值为中心)。
       - 其他正量 → 乘除式。
-    结果一律用 lower_global/upper_global 裁剪;非法时回退全局边界或 None。
+    结果一律用 lower_global/upper_global 裁剪;非法时返回 None。
 
     Returns
     -------
@@ -234,7 +123,7 @@ def bounds_from_k(
         lo = max(glo, center - half)
         hi = min(ghi, center + half)
         if lo >= hi:
-            return (glo, ghi)
+            return None
         return (lo, hi)
 
     # ── 模式 A：乘除式(跨量级正量)────────────────────────────────────
@@ -249,7 +138,7 @@ def bounds_from_k(
 
     if lo >= hi:
         if glo is not None and ghi is not None and glo < ghi:
-            return (glo, ghi)
+            return None
         return None
     return (lo, hi)
 

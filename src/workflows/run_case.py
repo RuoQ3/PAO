@@ -28,6 +28,7 @@ ConstraintFn: (ProcessCase) -> ConstraintValue
 函数内部不应修改 case，只读取数据并返回计算结果。
 """
 from __future__ import annotations
+from src.agents.actions.authorization import evaluated_case
 
 import logging
 import math
@@ -245,6 +246,7 @@ class RunCaseConfig:
 # 主入口
 # ---------------------------------------------------------------------------
 
+@evaluated_case
 def run_case(
     driver: AspenDriver,
     design_vars: dict[str, Any],

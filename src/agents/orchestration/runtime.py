@@ -1,5 +1,6 @@
 """Bounded, auditable execution runtime for PAO Subagents."""
 from __future__ import annotations
+from src.agents.errors import AgentUnavailableError, unavailable, failure_from
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ class TaskPlanner:
             planned.append(task)
             previous = task.task_id
         if not planned:
-            planned.append(TaskSpec(task_type=intent.task_type, prompt=prompt, agent="general_agent", budget=1))
+            raise unavailable("agent_output_invalid", stage="task_planner")
         return planned
 
     @staticmethod
@@ -54,7 +55,7 @@ class TaskPlanner:
         return {
             "project_researcher": ["read_files", "read_yaml", "read_node_db", "read_simulation_db"],
             "process_advisor": ["read_process_context", "read_node_db", "read_simulation_db"],
-            "optimization_advisor": ["read_yaml", "read_simulation_db", "read_checkpoint"],
+            "optimization_advisor": ["read_yaml", "read_simulation_db", "read_checkpoint", "plan_optimization"],
             "boundary_advisor": ["read_yaml", "read_process_context"],
             "kinetics_advisor": ["read_files", "read_simulation_db"],
             "risk_reviewer": ["read_process_context", "read_checkpoint"],
@@ -81,6 +82,7 @@ class OrchestrationRuntime:
         self._cancelled: set[str] = set()
         self._resident: dict[str, Any] = dict(resident or {})
         self._lock = threading.Lock()
+        self._unavailable = threading.Event()
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
         self.session_id = session_id or hashlib.sha256(str(self.checkpoint_path or id(self)).encode()).hexdigest()[:16]
         self._checkpoint_results: dict[str, TaskResult] = {}
@@ -104,7 +106,7 @@ class OrchestrationRuntime:
         if self.checkpoint_path is None:
             return
         payload = {
-            "version": 1, "session_id": self.session_id, "status": status,
+            "version": 2, "session_id": self.session_id, "status": status,
             "tasks": [task.to_dict() for task in tasks],
             "results": [result.to_dict() for result in results],
             "resident": self.resident_state(), "audit": list(self.audit),
@@ -135,6 +137,8 @@ class OrchestrationRuntime:
         payload = self.checkpoint_state()
         if not payload:
             return
+        if payload.get("version") != 2 or payload.get("status") != "completed":
+            raise unavailable("agent_output_invalid", stage="runtime_restore")
         self.session_id = str(payload.get("session_id") or self.session_id)
         self._resident.update(payload.get("resident") or {})
         self._checkpoint_results = {
@@ -144,6 +148,8 @@ class OrchestrationRuntime:
         self.audit.extend(payload.get("audit") or [])
 
     def run(self, tasks: list[TaskSpec], *, context: Any = None) -> list[TaskResult]:
+        if self._unavailable.is_set():
+            raise unavailable("subagent_unavailable", stage="runtime_disabled")
         tasks = self._normalize(tasks)
         results: dict[str, TaskResult] = dict(self._checkpoint_results)
         tasks = [task for task in tasks if task.task_id not in results]
@@ -187,18 +193,33 @@ class OrchestrationRuntime:
                             results[task.task_id] = TaskResult.failed(task, "task timeout", status=TaskStatus.TIMEOUT)
                             self._record("task_timeout", task_id=task.task_id)
                         unfinished -= expired
-                        continue
+                        self._unavailable.set()
+                        raise unavailable("subagent_timeout", stage="runtime")
                     for future in done:
                         task = futures[future]
                         try:
                             result = future.result()
+                        except AgentUnavailableError:
+                            for pending_future in unfinished:
+                                pending_future.cancel()
+                            raise
                         except Exception as exc:
-                            result = TaskResult.failed(task, f"{type(exc).__name__}: {exc}")
+                            raise failure_from(exc, "subagent") from None
+                        if result.status != TaskStatus.COMPLETED:
+                            self._unavailable.set()
+                            raise unavailable("subagent_unavailable", stage="runtime")
                         results[task.task_id] = result
                         self._record("task_finished", task_id=task.task_id, agent=task.agent,
                                      status=result.status.value, errors=list(result.errors))
                     unfinished -= done
+            except AgentUnavailableError as error:
+                self._unavailable.set()
+                self._record("agent_unavailable", **error.to_dict())
+                self.save_checkpoint(tasks, [], status="unavailable")
+                raise
             finally:
+                for future in unfinished:
+                    future.cancel()
                 pool.shutdown(wait=False, cancel_futures=True)
         ordered = [results[t.task_id] for t in tasks]
         self._checkpoint_results.update(results)
@@ -238,13 +259,14 @@ class OrchestrationRuntime:
             self._record("task_started", task_id=task.task_id, agent=task.agent, attempt=attempt + 1)
             result = self._execute(task, context, attempt=attempt + 1)
             last = result
-            if result.status in {TaskStatus.COMPLETED, TaskStatus.PARTIAL}:
+            if result.status == TaskStatus.COMPLETED:
                 return result
-            if attempt + 1 < self._attempts(task):
-                self._record("task_retry", task_id=task.task_id, attempt=attempt + 2, reason=list(result.errors))
+            raise unavailable("subagent_unavailable", stage="subagent_result")
         return last or TaskResult.failed(task, "task did not execute")
 
     def _execute(self, task: TaskSpec, context: Any, *, attempt: int) -> TaskResult:
+        if self._unavailable.is_set():
+            raise unavailable("subagent_unavailable", stage="runtime_disabled")
         if task.task_id in self._cancelled:
             return TaskResult.failed(task, "task cancelled", status=TaskStatus.CANCELLED)
         if task.recursion_depth > self.policy.max_recursion_depth:
@@ -256,18 +278,27 @@ class OrchestrationRuntime:
             result = handler(task, context=context, tool_allowlist=tuple(task.tool_allowlist),
                             max_steps=task.max_steps, max_tool_calls=self.policy.max_tool_calls_per_task,
                             resident_state=self._resident.get(task.agent), attempt=attempt,
+                            tool_audit=self.audit, stopped=lambda: self._unavailable.is_set() or task.task_id in self._cancelled,
                             is_tool_allowed=lambda name: self.is_tool_allowed(task, name))
             if not isinstance(result, TaskResult):
                 raise TypeError("subagent must return TaskResult")
+            if result.status != TaskStatus.COMPLETED:
+                self._unavailable.set()
+                raise unavailable("subagent_unavailable", stage="subagent_result")
             with self._lock:
-                self._resident[task.agent] = {"task_id": task.task_id, "status": result.status.value,
+                if not self._unavailable.is_set():
+                    self._resident[task.agent] = {"task_id": task.task_id, "status": result.status.value,
                                               "summary": result.summary[:1000], "updated_at": _now()}
             return result
+        except AgentUnavailableError:
+            self._unavailable.set()
+            raise
         except Exception as exc:
-            return TaskResult.failed(task, f"{type(exc).__name__}: {exc}")
+            self._unavailable.set()
+            raise failure_from(exc, "subagent") from None
 
     def _attempts(self, task: TaskSpec) -> int:
-        return 1 + min(max(0, task.retry_attempts), self.policy.max_retries)
+        return 1
 
     @staticmethod
     def _cost(task: TaskSpec) -> int:

@@ -56,6 +56,7 @@ main.py — PAO 命令行入口。
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -264,9 +265,15 @@ def _print_backtest_progress(event: dict) -> None:
     completed, total = event["completed"], event["total"]
     elapsed = event["elapsed_seconds"]
     labels = {"started": "开始执行", "running": "运行中", "completed": "工况完成",
-              "failed": "工况失败", "stopped": "基准预检失败，已停止后续扰动",
+              "failed": "工况失败", "stopped": "已停止派发后续工况；底层状态见执行证据",
+              "timeout": "等待超时，尚未确认底层停止", "cleaning": "正在尝试清理",
+              "cleanup_completed": "工作单元清理流程已返回；Aspen 进程状态见证据",
+              "cleanup_incomplete": "清理未完成，资源状态需核查",
               "finished": "回测结束"}
-    print(f"回测进度 {completed}/{total}：{labels.get(status, status)}（已用时 {elapsed:.0f}s）", flush=True)
+    from src.agents.orchestration.models import Answer
+    from src.reporting.answer_terminal import TerminalRenderer
+    print(TerminalRenderer().render(Answer(
+        f"回测进度 {completed}/{total}：{labels.get(status, status)}（已用时 {elapsed:.0f}s）")), flush=True)
 
 
 def _run_unified_chat_loop(
@@ -275,6 +282,16 @@ def _run_unified_chat_loop(
 ) -> int:
     """Run the unified Lead Agent conversation entry point."""
     from src.agents.lead import ConversationSession, LeadAgent
+    from src.agents.lead.intent import IntentClassifier
+    from src.agents.errors import AgentInternalError, AgentUnavailableError
+    from src.agents.reasoning import configured
+    try:
+        llm_config = configured()
+        IntentClassifier(llm_config=llm_config).classify("Hello")
+    except AgentUnavailableError as exc:
+        print(exc.user_message)
+        log.error("%s: %s", "agent_internal_error" if isinstance(exc, AgentInternalError) else "agent_unavailable", exc.to_dict())
+        return 2
     from src.agents.orchestration import RuntimePolicy, SessionState
     from src.agents.context import ProcessContextBuilder
     from src.agents.actions import ActionGateway
@@ -292,41 +309,102 @@ def _run_unified_chat_loop(
     )
     # Build the gateway at the CLI boundary.  The context remains read-only;
     # Aspen is opened lazily by the runner only after preview + approval.
-    context = builder.build()
-    params = {}
-    for item in list((getattr(context, "variables", {}) or {}).values()) + [
-        p for values in (getattr(context, "equipment_parameters", {}) or {}).values()
-        for p in (values or []) if isinstance(p, dict)
-    ]:
-        path = str(item.get("aspen_path") or item.get("path") or "")
-        if "\\input\\" not in path.casefold():
-            continue
-        params[path] = ParameterSpec(path=path, value_type="int" if str(item.get("type", "")).casefold() in {"int", "integer"} else "float",
-                                     unit=item.get("unit"), minimum=item.get("lower", item.get("lower_bound")),
-                                     maximum=item.get("upper", item.get("upper_bound")), integer=bool(item.get("integer")))
-    schema = ModelSchema(ModelIdentity(str(getattr(context, "model_id", None) or "model")), parameters=params,
-                         current_values=getattr(context, "current_values", {}) or {},
-                         permissions={"inspect", "run_simulation"}, targets=("model", ""))
-    sim_db = SimulationDB(db_path)
-    runner = AspenSandboxRunner(driver_factory=lambda _path: __import__("src.aspen_driver.driver", fromlist=["AspenDriver"]).AspenDriver(),
-                                allowed_paths=set(params), require_path_whitelist=True,
-                                progress_callback=_print_backtest_progress)
-    gateway = ActionGateway(schema, simulation_runner=runner, simulation_db=sim_db)
+    sim_db = None
+    def create_gateway():
+        nonlocal sim_db
+        context = builder.build(session=session.state)
+        params = {}
+        for item in [
+            p for values in (getattr(context, "equipment_parameters", {}) or {}).values()
+            for p in (values or []) if isinstance(p, dict)
+        ] + list((getattr(context, "variables", {}) or {}).values()):
+            path = str(item.get("aspen_path") or item.get("path") or "")
+            if "\\input\\" not in path.casefold():
+                continue
+            params[path] = ParameterSpec(path=path, value_type="int" if str(item.get("type", "")).casefold() in {"int", "integer"} else "float",
+                                         unit=item.get("unit"), writable=item.get("authorized", item.get("tunable", path in {v.get("aspen_path") or v.get("path") for v in (getattr(context, "variables", {}) or {}).values()})) is True, minimum=item.get("lower", item.get("lower_bound")),
+                                         maximum=item.get("upper", item.get("upper_bound")), integer=bool(item.get("integer")))
+        schema = ModelSchema(ModelIdentity(str(getattr(context, "model_id", None) or "model")), parameters=params,
+                             model_path=str(builder.resolve_model_resource(session=session.state).path or ""),
+                             config_path=str(yaml_path) if yaml_path else None,
+                             current_values=getattr(context, "current_values", {}) or {},
+                             permissions={"inspect", "run_simulation"}, targets=("model", ""))
+        sim_db = SimulationDB(db_path)
+        runner = AspenSandboxRunner(driver_factory=lambda _path: __import__("src.aspen_driver.driver", fromlist=["AspenDriver"]).AspenDriver(),
+                                    allowed_paths=set(params), require_path_whitelist=True,
+                                    progress_callback=_print_backtest_progress)
+        return ActionGateway(schema, simulation_runner=runner, simulation_db=sim_db)
+    class LazyGateway:
+        instance = None
+        def __getattr__(self, name):
+            if self.instance is None:
+                self.instance = create_gateway()
+            return getattr(self.instance, name)
+    gateway = LazyGateway()
     session = ConversationSession(SessionState(), LeadAgent(
         policy=RuntimePolicy(allow_writes=False), context_builder=builder,
-        action_gateway=gateway, use_llm=True))
+        action_gateway=gateway, use_llm=True, llm_config=llm_config))
+    from src.reporting.answer_terminal import TerminalRenderer
+    from src.reporting.answer_export import markdown_answer
+    from src.agents.orchestration.models import Answer
+    renderer = TerminalRenderer()
+    audit_path = (db_path.parent if db_path else config_path.parent) / f"conversation-{session.state.session_id}.jsonl"
+    audit_cursor = 0
+
+    def save_audit():
+        nonlocal audit_cursor
+        from src.agents.reasoning import redact
+        events = session.state.audit_events[audit_cursor:]
+        if events:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with audit_path.open("a", encoding="utf-8") as stream:
+                for event in events:
+                    stream.write(json.dumps(redact(event, llm_config), ensure_ascii=False, default=str) + "\n")
+            audit_cursor += len(events)
     print("\nPAO Lead Agent conversation")
-    print("输入问题，输入 exit 退出")
+    print("输入问题，exit 退出；/details 查看详情；/value p1 查看完整路径；/export 文件.json 或 .md 导出")
 
     def run_turn(text: str) -> bool:
         if text.strip().lower() in {"/exit", "exit", "quit"}:
             return True
-        result = session.submit(text)
-        print(result.text)
-        if result.recommendations and result.approval_request is None:
-            print("建议：")
-            for recommendation in result.recommendations:
-                print("-", recommendation)
+        if not text.strip():
+            print("请输入非空问题。")
+            return False
+        command, _, argument = text.strip().partition(" ")
+        if command in {"/details", "/answer", "/value", "/export"}:
+            answer = session.last_answer
+            if answer is None:
+                print("当前没有可查看的回答。")
+                return False
+            if command in {"/details", "/answer"}:
+                # Detail inspection must not invalidate the current path IDs.
+                print((TerminalRenderer() if command == "/details" else renderer).render(answer, details=command == "/details"))
+            elif command == "/value":
+                try:
+                    print(renderer.render_value(argument.strip()))
+                except KeyError:
+                    print("路径编号不存在；输入 /answer 重新显示编号。")
+            else:
+                destination = Path(argument.strip().strip('"'))
+                if not argument or destination.suffix.lower() not in {".json", ".md"}:
+                    print("用法：/export 文件.json 或 /export 文件.md")
+                    return False
+                try:
+                    # Never silently overwrite an existing artifact.
+                    with destination.open("x", encoding="utf-8") as stream:
+                        stream.write(markdown_answer(answer) if destination.suffix.lower() == ".md" else answer.to_json(indent=2))
+                    print(TerminalRenderer().render(Answer(f"已导出：{destination}")))
+                except OSError as exc:
+                    print(TerminalRenderer().render(Answer(f"导出失败：{exc}")))
+            return False
+        if command.startswith("/"):
+            print("未知命令；可用 /answer、/details、/value、/export、/exit。")
+            return False
+        try:
+            result = session.submit(text)
+        finally:
+            save_audit()
+        print(renderer.render(result))
         return False
 
     try:
@@ -341,8 +419,13 @@ def _run_unified_chat_loop(
             if run_turn(text):
                 print("已退出")
                 return 0
+    except AgentUnavailableError as exc:
+        print(renderer.render(Answer(exc.user_message + f"\n审计记录：{audit_path}")))
+        log.error("%s: %s", "agent_internal_error" if isinstance(exc, AgentInternalError) else "agent_unavailable", exc.to_dict())
+        return 2
     finally:
-        sim_db.close()
+        if sim_db is not None:
+            sim_db.close()
         builder.close()
 
 
@@ -422,84 +505,36 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Agent 闭环必须通过唯一的 --conversation 入口进入 LeadAgent")
         return 1
 
-    # 判断优化类型
-    from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig
-    is_pareto = isinstance(opt_cfg, ParetoOptimizeCaseConfig)
-
-    # 打印配置摘要
-    log.info("仿真文件：%s", sim_filepath)
-    log.info("设计变量（%d 个）：", len(opt_cfg.param_bounds))
-    for path, (lo, hi) in opt_cfg.param_bounds.items():
-        log.info("  %s  [%.4g, %.4g]", path.split("\\")[-1], lo, hi)
-    if opt_cfg.fixed_vars:
-        log.info("固定变量（%d 个）：%s", len(opt_cfg.fixed_vars),
-                 list(opt_cfg.fixed_vars.keys()))
-
-    if is_pareto:
-        log.info(
-            "优化模式：多目标 Pareto（%s），目标=%s，初始 DOE=%d，总迭代=%d，"
-            "标量化=%s，采集函数=%s",
-            "pareto_bayesian",
-            opt_cfg.objective_names,
-            opt_cfg.n_initial,
-            opt_cfg.n_iterations,
-            opt_cfg.scalarization,
-            opt_cfg.acquisition,
-        )
-        log.info("Surrogate model: %s", opt_cfg.surrogate_model)
-    else:
-        log.info(
-            "优化目标：%s（%s），初始 DOE=%d，总迭代=%d，采集函数=%s",
-            opt_cfg.objective_name,
-            "最小化" if opt_cfg.minimize else "最大化",
-            opt_cfg.n_initial,
-            opt_cfg.n_iterations,
-            opt_cfg.acquisition,
-        )
-        log.info("Surrogate model: %s", opt_cfg.surrogate_model)
-    log.info("结果数据库：%s", db_path)
-
-    if args.dry_run:
-        log.info("--dry-run 模式，跳过仿真。")
-        return 0
-
-    # 运行优化
-    from src.aspen_driver.driver import AspenDriver
-
-    log.info("正在连接 Aspen Plus 并打开仿真文件……")
+    # The CLI uses the same preview/approval/execution boundary as conversation.
+    from src.agents.actions import ActionGateway, ActionRequest
+    from src.agents.actions.plans import build_optimization_plan, preflight_optimizer
+    from src.database.simulation_db import SimulationDB
     try:
-        with AspenDriver(**driver_kwargs) as driver:
-            driver.open(sim_filepath)
-            if is_pareto:
-                from src.workflows.optimize_pareto_case import optimize_pareto_case
-                log.info("仿真文件已打开，开始多目标贝叶斯优化……")
-                result = optimize_pareto_case(driver, opt_cfg)
-            else:
-                from src.workflows.optimize_case import optimize_case
-                log.info("仿真文件已打开，开始贝叶斯优化……")
-                result = optimize_case(driver, opt_cfg)
+        plan, schema = build_optimization_plan(args.config)
+        preflight_optimizer(opt_cfg)
+        with SimulationDB(db_path) as execution_db:
+            gateway = ActionGateway(schema, simulation_db=execution_db)
+            action = ActionRequest("run_optimization", "model", reason="CLI configured optimization",
+                                   payload={"optimization_plan": plan})
+            validation = gateway.submit(action, refresh=False)
+            if not validation.valid:
+                raise ValueError("; ".join(validation.errors))
+            print(json.dumps(gateway.preview(action.audit_id).to_dict(), ensure_ascii=False, indent=2))
+            try:
+                confirmation = input("确认以上模型、算法、边界和总执行预算？输入 APPROVE 执行：")
+            except (EOFError, KeyboardInterrupt):
+                confirmation = ""
+            if confirmation != "APPROVE":
+                gateway.reject(action.audit_id)
+                log.info("执行未批准；未打开 Aspen。")
+                return 1
+            gateway.approve(action.audit_id)
+            output = gateway.execute(action.audit_id)
+            log.info("执行结果：%s", json.dumps(output, ensure_ascii=False, default=str))
+            return 0 if output.get("real_execution") else 1
     except Exception as exc:
-        log.error("优化运行失败：%s", exc, exc_info=True)
+        log.error("优化未完成：%s", exc, exc_info=True)
         return 1
-
-    if is_pareto:
-        _print_pareto_summary(log, result, db_path)
-    else:
-        _print_single_summary(log, result, db_path)
-
-    # 自动生成可视化报告（仅多目标 Pareto 优化）
-    if is_pareto:
-        try:
-            from src.reporting.plot_pareto import generate_pareto_report
-            generate_pareto_report(
-                db_path,
-                out_dir=db_path.parent,
-                session_id=getattr(result, "session_id", None),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("可视化报告生成失败（不影响结果）：%s", exc)
-
-    return 0
 
 
 if __name__ == "__main__":

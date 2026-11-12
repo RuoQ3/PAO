@@ -149,8 +149,7 @@ class FeasibilityClassifier:
             _log.debug("FeasibilityClassifier：model='random'，跳过训练。")
             return False
         if not _HAS_SKLEARN:
-            _log.warning("FeasibilityClassifier：sklearn 不可用，跳过训练。")
-            return False
+            raise RuntimeError("feasibility filter backend unavailable: scikit-learn required")
 
         # 提取有效样本
         X: list[list[float]] = []
@@ -191,8 +190,7 @@ class FeasibilityClassifier:
             clf = self._build_model()
             clf.fit(X, y)
         except Exception as exc:
-            _log.warning("FeasibilityClassifier：训练异常，跳过。%s", exc)
-            return False
+            raise RuntimeError(f"feasibility filter fit failed: {exc}") from exc
 
         self._model = clf
         self._var_names = list(var_names)
@@ -249,8 +247,7 @@ class FeasibilityClassifier:
             pos_idx = classes.index(1)
             prob = float(proba_array[0][pos_idx])
         except Exception as exc:
-            _log.warning("FeasibilityClassifier.predict_proba：预测异常，返回 1.0。%s", exc)
-            return 1.0
+            raise RuntimeError(f"feasibility filter predict failed: {exc}") from exc
 
         return max(0.0, min(1.0, prob))
 

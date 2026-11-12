@@ -10,6 +10,7 @@ from .models import (
     IntentSchema,
     RuntimePolicy,
     SessionState,
+    PendingTask,
     SubagentRequest,
     TaskResult,
     TaskSpec,
@@ -24,7 +25,7 @@ from .parameter_impact import (
 
 __all__ = [
     "Answer", "ActionProposal", "ApprovalRequest", "Classification", "Evidence", "ExecutionMode",
-    "IntentSchema", "RuntimePolicy", "SessionState", "SubagentRequest", "TaskResult", "TaskSpec",
+    "IntentSchema", "RuntimePolicy", "SessionState", "PendingTask", "SubagentRequest", "TaskResult", "TaskSpec",
     "TaskStatus", "OrchestrationRuntime", "TaskPlanner",
     "ParameterImpactPlan", "SimulationPlan", "AspenSandboxRunner",
     "FakeAspenSandboxRunner", "SensitivityAnalyzer", "build_parameter_impact_plan",

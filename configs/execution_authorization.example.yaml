@@ -1,0 +1,6 @@
+# Merge this top-level section into an existing optimization YAML.
+# This is an execution-limit example, not a complete runnable case.
+execution:
+  max_evaluations: 40  # All phases, failed/unknown attempts and verification.
+  max_seconds: 3600
+  max_failures: 5

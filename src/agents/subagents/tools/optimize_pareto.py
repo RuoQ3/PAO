@@ -136,66 +136,7 @@ def _fmt_pareto_result_summary(result: Any, config_path: str) -> str:
 
 def _impl_optimize_pareto(config_path: str, db_path: str | None) -> str:
     """optimize_pareto_tool 的核心实现，出错时返回 '错误：' 字符串。"""
-    # 1. 解析配置路径
-    try:
-        yaml_path = _common._resolve_config_path(config_path)
-    except FileNotFoundError as exc:
-        return f"错误：{exc}"
-
-    # 2. 按需导入依赖
-    err = _common._import_pareto_deps()
-    if err:
-        return err
-
-    # 3. 加载配置
-    try:
-        opt_cfg, sim_filepath, driver_kwargs = _common._load_optimize_config(yaml_path)
-    except (FileNotFoundError, KeyError, ValueError, TypeError) as exc:
-        return f"错误：配置加载失败 [{type(exc).__name__}] — {exc}"
-    except Exception as exc:
-        return f"错误：配置加载时出现意外错误 — {exc}"
-
-    # 4. 校验是多目标配置
-    try:
-        from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig
-        if not isinstance(opt_cfg, ParetoOptimizeCaseConfig):
-            return (
-                "错误：此工具仅支持 optimizer.type: pareto_bayesian 的多目标配置。"
-                f"当前配置类型为 {type(opt_cfg).__name__}。"
-                "如需单目标优化，请使用其他工具。"
-            )
-    except ImportError as exc:
-        return f"错误：无法导入 ParetoOptimizeCaseConfig — {exc}"
-
-    # 5. 确定数据库路径
-    if db_path:
-        opt_cfg.db_path = db_path
-    elif opt_cfg.db_path is None:
-        opt_cfg.db_path = yaml_path.parent / "output" / "simulation.db"
-
-    # 6. 运行优化
-    try:
-        with _common._AspenDriver(**driver_kwargs) as driver:
-            driver.open(sim_filepath)
-            result = _common._optimize_pareto_fn(driver=driver, config=opt_cfg)
-    except FileNotFoundError as exc:
-        return f"错误：Aspen 仿真文件不存在 — {exc}"
-    except Exception as exc:
-        return f"错误：优化运行失败 [{type(exc).__name__}] — {exc}"
-
-    # 7. 格式化报告
-    try:
-        report = _fmt_pareto_result_summary(result, config_path)
-    except Exception as exc:
-        _log.exception("格式化 optimize_pareto 报告时出现意外错误")
-        return f"错误：格式化报告时出现意外错误 — {exc}"
-
-    _log.info(
-        "optimize_pareto_tool: 完成优化 session=%s n_total=%d n_success=%d HV=%s",
-        result.session_id, result.n_total, result.n_success,
-        f"{result.hypervolume:.4g}" if result.hypervolume is not None else "N/A",
-    )
-    return report
+    raise PermissionError('Direct execution tool disabled; submit a complete plan to ActionGateway for preview and approval')
 
 
 # ---------------------------------------------------------------------------

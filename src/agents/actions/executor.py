@@ -16,7 +16,7 @@ class MockExecutor:
         self.backups.append(token); return token
     def execute(self, action, *, preview):
         if action.action_type.value == "modify_structure": raise ExecutionError("structural modifications disabled")
-        result = {"audit_id": action.audit_id, "status": "executed", "action_type": action.action_type.value, "target": action.target, "new_value": action.new_value}
+        result = {"audit_id": action.audit_id, "status": "simulated", "simulated": True, "real_execution": False, "action_type": action.action_type.value, "target": action.target, "new_value": action.new_value}
         self.calls.append(result); return result
     def rollback(self, token):
         if token not in self.backups: raise ExecutionError("unknown backup token")

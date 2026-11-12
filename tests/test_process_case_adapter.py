@@ -1,4 +1,6 @@
 """Contract tests for the configuration-driven read-only case boundary."""
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from pathlib import Path
 
 from src.agents.context import CaseInputConfig, ProcessCaseAdapter
@@ -70,7 +72,7 @@ def test_adapter_load_is_cached_for_followup_turns():
 
 def test_lead_resolves_and_reuses_case_adapter_from_session_ref():
     session = SessionState(context_refs={"case_config": "case-config-does-not-exist.yaml"})
-    lead = LeadAgent(use_llm=False)
+    lead = LeadAgent(**fake_kwargs())
     lead.answer("项目有哪些设备？", session)
     first = lead._case_adapters[session.session_id]
     lead.answer("流程怎么走？", session)

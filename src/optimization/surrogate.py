@@ -9,12 +9,13 @@ surrogate.py — 可配置代理模型层。
 
   model in {"GP", "RF", "ET", "GBRT"}
       使用 skopt.Optimizer(base_estimator=model)。
-      skopt 不可用、初始化失败、ask/tell 失败、
-      或成功样本数 < n_initial_min 时，回退随机采样并写 WARNING 日志。
+      skopt 不可用或初始化、ask/tell 失败时抛出可定位错误。
+      成功样本数 < n_initial_min 的随机初始化是算法的一部分。
 """
 from __future__ import annotations
 
 import logging
+import math
 import random as _random
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -70,6 +71,12 @@ class SurrogateConfig:
     random_seed: int | None = None
 
     def __post_init__(self) -> None:
+        if self.acquisition not in {"EI", "UCB", "PI"}:
+            raise ValueError("unsupported acquisition function")
+        if type(self.n_initial_min) is not int or self.n_initial_min < 1:
+            raise ValueError("n_initial_min must be a positive integer")
+        if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in (self.xi, self.kappa)):
+            raise ValueError("xi/kappa must be finite and nonnegative")
         if self.model not in _VALID_MODELS:
             raise ValueError(
                 f"SurrogateConfig.model={self.model!r} 不合法，"
@@ -90,12 +97,7 @@ class SurrogateOptimizer:
     支持混合整数搜索空间：integer_indices 中的维度使用 skopt.space.Integer，
     采集函数直接在整数格点上采样；回退随机采样时同样对整数维度取整。
 
-    回退规则（按优先级）：
-      1. model == "random"：始终随机采样。
-      2. skopt 不可用：随机采样（初始化时写 WARNING）。
-      3. skopt 初始化失败：随机采样（写 WARNING）。
-      4. 成功样本数 < n_initial_min：随机采样。
-      5. skopt.ask() 失败：随机采样（写 WARNING）。
+    显式 random 和 BO 初始采样允许随机点。后端故障必须停止。
     """
 
     def __init__(
@@ -126,7 +128,7 @@ class SurrogateOptimizer:
 
                 # dimensions 构造与 Optimizer 初始化放在同一个 try 块：
                 # _Real/_Integer 为 None（skopt 未正确安装）或 Optimizer 初始化失败时，
-                # 统一回退到随机采样，不向上抛出异常。
+                # 初始化故障必须传递给调用者，不能替换算法。
                 try:
                     if not callable(_Real):
                         raise RuntimeError(
@@ -168,16 +170,9 @@ class SurrogateOptimizer:
                         n_initial_points=0,
                     )
                 except Exception as exc:
-                    _log.warning(
-                        "skopt Optimizer(base_estimator=%r) 初始化失败，回退到随机采样：%s",
-                        config.model, exc,
-                    )
+                    raise RuntimeError(f"backend initialization failed for {config.model}: {exc}") from exc
             else:
-                _log.warning(
-                    "scikit-optimize 未安装，代理模型 %r 将退化为随机采样。"
-                    "安装方法：pip install scikit-optimize",
-                    config.model,
-                )
+                raise RuntimeError(f"backend unavailable for {config.model}: install scikit-optimize")
 
     def tell(self, x: list[float], y: float, *, is_success: bool) -> None:
         """提交一次观测。is_success=True 时计入成功样本数。"""
@@ -187,7 +182,7 @@ class SurrogateOptimizer:
             try:
                 self._skopt.tell(x, y)
             except Exception as exc:
-                _log.warning("skopt.tell() 失败（已忽略）：%s", exc)
+                raise RuntimeError(f"{self._config.model} tell failed: {exc}") from exc
 
     def ask(self, active_bounds: list[tuple[float, float]] | None = None) -> list[float]:
         """
@@ -218,7 +213,7 @@ class SurrogateOptimizer:
                     return pool[int(score.argmin())]
                 return self._skopt.ask()
             except Exception as exc:
-                _log.warning("skopt.ask() 失败，回退到随机采样：%s", exc)
+                raise RuntimeError(f"{self._config.model} ask failed: {exc}") from exc
         return self._random_point(active_bounds)
 
     def _random_point(self, bounds=None) -> list[float]:
@@ -230,7 +225,9 @@ class SurrogateOptimizer:
                 int_lo = math.ceil(lo)
                 int_hi = math.floor(hi)
                 # 若 ceil(lo) > floor(hi)，说明边界区间内无整数，退化到 int_lo
-                val = float(self._rng.randint(int_lo, max(int_lo, int_hi)))
+                if int_lo > int_hi:
+                    raise ValueError("integer search interval is empty")
+                val = float(self._rng.randint(int_lo, int_hi))
             else:
                 val = lo + self._rng.random() * (hi - lo)
             point.append(val)
@@ -252,7 +249,7 @@ def make_surrogate_optimizer(
 
     model="qEHVI"/"NEHVI" 时返回 BoTorchMOOptimizer；
     其余 model 值返回 SurrogateOptimizer（skopt 后端）。
-    BoTorch 不可用时自动退化为 GP（skopt），并写 WARNING 日志。
+    BoTorch 不可用时明确抛错，不替换为 GP。
 
     Parameters
     ----------
@@ -272,21 +269,10 @@ def make_surrogate_optimizer(
     SurrogateOptimizer
     """
     if config.model in ("qEHVI", "NEHVI"):
-        try:
-            from .botorch_backend import BoTorchMOOptimizer, _check_botorch
-            if _check_botorch():
-                return BoTorchMOOptimizer(bounds, n_objectives, integer_indices or set(), config)
-            _log.warning("BoTorch 未安装，%s 退化为 skopt GP。", config.model)
-        except Exception as exc:
-            _log.warning("BoTorchMOOptimizer 初始化失败，退化为 skopt GP：%s", exc)
-        # 退化：创建 GP 配置
-        fallback_cfg = SurrogateConfig(
-            model="GP",
-            acquisition=config.acquisition,
-            xi=config.xi,
-            kappa=config.kappa,
-            n_initial_min=config.n_initial_min,
-            random_seed=config.random_seed,
-        )
-        return SurrogateOptimizer(bounds, fallback_cfg, integer_indices)
+        from .botorch_backend import BoTorchMOOptimizer, _check_botorch
+        if not _check_botorch():
+            raise RuntimeError(f"backend unavailable for {config.model}: install torch/botorch/gpytorch")
+        if n_objectives < 2:
+            raise ValueError(f"{config.model} requires multiple objectives")
+        return BoTorchMOOptimizer(bounds, n_objectives, integer_indices or set(), config)
     return SurrogateOptimizer(bounds, config, integer_indices)

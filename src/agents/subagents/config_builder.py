@@ -20,10 +20,13 @@ config_builder.py — A4 配置构建器。
   IntentParseError                                         # A4-2a 异常类
 """
 from __future__ import annotations
+from src.agents.errors import AgentUnavailableError, unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured, redact
 
 import json
 import logging
 import re
+import math
 from typing import Any
 
 from src.models.tunable import (
@@ -38,12 +41,7 @@ from src.models.tunable import (
 _log = logging.getLogger(__name__)
 
 # 模块级 import：让 monkeypatch 可在测试中替换这些名字
-try:
-    from src.agents.lead.llm_client import chat, is_configured, load_llm_config  # noqa: F401
-except Exception:  # llm_client 可能依赖可选依赖，降级处理
-    chat = None  # type: ignore[assignment]
-    is_configured = None  # type: ignore[assignment]
-    load_llm_config = None  # type: ignore[assignment]
+from src.agents.lead.llm_client import chat, is_configured, load_llm_config
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +64,7 @@ def _get_tac_defaults() -> dict[str, Any]:
             },
         }
     except Exception as exc:
-        _log.warning("读取 TACConfig 默认值失败，使用内置兜底值：%s", exc)
-        return {
-            "annualization_factor": 0.1,
-            "operating_hours":      8000.0,
-            "utility_cost": {
-                "steam_price":         14.19,
-                "cooling_water_price": 0.354,
-                "electricity_price":   0.0775,
-            },
-        }
+        raise failure_from(exc, "config_economic_parameters") from None
 
 
 def _get_emissions_defaults() -> dict[str, Any]:
@@ -92,14 +81,7 @@ def _get_emissions_defaults() -> dict[str, Any]:
             },
         }
     except Exception as exc:
-        _log.warning("读取 EmissionsConfig 默认值失败，使用内置兜底值：%s", exc)
-        return {
-            "operating_hours": 8000.0,
-            "emission_factors": {
-                "steam_factor":       66.0,
-                "electricity_factor": 0.581,
-            },
-        }
+        raise failure_from(exc, "config_economic_parameters") from None
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +712,7 @@ metric 取值规则（重要）：
 3. 用户提到"纯度"、"质量分数" → 放入 hard_constraints，metric=purity，提供 target_value 和 custom_aspen_path
 4. 若用户提供了具体的 Aspen 路径，直接使用；未提供时根据描述推断
 5. 不要把"产量最大化"解析为 TAC 或 emissions
-6. 只有当用户未提及任何具体指标时，才使用 TAC + emissions 作为兜底
+6. 未明确指定目标时返回空 goals；不得发明默认目标或 Aspen 路径。
 
 只输出 JSON，不输出任何解释。"""
 
@@ -744,6 +726,14 @@ def _validate_intent_schema(data: dict) -> None:
     """
     if not isinstance(data, dict):
         raise IntentParseError("LLM 输出不是 JSON 对象")
+    required = {"goals", "hard_constraints", "n_initial", "n_iterations", "notes"}
+    if set(data) != required:
+        raise IntentParseError("Optimization intent requires all protocol fields")
+    for name in ("n_initial", "n_iterations"):
+        if type(data[name]) is not int or data[name] < 1:
+            raise IntentParseError("Iteration budgets must be positive integers")
+    if not isinstance(data["notes"], str):
+        raise IntentParseError("notes must be a string")
     if "goals" not in data:
         raise IntentParseError("LLM 输出缺少 'goals' 字段")
     if not isinstance(data["goals"], list):
@@ -758,6 +748,8 @@ def _validate_intent_schema(data: dict) -> None:
                 raise IntentParseError(f"{section}[{i}] 不是字典")
             if "metric" not in g:
                 raise IntentParseError(f"{section}[{i}] 缺少 'metric' 字段")
+            if not isinstance(g["metric"], str) or g["metric"].lower() not in {"tac", "emissions", "purity", "yield", "flow", "custom"}:
+                raise IntentParseError("Unsupported metric")
             if "direction" not in g:
                 raise IntentParseError(
                     f"{section}[{i}] 缺少 'direction' 字段（metric='{g.get('metric')}'）。"
@@ -775,7 +767,7 @@ def _validate_intent_schema(data: dict) -> None:
                         f"{section}[{i}]（metric='{g['metric']}'）缺少 'target_value'。"
                         "阈值约束必须显式提供数值阈值，不允许 null/缺失。"
                     )
-                if not isinstance(tv, (int, float)):
+                if type(tv) not in (int, float) or not math.isfinite(tv):
                     raise IntentParseError(
                         f"{section}[{i}].target_value='{tv}' 不是数值"
                         f"（metric='{g['metric']}'），阈值必须是数字。"
@@ -808,86 +800,19 @@ def _dict_to_intent(data: dict) -> OptimizationIntent:
     return OptimizationIntent(
         goals=goals,
         hard_constraints=constraints,
-        n_initial=int(data.get("n_initial", 20)),
-        n_iterations=int(data.get("n_iterations", 60)),
-        notes=str(data.get("notes", "")),
+        n_initial=data["n_initial"],
+        n_iterations=data["n_iterations"],
+        notes=data["notes"],
     )
 
 
-def _default_intent(notes: str = "") -> OptimizationIntent:
-    """降级返回：TAC 最小化 + 排放最小化默认意图。"""
-    return OptimizationIntent(
-        goals=[
-            GoalSpec(metric="TAC",       direction="min"),
-            GoalSpec(metric="emissions", direction="min"),
-        ],
-        notes=notes,
-    )
-
-
-def parse_intent_from_text(
-    text: str,
-    llm_config: Any = None,
-) -> OptimizationIntent:
-    """将自由文本意图解析为 OptimizationIntent。
-
-    LLM 只负责文本→结构化 JSON，不直接生成任何配置字段。
-
-    Parameters
-    ----------
-    text:
-        用户描述优化意图的自然语言文本。
-    llm_config:
-        LLMConfig 实例；None 时尝试从环境变量读取；
-        未配置或调用失败时降级返回默认意图。
-
-    Returns
-    -------
-    OptimizationIntent
-        解析成功时返回 LLM 解析结果；
-        降级时返回 TAC+排放 默认意图，notes 中说明原因。
-
-    Raises
-    ------
-    IntentParseError
-        LLM 有配置但输出不符合 schema 时抛出（调用方可捕获后选择降级）。
-    """
-    # 直接引用模块级名字（monkeypatch 可替换）
-    if is_configured is None or load_llm_config is None or chat is None:
-        return _default_intent(notes="llm_client 未就绪，已使用默认意图（TAC最小+排放最小）")
-
-    try:
-        cfg = llm_config if llm_config is not None else load_llm_config()
-    except Exception as exc:
-        _log.warning("无法加载 LLMConfig，使用默认意图：%s", exc)
-        return _default_intent(notes=f"LLM 配置加载失败：{exc}；已使用默认意图（TAC最小+排放最小）")
-
-    if not is_configured(cfg):
-        return _default_intent(
-            notes="LLM 未配置，已使用默认意图（TAC最小化 + 排放最小化）"
-        )
-
-    try:
-        raw = chat(cfg, system=_INTENT_SYSTEM_PROMPT, user=text)
-    except Exception as exc:
-        _log.warning("LLM 调用失败，使用默认意图：%s", exc)
-        return _default_intent(notes=f"LLM 调用失败：{exc}；已使用默认意图（TAC最小+排放最小）")
-
-    # 提取 JSON：LLM 可能包裹在 ```json...``` 中
-    json_text = raw.strip()
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", json_text)
-    if m:
-        json_text = m.group(1).strip()
-
-    try:
-        data = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise IntentParseError(
-            f"LLM 输出无法解析为 JSON：{exc}\n原始输出：{raw[:500]}"
-        ) from exc
-
+@fail_closed("config_intent")
+def parse_intent_from_text(text: str, llm_config=None):
+    if not text.strip():
+        raise unavailable("agent_output_invalid", stage="config_input")
+    cfg = configured(llm_config or load_llm_config())
+    data = redact(json.loads(chat(cfg, system=_INTENT_SYSTEM_PROMPT, user=text)), cfg)
     _validate_intent_schema(data)
-    intent = _dict_to_intent(data)
-    if not intent.notes:
-        intent.notes = text
-    return intent
+    if not data["goals"]:
+        raise unavailable("agent_output_invalid", stage="config_goals")
+    return _dict_to_intent(data)

@@ -1,3 +1,5 @@
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 import json
 
 import pytest
@@ -46,8 +48,7 @@ def test_analysis_type_requires_one_repair_and_audits_raw_response(invalid):
     assert 'analysis must be an object' in repair['validation_error']['message']
     assert repair['invalid_response'] == bad
     trace = state.audit_events[-1]
-    assert trace['attempts'][0]['raw_response'] == bad
-    assert trace['attempts'][1]['raw_response'] == good
+    assert all('raw_response' not in a and 'request' not in a for a in trace['attempts'])
     restored = SessionState.from_json(state.to_json())
     assert restored.classification_source == 'llm_repaired'
     assert restored.classification_retry_count == 1
@@ -65,12 +66,10 @@ def test_invalid_response_is_repaired_once_or_falls_back_with_reason(bad, reason
     assert result.classification_source == 'llm_repaired' and len(calls) == 2
     assert json.loads(calls[1]['user'])['validation_error']['code'] == reason
     state = SessionState(runtime_state={'conversation_focus': {'equipment': 'T0301', 'stream': '0319', 'component': 'ADN', 'metric': 'mole_fraction'}})
-    result, calls = run_responses([bad, bad], session=state)
-    assert result.classification_source == 'rule_fallback'
-    assert result.retry_count == 1 and len(calls) == 2
-    assert result.fallback_reason == reason
-    assert result.intent.analysis['target_component'] == 'ADN'
-    assert result.intent.requires_confirmation is True
+    with pytest.raises(AgentUnavailableError) as error:
+        run_responses([bad, bad], session=state)
+    assert error.value.retry_count == 1 and error.value.code == 'llm_repair_failed'
+    assert state.internal_error and not state.agent_unavailable and state.pending_approval is None
 
 
 def test_missing_analysis_and_missing_impact_slots_are_not_filled_silently():
@@ -81,16 +80,16 @@ def test_missing_analysis_and_missing_impact_slots_are_not_filled_silently():
     assert 'analysis' in json.loads(calls[1]['user'])['validation_error']['message']
     incomplete = impact_payload()
     del incomplete['analysis']['metric']
-    result, calls = run_responses([json.dumps(incomplete)]*2)
-    assert result.classification_source == 'rule_fallback'
-    assert 'metric' in json.loads(calls[1]['user'])['validation_error']['message']
+    with pytest.raises(AgentUnavailableError) as error:
+        run_responses([json.dumps(incomplete)]*2)
+    assert error.value.code == 'llm_repair_failed'
 
 
 def test_missing_key_has_zero_provider_calls(monkeypatch):
     monkeypatch.setattr('src.agents.lead.intent.llm_client.is_configured', lambda cfg: False)
-    result, calls = run_responses([])
-    assert result.fallback_reason == 'llm_key_missing'
-    assert result.retry_count == 0 and not calls
+    with pytest.raises(AgentUnavailableError) as error:
+        run_responses([])
+    assert error.value.code == 'llm_not_configured' and error.value.retry_count == 0
 
 
 def test_repair_provider_failure_is_distinguished():
@@ -100,9 +99,10 @@ def test_repair_provider_failure_is_distinguished():
         if len(calls) == 1:
             return 'bad JSON'
         raise TimeoutError('repair request timed out')
-    result = IntentClassifier(llm_config=_cfg(), llm_call=provider).classify('分析 T0301 参数')
-    assert result.retry_count == 1 and len(calls) == 2
-    assert result.fallback_reason == 'request_timeout'
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=_cfg(), llm_call=provider).classify('分析 T0301 参数')
+    assert error.value.retry_count == 1 and len(calls) == 2
+    assert error.value.code == 'llm_timeout'
 
 
 def test_repaired_action_still_requires_approval():
@@ -110,9 +110,11 @@ def test_repaired_action_still_requires_approval():
     payload = _payload(intent='simulation_request', action_type='simulate_once', requires_confirmation=True)
     responses = iter(['invalid JSON', json.dumps(payload)])
     classifier = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **kw: next(responses))
-    session = ConversationSession(SessionState(), LeadAgent(intent_classifier=classifier))
+    session = ConversationSession(SessionState(), LeadAgent(intent_classifier=classifier,
+        llm_config=_cfg(), llm_call=lambda *a, **k: json.dumps(dict(
+            text='执行仿真以检查当前模型，需要先确认。', confidence=.9, uncertainties=[], blocks=[]))))
     answer = session.submit('运行仿真')
     assert session.state.classification_source == 'llm_repaired'
-    assert answer.approval_request is not None
-    assert session.state.pending_approval is not None
-    assert session.state.pending_approval.status == 'pending'
+    assert answer.approval_request is None
+    assert session.state.pending_approval is None
+    assert "未执行 Aspen" in answer.text

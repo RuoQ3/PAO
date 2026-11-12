@@ -89,6 +89,11 @@ def _objective_summary(cases: Sequence[ProcessCase], name: str) -> dict[str, Any
             "best_improvement_from_first": None,
         }
 
+    if len({direction for _, _, direction in values}) > 1:
+        return {"n_available": len(values), "direction": "conflicting", "error": "objective direction conflict",
+                "first_value": values[0][1], "latest_value": values[-1][1],
+                "best_value": None, "best_case_id": None, "latest_case_id": _safe_case_id(values[-1][0]),
+                "improvement_from_first": None, "best_improvement_from_first": None}
     minimize = values[0][2]
     oriented = [value if minimize else -value for _, value, _ in values]
     best_index = min(range(len(values)), key=oriented.__getitem__)

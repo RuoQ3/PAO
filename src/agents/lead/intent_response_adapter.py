@@ -3,29 +3,69 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
-from src.agents.orchestration.models import IntentSchema
+from src.agents.orchestration.models import (
+    CONTEXT_REQUIREMENTS,
+    CONTEXT_REQUIREMENTS_ORDER,
+    IntentSchema,
+    validate_context_requirements,
+)
 
 
 class IntentResponseAdapter:
     """Extract and validate responses, and construct explicit repair requests."""
 
-    def parse(self, raw: str) -> IntentSchema:
+    def parse(self, raw: str, *, validator: Callable | None = None) -> IntentSchema:
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("empty_model_result")
-        payload = self.validate_provider_payload(self.parse_json_response(raw))
+        payload = (validator or self.validate_provider_payload)(self.parse_json_response(raw))
         return IntentSchema.from_dict(payload)
 
     @staticmethod
     def build_repair_request(*, question: str, focus: dict[str, Any],
                              raw: Any, error: dict[str, str]) -> str:
+        allowed = list(CONTEXT_REQUIREMENTS_ORDER)
+        instruction = (
+            "Return only the corrected complete JSON object. No explanation or Markdown. Do not explain. "
+            "Keep the original user intent; do not invent missing slots or bypass confirmation. "
+            "Do not put equipment, stream or component names in context_required. "
+            "For current project questions and parameter_impact, replace context_required with [\"process_context\"]. "
+            "For parameter_impact, equipment, target_stream, target_component, metric, candidate_parameters "
+            "must all exist inside analysis; ordinary intents use analysis: {}. "
+            "For parameter_impact set action_type to simulate_once and requires_confirmation to true. "
+            "Never return an empty context_required for current_project, current_case, or current_session. "
+            "The value none must appear alone."
+        )
+        # Explain the actual invalid identifiers without changing the payload
+        # or hard-coding a particular equipment/stream/component name.
+        try:
+            invalid = IntentResponseAdapter.parse_json_response(raw) if isinstance(raw, str) else {}
+        except (ValueError, TypeError):
+            invalid = {}
+        context = invalid.get("context_required")
+        error_text = str(error.get("message", ""))
+        if (isinstance(context, list) and any(isinstance(value, str) and value not in CONTEXT_REQUIREMENTS for value in context)) or any(
+            token in error_text for token in ("equipment", "stream:", "component:")
+        ):
+            instruction += ' Replace context_required with ["process_context"].'
+            error_values = re.findall(r"equipment:([A-Za-z0-9_-]+)", error_text)
+            for value in [*(context or []), *error_values]:
+                if isinstance(value, str) and ":" in value:
+                    identifier = value.split(":", 1)[1]
+                    instruction += f" Keep {identifier} in the question/focus/analysis slot, not in context_required."
         return json.dumps({
             "request_type": "repair_intent_json", "original_question": question,
             "conversation_focus": focus, "invalid_response": raw,
             "validation_error": error,
-            "instruction": "Return only the corrected complete JSON object. No explanation or Markdown. "
-                           "Keep the original user intent; do not invent missing slots or bypass confirmation.",
+            "allowed_context_required": allowed,
+            "repair_examples": {
+                "project_query": ["process_context"],
+                "equipment_analysis": ["process_context"],
+                "parameter_impact": ["process_context"],
+                "no_context_chat": ["none"],
+            },
+            "instruction": instruction,
         }, ensure_ascii=False)
 
     @staticmethod
@@ -59,6 +99,10 @@ class IntentResponseAdapter:
         for key in ("context_required", "missing_information"):
             if not isinstance(payload[key], list) or not all(isinstance(x, str) for x in payload[key]):
                 raise TypeError(f"{key} must be a list of strings")
+        context = payload["context_required"]
+        scope = payload["project_scope"]
+        intent_name = payload["intent"]
+        validate_context_requirements(context, intent=intent_name, project_scope=scope)
         if not isinstance(payload["subagents"], list) or not all(isinstance(x, dict) for x in payload["subagents"]):
             raise TypeError("subagents must be a list of objects")
         analysis = payload["analysis"]

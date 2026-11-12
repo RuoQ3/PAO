@@ -5,8 +5,8 @@ boundary_advisor — 搜索边界顾问 agent。
 推理出合理的搜索倍数 k,生成自适应搜索边界。是系统化方案的"冷启动边界判断"层。
 
 公开接口：
-  recommend_boundaries        纯规则兜底(无 LLM 依赖)
-  recommend_boundaries_agent  LLM 层(deepseek-v4-pro),失败降级规则兜底
+  recommend_boundaries        兼容入口（严格 LLM 校验）
+  recommend_boundaries_agent  LLM 层，失败立即终止
   format_boundary_report      报告格式化
   VarMeta / BoundaryReport / BoundaryRecommendation  数据容器
 """

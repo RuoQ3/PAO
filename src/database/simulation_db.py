@@ -193,6 +193,8 @@ class SimulationDB:
         幂等列迁移：检查 _MIGRATIONS 中每列是否存在，不存在则 ALTER TABLE 补列。
         用于将旧版数据库升级到当前 schema，不清空任何数据。
         """
+        if "execution_algorithm" not in {row["name"] for row in self._conn.execute("PRAGMA table_info(cases)")}:
+            self._conn.execute("ALTER TABLE cases ADD COLUMN execution_algorithm TEXT")
         for table, column, alter_sql in _MIGRATIONS:
             cur = self._conn.execute(f"PRAGMA table_info({table})")
             existing = {row["name"] for row in cur.fetchall()}
@@ -251,9 +253,60 @@ class SimulationDB:
         )
         self._conn.commit()
 
+    def claim_execution(self, audit_id: str, payload: dict[str, Any]) -> None:
+        """Atomic single-use claim; a crash never enables automatic replay."""
+        with self._conn:
+            self._conn.execute("CREATE TABLE IF NOT EXISTS execution_budget (audit_id TEXT PRIMARY KEY, used INTEGER NOT NULL)")
+            self._conn.execute("CREATE TABLE IF NOT EXISTS execution_evaluations (audit_id TEXT, evaluation INTEGER, payload TEXT NOT NULL, PRIMARY KEY(audit_id,evaluation))")
+            self._conn.execute("INSERT INTO execution_budget VALUES (?, 0)", (audit_id,))
+            self._conn.execute("INSERT INTO action_audits(audit_id,payload,created_at) VALUES (?,?,?)",
+                               (audit_id, json.dumps(payload, default=str), datetime.now(timezone.utc).isoformat()))
+
+    def reserve_execution(self, audit_id: str, maximum: int, inputs=None, algorithm=None) -> None:
+        with self._conn:
+            updated = self._conn.execute("UPDATE execution_budget SET used=used+1 WHERE audit_id=? AND used < ?",
+                                         (audit_id, maximum))
+            if updated.rowcount != 1:
+                raise PermissionError("execution budget exhausted or action not claimed")
+            used = self._conn.execute("SELECT used FROM execution_budget WHERE audit_id=?", (audit_id,)).fetchone()[0]
+            self._conn.execute("INSERT INTO execution_evaluations VALUES (?,?,?)", (audit_id, used,
+                json.dumps({"status": "reserved_outcome_unknown", "inputs": inputs, "algorithm": algorithm,
+                            "timestamp": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False)))
+
+    def finish_execution_evaluation(self, audit_id, evaluation, case):
+        with self._conn:
+            row = self._conn.execute("SELECT payload FROM execution_evaluations WHERE audit_id=? AND evaluation=?",
+                                     (audit_id, evaluation)).fetchone()
+            payload = json.loads(row[0])
+            payload.update(status="outcome_unknown" if case.impact_outputs.get("_lifecycle", {}).get("execution_state") == "unknown" else "completed", case_id=case.case_id, simulation_valid=case.simulation_valid,
+                           success=case.success)
+            self._conn.execute("UPDATE execution_evaluations SET payload=? WHERE audit_id=? AND evaluation=?",
+                               (json.dumps(payload, ensure_ascii=False), audit_id, evaluation))
+
     def get_action_audit(self, audit_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT payload FROM action_audits WHERE audit_id=?", (audit_id,)).fetchone()
         return self._decode_json(row[0], None) if row else None
+
+    def get_execution_evaluations(self, audit_id: str) -> list[dict[str, Any]]:
+        return [json.loads(r[0]) for r in self._conn.execute(
+            "SELECT payload FROM execution_evaluations WHERE audit_id=? ORDER BY evaluation", (audit_id,))]
+
+    def get_execution_answer(self, audit_id: str, *, session_id: str, version: int | None = None):
+        """Read saved answer content without reanalysis or execution."""
+        from src.agents.actions.authorization import digest
+        from src.agents.orchestration.models import Answer
+        record = self.get_action_audit(audit_id)
+        if not record or record.get("action", {}).get("session_id") != session_id:
+            raise ValueError("execution audit not found in exact session")
+        packet = dict((record.get("result") or {}).get("execution_evidence") or {})
+        expected = packet.pop("evidence_digest", None)
+        if not expected or digest(packet) != expected:
+            raise ValueError("execution evidence missing or digest mismatch")
+        analyses = record.get("analyses", [])
+        selected = next((a for a in reversed(analyses) if version is None or a.get("version") == version), None)
+        if not selected or selected.get("status") != "available" or selected.get("evidence_digest") != expected:
+            raise ValueError("analysis unavailable for this evidence version")
+        return Answer.from_dict(selected["answer"])
 
     def save_cases(self, case_dicts: list[dict[str, Any]]) -> None:
         """
@@ -344,6 +397,8 @@ class SimulationDB:
             ),
         )
 
+        self._conn.execute("UPDATE cases SET execution_algorithm=? WHERE case_id=?",
+                           (json.dumps(d.get("execution_algorithm"), ensure_ascii=False), case_id))
         # INSERT OR REPLACE 已通过 CASCADE 删除旧子行，直接插入新子行
         for obj in d.get("objectives", []):
             self._conn.execute(
@@ -471,51 +526,6 @@ class SimulationDB:
             params.append(offset)
 
         rows = self._conn.execute(sql, params).fetchall()
-
-        # session_id 前缀容错回退：
-        # 历史上 backend 曾用 8 字符前缀（uuid[:8]）作为 session_id，而工况写库时
-        # 用的是完整 UUID（经 YAML optimizer.session_id 注入）。两者精确匹配会失败，
-        # 导致 Pareto/报告查回 0 行（前端“结果全为 0、找不到解”）。
-        # 当精确匹配 0 行、且 session_id 看起来像 UUID 前缀（无连字符、长度较短）时，
-        # 回退到前缀匹配，找回这类历史数据。新代码已统一完整 UUID，此回退只兜底旧库。
-        if (
-            not rows
-            and session_id is not None
-            and 0 < len(session_id) < 36
-            and "-" not in session_id
-        ):
-            # 重建条件与参数：把 session_id 等值条件换成前缀匹配，其余保持不变。
-            fb_conditions: list[str] = []
-            fb_params: list[Any] = []
-            _p_iter = iter(params)
-            for c in conditions:
-                val = next(_p_iter)
-                if c == "cases.session_id = ?":
-                    fb_conditions.append("cases.session_id LIKE ?")
-                    fb_params.append(f"{session_id}%")
-                else:
-                    fb_conditions.append(c)
-                    fb_params.append(val)
-            # params 尾部的 LIMIT/OFFSET 值原样保留
-            fb_params.extend(_p_iter)
-
-            fb_sql = f"SELECT {cols} FROM cases"
-            if fb_conditions:
-                fb_sql += " WHERE " + " AND ".join(fb_conditions)
-            fb_sql += " ORDER BY cases.iteration ASC, cases.created_at ASC"
-            if limit is not None:
-                fb_sql += " LIMIT ?" + (" OFFSET ?" if offset else "")
-            elif offset:
-                fb_sql += " LIMIT -1 OFFSET ?"
-
-            fb_rows = self._conn.execute(fb_sql, fb_params).fetchall()
-            if fb_rows:
-                _log.warning(
-                    "query_cases: session_id=%r 精确匹配 0 行，前缀匹配命中 %d 行"
-                    "（疑似历史 8 字符前缀 ID 与完整 UUID 不一致）。",
-                    session_id, len(fb_rows),
-                )
-                rows = fb_rows
 
         return [self._row_to_summary_dict(r) for r in rows]
 
@@ -731,6 +741,7 @@ class SimulationDB:
         d["blocks"]            = self._decode_json(d.get("blocks"),            {})
         d["streams"]           = self._decode_json(d.get("streams"),           {})
         d["semantic_blocks"]   = self._decode_json(d.get("semantic_blocks"),   {})
+        d["execution_algorithm"] = self._decode_json(d.get("execution_algorithm"), None)
         d["impact_inputs"] = self._decode_json(d.get("impact_inputs"), {})
         d["impact_outputs"] = self._decode_json(d.get("impact_outputs"), {})
         d["converged"] = None if d.get("converged") is None else bool(d.get("converged"))

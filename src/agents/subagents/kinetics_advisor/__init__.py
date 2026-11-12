@@ -13,8 +13,8 @@ kinetics_advisor — 反应动力学参数顾问 agent。
 write_feasibility_node 的 COM 试写验证和 human_confirm_node 的用户确认。
 
 公开接口：
-  recommend_kinetics_bounds        纯规则兜底(无 LLM 依赖)
-  recommend_kinetics_bounds_agent  LLM 层,失败降级规则兜底
+  recommend_kinetics_bounds        兼容入口（严格 LLM 校验）
+  recommend_kinetics_bounds_agent  LLM 层，失败立即终止
   fit_kinetics_params               数据拟合(确定性)+可选 LLM 解读
   KineticsBoundsReport / KineticsFitOutcome  结果容器
   KineticsVarMeta / KineticsDataPoint        输入数据结构（从 models.kinetics 转发）

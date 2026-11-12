@@ -1,5 +1,7 @@
 """Common configuration and result adapter for CLI, tools, and LangGraph."""
 from __future__ import annotations
+from src.agents.errors import unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured
 
 import hashlib
 import json
@@ -81,64 +83,5 @@ def validate_agent_config(config):
 
 
 def run_configured_agent(driver, config, *, _internal: bool = False):
-    """Run the checkpointed loop as an internal service implementation.
-
-    User-facing callers must enter through ``LeadAgent``; this adapter remains
-    public only for orchestration/runtime integrations and tests.
-    """
-    if not _internal:
-        raise PermissionError("run_configured_agent is an internal LeadAgent service; use LeadAgent")
-    from src.agents.orchestration.closed_loop.journal import decode_case
-    from src.agents.orchestration.closed_loop.advisor import ProcessDecisionAgent
-    from src.agents.orchestration.closed_loop.reporting import render_explanatory_report
-    from src.optimization.pareto import compute_pareto, _restore_reference_point
-    from src.workflows.agent_optimize import optimize_agent_case
-    from src.workflows.optimize_pareto_case import ParetoOptimizeResult
-    from src.models.process_case import CaseStatus
-
-    settings = validate_agent_config(config)
-    checkpoint = config.agent_checkpoint_path or str(
-        Path(config.db_path or "output/simulation.db").with_name("agent_checkpoint.db"))
-    start = time.monotonic()
-    # IMA is optional and read-only.  Failure to configure it must never stop
-    # the optimization loop; the closed-loop bridge falls back to local rules.
-    technical_advisor = None
-    try:
-        from src.agents.subagents.technical_advisor import TechnicalAdvisor
-        from src.integrations.ima import ImaServiceClient
-        technical_advisor = TechnicalAdvisor(ImaServiceClient.from_env())
-    except Exception:
-        technical_advisor = TechnicalAdvisor(None) if 'TechnicalAdvisor' in locals() else None
-    state = optimize_agent_case(driver, config, settings=settings, checkpoint_path=checkpoint,
-                                context=config.agent_context, knowledge=config.agent_knowledge,
-                                resume=config.agent_resume,
-                                agent=ProcessDecisionAgent(config.agent_llm_config),
-                                technical_advisor=technical_advisor)
-    cases = [decode_case(row) for row in state["observations"]]
-    reference = state.get("hv_reference")
-    sample = next((c for c in cases if c.success), None)
-    reference_raw = _restore_reference_point(reference, sample, config.objective_names) if reference and sample else None
-    pareto = compute_pareto(cases, config.objective_names, reference_point=reference_raw, compute_hv=True)
-    # Human-readable report and machine-readable audit share the same checkpoint identity.
-    report_json_path = Path(checkpoint).with_suffix(".report.json")
-    report_json_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    report_md_path = Path(checkpoint).with_suffix(".report.md")
-    report_md_path.write_text(
-        render_explanatory_report(
-            state,
-            settings=settings,
-            objective_names=config.objective_names,
-        ),
-        encoding="utf-8",
-    )
-    return ParetoOptimizeResult(
-        cases=cases, pareto_result=pareto, param_bounds=config.param_bounds,
-        fixed_vars=config.fixed_vars, objective_names=config.objective_names,
-        n_total=state["used"], n_success=sum(c.success for c in cases),
-        n_sim_failed=sum(c.status == CaseStatus.SIM_FAILED for c in cases),
-        n_objective_error=sum(c.status == CaseStatus.OBJECTIVE_ERROR for c in cases),
-        n_initial=1, elapsed=time.monotonic() - start, hv_history=state["hv_history"],
-        hv_reference_point=reference, session_id=state["session_id"],
-        early_stopped=True, early_stop_reason=f"{state['termination_reason']}:{state['result']}",
-        completed_iterations=state["used"], no_improvement_count=state["stagnation_count"],
-    )
+    """Disabled legacy execution adapter; booleans cannot grant execution authority."""
+    raise PermissionError('Legacy execution disabled: no complete ActionGateway execution envelope; use an approved static simulation/optimization plan')

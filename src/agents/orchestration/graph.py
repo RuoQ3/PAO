@@ -29,6 +29,7 @@ HITL 模式（interrupt_before）：
 """
 from __future__ import annotations
 
+from src.agents.errors import AgentUnavailableError
 import pathlib
 import logging
 import tempfile
@@ -124,86 +125,8 @@ def onboarding_node(state: PAOGraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 def write_feasibility_node(state: PAOGraphState) -> dict:
-    """
-    对 ConfigDraft 的每个设计变量执行 COM 层写入测试（不运行仿真）。
-
-    在 onboarding_node 完成后、human_confirm_node 之前自动运行，
-    让用户第一次看到确认页时草案已是"可写变量"的干净集合。
-
-    - 全部通过：只追加一条成功日志，不修改草案。
-    - 有不可写变量：自动移除，追加移除说明到 messages。
-    - 剩余变量数为 0：终止流程（termination_reason=no_writable_variables）。
-    - Aspen 文件打开失败：跳过验证，草案原样透传（不阻断流程）。
-    """
-    import dataclasses as _dc
-    from src.agents.subagents.tools.verify_write_feasibility import verify_write_feasibility_impl
-
-    draft = state.config_draft
-    if draft is None or not draft.design_variables:
-        return {}   # 无草案 / 无变量，透传不做任何修改
-
-    new_msgs = list(state.messages)
-
-    report = verify_write_feasibility_impl(state.aspen_file, draft.design_variables)
-
-    # Aspen 打开失败时，report.warnings 里有说明，所有变量 writable=False
-    # 若全部失败且是因为文件打开失败，给用户友好提示并透传草案（不移除变量）
-    all_failed_due_to_open = (
-        report.warnings
-        and all(not r.writable for r in report.results)
-        and any("打开 Aspen 文件失败" in w for w in report.warnings)
-    )
-    if all_failed_due_to_open:
-        for w in report.warnings:
-            new_msgs.append(f"【写入验证】⚠ {w}，已跳过验证，变量列表保持原样。")
-        return {"messages": new_msgs, "write_feasibility_report": report}
-
-    if not report.unwritable_paths:
-        n = len(report.results)
-        new_msgs.append(f"【写入验证】全部 {n} 个设计变量写入测试通过。")
-        return {"messages": new_msgs, "write_feasibility_report": report}
-
-    # 移除不可写变量
-    bad = set(report.unwritable_paths)
-    new_dvs = [dv for dv in draft.design_variables if dv["aspen_path"] not in bad]
-    extra_warnings = [
-        f"变量 {p} COM 写入测试失败，已从优化草案中移除"
-        for p in report.unwritable_paths
-    ]
-    new_draft = _dc.replace(
-        draft,
-        design_variables=new_dvs,
-        warnings=list(draft.warnings) + extra_warnings,
-    )
-
-    new_msgs.append(
-        f"【写入验证】发现 {len(bad)} 个变量无法写入 Aspen，已自动移除："
-    )
-    for r in report.results:
-        if not r.writable:
-            new_msgs.append(f"  ✗ {r.aspen_path}：{r.error[:160]}")
-
-    if not new_dvs:
-        new_msgs.append(
-            "  移除后草案中无可用设计变量，无法继续优化，流程终止。"
-            "请检查 Aspen 仿真文件中各塔/设备的规定设置（COL-SPECS）后重新开始。"
-        )
-        return {
-            "config_draft": new_draft,
-            "write_feasibility_report": report,
-            "messages": new_msgs,
-            "current_phase": "done",
-            "termination_reason": "no_writable_variables",
-        }
-
-    new_msgs.append(
-        f"  剩余 {len(new_dvs)} 个可写变量，请在确认页核查后启动优化。"
-    )
-    return {
-        "config_draft": new_draft,
-        "write_feasibility_report": report,
-        "messages": new_msgs,
-    }
+    """Disabled: pre-approval writability probing must never touch Aspen."""
+    raise PermissionError('Legacy execution disabled: no complete ActionGateway execution envelope; use an approved static simulation/optimization plan')
 
 
 # ---------------------------------------------------------------------------
@@ -305,200 +228,7 @@ def optimization_node(state: PAOGraphState) -> dict:
     每完成一个仿真样本就将当前 Pareto 前沿和超体积历史写入 SessionEntry，
     供 SSE 流实时推送 progress 事件给前端。
     """
-    from src.agents.subagents.tools._common import (  # noqa: PLC0415
-        _import_pareto_deps, _load_optimize_config, _AspenDriver, _optimize_pareto_fn,
-    )
-    import src.agents.subagents.tools._common as _common  # noqa: PLC0415
-    from src.agents.subagents.tools.optimize_pareto import _fmt_pareto_result_summary  # noqa: PLC0415
-
-    config_path = state.config_yaml_path
-    if not config_path:
-        return {"current_phase": "done", "termination_reason": "no_config_yaml_path",
-                "messages": state.messages + ["【优化】错误：config_yaml_path 为空。"]}
-
-    new_msgs = list(state.messages)
-    new_msgs.append(f"【优化】开始第 {state.iteration + 1} 轮（配置：{config_path}）")
-
-    # 尝试导入底层依赖
-    err = _import_pareto_deps()
-    if err:
-        # 依赖不可用（非 Windows 环境），回退到 tool.invoke 方式（无实时进度）
-        from src.agents.subagents.tools.optimize_pareto import optimize_pareto_tool  # noqa: PLC0415
-        result_text = optimize_pareto_tool.invoke({"config_path": config_path, "db_path": ""})
-        failed = result_text.startswith("错误：") or "[失败]" in result_text
-        db_path = state.db_path or str(pathlib.Path(config_path).parent / "output" / "simulation.db")
-        if failed:
-            new_msgs.append(f"【优化】失败：{result_text[:200]}")
-            return {"current_phase": "done", "termination_reason": "optimization_failed",
-                    "db_path": db_path, "messages": new_msgs}
-        new_msgs.append(f"【优化】第 {state.iteration + 1} 轮完成，DB：{db_path}")
-        new_msgs.append(result_text[:500])
-        return {"current_phase": "analyzing", "db_path": db_path,
-                "iteration": state.iteration + 1, "messages": new_msgs}
-
-    # 解析配置路径
-    from src.agents.subagents.tools._common import _resolve_config_path  # noqa: PLC0415
-    try:
-        yaml_path = _resolve_config_path(config_path)
-    except FileNotFoundError as exc:
-        new_msgs.append(f"【优化】失败：{exc}")
-        return {"current_phase": "done", "termination_reason": "optimization_failed",
-                "messages": new_msgs}
-
-    # 加载配置
-    try:
-        opt_cfg, sim_filepath, driver_kwargs = _common._load_optimize_config(yaml_path)
-    except Exception as exc:
-        new_msgs.append(f"【优化】失败（配置加载）：{exc}")
-        return {"current_phase": "done", "termination_reason": "optimization_failed",
-                "messages": new_msgs}
-
-    db_path = state.db_path or str(pathlib.Path(config_path).parent / "output" / "simulation.db")
-
-    # 确定数据库路径
-    if not getattr(opt_cfg, "db_path", None):
-        opt_cfg.db_path = yaml_path.parent / "output" / "simulation.db"
-    else:
-        db_path = str(opt_cfg.db_path)
-
-    # 将 opt_cfg.session_id 对齐到 LangGraph 会话 ID，
-    # 确保工况写入数据库时用的 session_id 与后续查询时一致
-    session_id = state.session_id
-    opt_cfg.session_id = session_id
-    if state.agent_loop.get("enabled", False):
-        opt_cfg.agent_loop.update(state.agent_loop)
-        opt_cfg.agent_checkpoint_path = state.agent_checkpoint_path or str(pathlib.Path(config_path).parent / "output" / "agent_checkpoint.db")
-        opt_cfg.agent_resume = state.agent_resume
-        opt_cfg.agent_llm_config = state.llm_config
-
-    # 构建实时进度回调：每个仿真样本完成后更新 SessionEntry
-    # 用可变容器在闭包中积累 HV 历史（每次 on_case_complete 追加一个值）
-    _hv_accumulator: list[float] = []
-
-    def _on_case_complete(case, sample_idx: int, total: int) -> None:  # noqa: ANN001
-        """将当前 Pareto 前沿和 HV 历史写入 SessionEntry，触发 SSE progress 推送。"""
-        try:
-            from backend.session_store import get_entry  # noqa: PLC0415
-            from src.optimization.pareto import compute_pareto  # noqa: PLC0415
-            from src.database.simulation_db import SimulationDB  # noqa: PLC0415
-
-            entry = get_entry(session_id)
-            if entry is None:
-                return
-
-            # 从数据库读取当前 session 的所有工况计算 Pareto 前沿
-            db_file = opt_cfg.db_path
-            if db_file is None:
-                return
-
-            db = SimulationDB(db_file)
-            try:
-                rows = db.query_cases(session_id=session_id, limit=2000, offset=0)
-            finally:
-                db.close()
-
-            if not rows:
-                return
-
-            # 目标函数名必须以优化配置为准，避免数据库首个失败/部分目标工况误导图表字段。
-            obj_names: list[str] = list(getattr(opt_cfg, "objective_names", []) or [])
-            if not obj_names:
-                return
-
-            # 重建 ProcessCase，同时计算 Pareto 前沿和超体积
-            from src.agents.subagents.tools.summarize_pareto import _dict_to_process_case  # noqa: PLC0415
-            cases_list = [_dict_to_process_case(r) for r in rows]
-            pareto_result = compute_pareto(
-                cases=cases_list,
-                objective_names=obj_names,
-                compute_hv=True,    # 同时计算 HV，供 HvChart 使用
-            )
-
-            # 将第一前沿序列化为前端期望的格式 [{obj1: v1, obj2: v2, ...}]
-            points: list[dict] = []
-            if pareto_result.first_front and pareto_result.first_front.cases:
-                for pc, vec in zip(
-                    pareto_result.first_front.cases,
-                    pareto_result.first_front.objective_vectors,
-                ):
-                    pt: dict = {}
-                    for name, val in zip(obj_names, vec):
-                        pt[str(name).lower()] = val
-                    points.append(pt)
-
-            # 将当前 HV 值追加到累积列表（None 表示样本不足，不追加）
-            hv_val = pareto_result.hypervolume
-            if hv_val is not None:
-                _hv_accumulator.append(hv_val)
-
-            with entry.lock:
-                entry.pareto_points = points
-                entry.hv_history = list(_hv_accumulator)
-                entry.progress_version += 1
-
-        except Exception as exc:
-            # 提升到 warning：此回调静默失败会表现为"图不实时更新"（数据只在优化结束后才出现），
-            # 难以排查。保留异常隔离（不影响优化主流程），但让失败在日志中可见。
-            _log.warning("_on_case_complete 实时进度回调异常（已隔离，不影响优化）：%s", exc, exc_info=True)
-
-    opt_cfg.on_case_complete = _on_case_complete
-
-    # 运行优化
-    try:
-        with _common._AspenDriver(**driver_kwargs) as driver:
-            driver.open(sim_filepath)
-            result = _common._optimize_pareto_fn(driver=driver, config=opt_cfg)
-    except FileNotFoundError as exc:
-        new_msgs.append(f"【优化】失败：Aspen 仿真文件不存在 — {exc}")
-        return {"current_phase": "done", "termination_reason": "optimization_failed",
-                "db_path": db_path, "messages": new_msgs}
-    except Exception as exc:
-        new_msgs.append(f"【优化】失败：{exc}")
-        return {"current_phase": "done", "termination_reason": "optimization_failed",
-                "db_path": db_path, "messages": new_msgs}
-
-    db_path = str(opt_cfg.db_path) if opt_cfg.db_path else db_path
-
-    # 优化完成后将最终 Pareto 点和完整 HV 历史写入 SessionEntry
-    try:
-        from backend.session_store import get_entry  # noqa: PLC0415
-        entry = get_entry(session_id)
-        if entry is not None:
-            hv_clean = [v for v in result.hv_history if v is not None]
-            points: list[dict] = []
-            first_front = getattr(result, "first_front", None)
-            obj_names = list(getattr(result, "objective_names", []) or [])
-            if first_front is not None and obj_names:
-                for vec in getattr(first_front, "objective_vectors", []) or []:
-                    pt = {
-                        str(name).lower(): val
-                        for name, val in zip(obj_names, vec)
-                    }
-                    points.append(pt)
-            with entry.lock:
-                entry.pareto_points = points
-                entry.hv_history = hv_clean
-                entry.progress_version += 1
-    except Exception as exc:
-        _log.debug("优化完成后写入 hv_history 失败（已忽略）：%s", exc)
-
-    # 格式化报告文本
-    try:
-        result_text = _fmt_pareto_result_summary(result, config_path)
-    except Exception as exc:
-        result_text = f"（报告格式化失败：{exc}）"
-
-    failed = "[失败]" in result_text
-    if failed:
-        new_msgs.append(f"【优化】失败：{result_text[:200]}")
-        return {"current_phase": "done", "termination_reason": "optimization_failed",
-                "db_path": db_path, "messages": new_msgs}
-
-    new_msgs.append(f"【优化】第 {state.iteration + 1} 轮完成，DB：{db_path}")
-    new_msgs.append(result_text[:500])
-    return {"current_phase": "analyzing", "db_path": db_path,
-            "termination_reason": result.early_stop_reason if state.agent_loop.get("enabled") else None,
-            "iteration": state.iteration + 1, "messages": new_msgs}
+    raise PermissionError('Legacy execution disabled: no complete ActionGateway execution envelope; use an approved static simulation/optimization plan')
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +251,16 @@ def analysis_node(state: PAOGraphState) -> dict:
             mode="db" if state.db_path else "config",
             llm_config=state.llm_config,
         )
+    except AgentUnavailableError as error:
+        state.current_phase = "unavailable"
+        state.termination_reason = error.code
+        raise
     except Exception as exc:
-        report = f"分析出现异常：{exc}"
+        from src.agents.errors import failure_from
+        error = failure_from(exc, "graph_analysis")
+        state.current_phase = "unavailable"
+        state.termination_reason = error.code
+        raise error from None
 
     new_msgs.append(f"【分析摘要】\n{report[:300]}{'…' if len(report) > 300 else ''}")
     return {"analysis_report": report, "current_phase": "deciding", "messages": new_msgs}

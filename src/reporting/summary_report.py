@@ -600,7 +600,7 @@ def generate_variable_importance(
     for rank_i, (path, _abs_score) in enumerate(ranked, 1):
         short = _fmt_path_tail(path)
         reliable = sens.is_reliable(path)
-        reliable_str = "✓ 可靠" if reliable else "⚠ 证据不足"
+        reliable_str = "样本满足计算规则" if reliable else "⚠ 证据不足"
 
         rho = signed_rho.get(path)
         if rho is None:
@@ -622,24 +622,7 @@ def generate_variable_importance(
 
     # 简短解读（使用绝对值排序的 top 变量，但显示带符号 ρ）
     # 样本不足时跳过解读，避免输出不可靠的 ρ 值误导用户
-    if ranked and not sens.warnings:
-        top_path, top_abs = ranked[0]
-        top_short = _fmt_path_tail(top_path)
-        top_rho = signed_rho.get(top_path)
-        rho_display = f"{top_rho:+.3f}" if top_rho is not None else f"{top_abs:.3f}"
-        direction_hint = ""
-        if top_rho is not None:
-            direction_hint = (
-                "增大该变量会使目标升高。" if top_rho > 0
-                else "增大该变量会使目标降低。" if top_rho < 0
-                else ""
-            )
-        lines.append("")
-        lines.append(
-            f"> **解读**：`{top_short}` 对 `{objective_name}` 影响最大（ρ = {rho_display}）。"
-            f"{direction_hint}"
-            f" |ρ| > 0.3 的变量通常值得优先关注；|ρ| < 0.1 的变量可考虑固定以减少搜索维度。"
-        )
+    lines.append("\n仅为所选历史样本的相关性统计，不证明因果、全局重要性或工程收益。")
 
     return "\n".join(lines)
 
@@ -744,55 +727,7 @@ def generate_failure_summary(
                 f"| `{short}` | {lo:.4g} | {hi:.4g} | {mean:.4g} | {len(vals)} |"
             )
         lines.append("")
-        lines.append(
-            "> **提示**：上表显示失败工况中各设计变量的取值范围，"
-            "集中在极端值（接近上下界）附近的变量可能是高危区域，"
-            "建议适当收窄相应边界。"
-        )
-
-    # 对每个失败工况调用 diagnose_case_tool 归并诊断建议
-    lines.append("")
-    lines.append("**逐工况诊断建议：**\n")
-
-    try:
-        from src.agents.subagents.tools.diagnose_case import _impl_diagnose_case
-        _diagnose_available = True
-    except ImportError:
-        _diagnose_available = False
-
-    if not _diagnose_available:
-        lines.append("> ⚠ 无法导入 diagnose_case_tool，跳过逐工况诊断。")
-    else:
-        for row in recent_failed:
-            case_id = row.get("case_id", "")
-            short_id = case_id[:8]
-            status   = row.get("status", "?")
-            iteration = row.get("iteration", "?")
-
-            diag = _impl_diagnose_case(
-                db_path=db_path,
-                case_id=case_id,
-                include_input_verification=False,
-                include_block_details=False,
-                include_failed_outputs=True,
-                include_blocks_snapshot=False,
-                max_items=5,
-            )
-
-            if diag.startswith("错误："):
-                lines.append(f"- `{short_id}` (iter={iteration}, {status}): {diag}")
-                continue
-
-            # 从诊断报告中提取"【诊断建议】"段落
-            suggestions = _extract_diagnose_suggestions(diag)
-            if suggestions:
-                lines.append(f"- `{short_id}` (iter={iteration}, {status}):")
-                for s in suggestions[:3]:
-                    lines.append(f"  - {s}")
-            else:
-                lines.append(
-                    f"- `{short_id}` (iter={iteration}, {status}): 诊断工具未产出具体建议。"
-                )
+    lines.append("\n分析不可用：未提供绑定上述工况的 Agent 诊断。仅保留失败分布与原始记录。")
 
     return "\n".join(lines)
 
@@ -807,6 +742,8 @@ def generate_summary_report(
     session_id: str | None = None,
     intent: Any | None = None,
     baseline: dict[str, float] | None = None,
+    audit_id: str | None = None,
+    analysis_version: int | None = None,
 ) -> str:
     """
     生成完整的优化结果综合分析报告。
@@ -833,6 +770,13 @@ def generate_summary_report(
     str
         完整 Markdown 报告字符串。
     """
+    if audit_id is not None:
+        from src.reporting.answer_export import markdown_answer
+        if session_id is None:
+            raise ValueError("execution report requires exact session_id")
+        with _open_db(db_path) as db:
+            answer = db.get_execution_answer(audit_id, session_id=session_id, version=analysis_version)
+        return markdown_answer(answer)
     lines: list[str] = []
 
     # 报告头部
@@ -841,6 +785,7 @@ def generate_summary_report(
     session_note = f"  会话：`{session_id}`" if session_id else ""
     lines.append(f"# PAO 优化结果综合分析报告")
     lines.append(f"> {cfg_note}{db_note}{session_note}")
+    lines.append("> 以下是历史数值汇总。分析不可用：未选定绑定执行证据的 Agent 分析版本；不提供工程建议。")
     lines.append("")
 
     # ------------------------------------------------------------------ #

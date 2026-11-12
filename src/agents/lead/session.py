@@ -6,6 +6,7 @@ import re
 import json
 
 from src.agents.orchestration.models import Answer, ExecutionMode, SessionState
+from src.agents.errors import ensure_session_available, session_boundary
 
 
 @dataclass
@@ -13,17 +14,23 @@ class ConversationSession:
     state: SessionState
     lead: Any
 
+    @session_boundary
     def submit(self, text: str) -> Answer:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("请输入非空问题。")
+        ensure_session_available(self.state)
         self.state.history.append({"role": "user", "content": text})
-        if text.strip().casefold() in {"确认", "确认执行", "confirm", "yes", "批准"} and self.state.pending_approval is not None:
+        task = self.state.pending_task
+        if (text.strip().casefold() in {"确认", "确认执行", "confirm", "yes", "批准"}
+                and self.state.pending_approval is not None
+                and (task is None or task.phase == "awaiting_approval")):
             result = self.lead.confirm_action(self.state, approved=True)
             answer = self._action_answer(result)
-            self.state.history.append({"role": "assistant", "content": answer.text})
-            return answer
-        self._update_focus_from_turn(text)
+            return self._record_answer(answer)
+        if task is None or not task.active:
+            self._update_focus_from_turn(text)
         answer = self.lead.answer(text, self.state)
-        self.state.history.append({"role": "assistant", "content": answer.text})
-        return answer
+        return self._record_answer(answer)
 
     @staticmethod
     def _action_answer(result: Any) -> Answer:
@@ -32,26 +39,29 @@ class ConversationSession:
             return result
         if not isinstance(result, dict):
             raise TypeError(f"Unsupported action result: {type(result).__name__}")
-        report = result.get("answer") or {}
-        if isinstance(report, dict) and "backtest_conclusion" in report:
-            facts = list(report.get("observed_facts") or [])
-            limitations = list(report.get("limitations") or [])
-            lines = ["参数影响回测结果："]
-            for fact in facts:
-                lines.append(f"已运行 {fact.get('case_count', 0)} 个工况，收敛 {fact.get('converged_case_count', 0)} 个，目标指标有效 {fact.get('valid_case_count', 0)} 个，未执行 {fact.get('skipped_case_count', 0)} 个。")
-            lines.append(str(report["backtest_conclusion"]))
-            # Full diagnostics stay in structured facts/uncertainties and the
-            # file log. Terminal text contains only bounded user summaries.
-            lines.extend("失败原因：" + str(x) for x in report.get("failure_summaries", []))
-            brief_limits = report.get("user_limitations", limitations)
-            lines.extend("限制：" + str(x).splitlines()[0][:160] for x in brief_limits[:3])
-            if limitations or report.get("failure_summaries"):
-                lines.append("详细诊断请查看日志文件。")
-            return Answer(text="\n".join(lines),
-                          facts=[*facts, {"kind": "action_result", "result": result}],
-                          uncertainties=limitations)
-        return Answer(text="动作执行结果：" + json.dumps(result, ensure_ascii=False, default=str),
-                      facts=[{"kind": "action_result", "result": result}])
+        report = result.get("answer")
+        if isinstance(report, dict) and "text" in report:
+            return Answer.from_dict(report)
+        from src.agents.errors import unavailable
+        raise unavailable("agent_output_invalid", stage="action_answer",
+                          user_message="Agent 不可用：动作结果缺少已验证的分析。已执行结果保留在审计记录中。")
+
+    def _record_answer(self, answer):
+        from src.agents.reasoning import redact
+        import logging
+        payload = redact(answer.to_dict(), getattr(self.lead, "llm_config", None))
+        self.state.history.append({"role": "assistant", "content": answer.text, "answer": payload})
+        self.state.audit_events.append({"event": "answer_created", "answer": payload})
+        logging.getLogger(__name__).info("Answer audit: %s", json.dumps(payload, ensure_ascii=False),
+                                        extra={"pao_file_only": True})
+        return answer
+
+    @property
+    def last_answer(self):
+        for turn in reversed(self.state.history):
+            if turn.get("answer"):
+                return Answer.from_dict(turn["answer"])
+        return None
 
     def _update_focus_from_turn(self, text: str, *, answer: Any = None) -> None:
         """Persist explicit conversation targets; never scan arbitrary history."""
@@ -70,30 +80,36 @@ class ConversationSession:
         if any(x in low for x in ("mole fraction", "molar fraction", "富集", "摩尔分数")): focus["metric"] = "mole_fraction"
         elif any(x in low for x in ("purity", "纯度")): focus["metric"] = "purity"
         elif any(x in low for x in ("recovery", "回收率")): focus["metric"] = "recovery"
-        # Resolve the explicitly requested bottom outlet using the loaded
-        # process graph.  Multiple candidates remain unresolved.
-        if "塔底" in str(text) and focus.get("equipment"):
-            try:
-                context = self.lead._context(self.state)
-                candidates = [s for s in (getattr(context, "streams", []) or [])
-                              if str(s.get("source") or s.get("source_node") or "").casefold() == str(focus["equipment"]).casefold()
-                              and any(k in str(s).casefold() for k in ("bottom", "塔底", "bottoms"))]
-                if len(candidates) == 1:
-                    focus["stream"] = str(candidates[0].get("id") or candidates[0].get("name"))
-            except Exception:
-                pass
 
+    @session_boundary
     def propose_closed_loop(self, text: str, *, config: Any, **kwargs: Any):
         """Route an optimization request through the same LeadAgent session."""
         self.state.history.append({"role": "user", "content": text})
         answer = self.lead.propose_closed_loop(question=text, config=config, session=self.state, **kwargs)
-        self.state.history.append({"role": "assistant", "content": answer.text})
-        return answer
+        return self._record_answer(answer)
 
+    @session_boundary
     def confirm_closed_loop(self, *, approved: bool = True):
-        return self.lead.confirm_closed_loop(self.state, approved=approved)
+        result = self.lead.confirm_closed_loop(self.state, approved=approved)
+        return self._record_answer(self._action_answer(result))
 
     def to_dict(self) -> dict[str, Any]:
         return self.state.to_dict()
 
+    def save_checkpoint(self, path) -> None:
+        """Persist conversation state separately from numerical runtime caches."""
+        from src.agents.orchestration.closed_loop.journal import SessionJournal
+        with SessionJournal(path) as journal:
+            journal.save({"kind": "conversation", "version": 1, "session": self.to_dict()})
 
+    @classmethod
+    def from_checkpoint(cls, path, lead):
+        from src.agents.orchestration.closed_loop.journal import SessionJournal
+        from src.agents.errors import internal_error
+        with SessionJournal(path) as journal:
+            payload = journal.load()
+        if not payload or payload.get("kind") != "conversation" or payload.get("version") != 1:
+            raise internal_error("conversation_checkpoint_invalid", stage="session_restore")
+        session = cls(SessionState.from_dict(payload["session"]), lead)
+        lead._revoke_restored_approvals(session.state)
+        return session

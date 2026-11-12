@@ -11,108 +11,115 @@ from src.agents.orchestration.models import (
     IntentSchema,
     SubagentRequest,
 )
+from src.agents.errors import AgentInternalError, AgentUnavailableError, unavailable, failure_from, mark_unavailable, ensure_session_available
+from src.agents.reasoning import configured, redact
 from . import llm_client
 from .intent_response_adapter import IntentResponseAdapter
 
 
-_PROJECT_HINTS = (
-    "aspen", "simulation", "simulate", "optimization", "optimize", "pareto",
-    "process", "equipment", "stream", "unit", "model", "case", "experiment",
-    "塔", "设备", "装置", "物流", "流程", "工艺", "仿真", "模拟", "优化", "边界",
-    "动力学", "参数", "结果", "模型", "实验", "方案", "刚才", "继续", "保存", "fail", "tower", "impact", "credible",
-)
-_ACTION_HINTS = ("modify", "change", "write", "set ", "run ", "execute", "save", "修改", "改变", "写入", "运行", "执行", "保存")
-
-
-_CHINESE_PROJECT_HINTS = tuple([chr(39033)+chr(30446),chr(35774)+chr(22791),chr(35013)+chr(32622),chr(29289)+chr(27969),chr(27969)+chr(32929),chr(29289)+chr(26009),chr(24037)+chr(33402),chr(20316)+chr(29992),chr(21151)+chr(33021),chr(21407)+chr(29702),chr(31934)+chr(39311),chr(21453)+chr(24212)+chr(22120),chr(27969)+chr(31243)])
-_EQUIPMENT_ID_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d{3,4}(?:-[A-Za-z0-9]+)?)(?![A-Za-z0-9])")
-_FOLLOW_UP_HINTS = tuple([chr(0x6240)+chr(0x4ee5), chr(0x7136)+chr(0x540e), chr(0x8fd9)+chr(0x610f)+chr(0x5473), chr(0x8fd9)+chr(0x8bf4)+chr(0x660e), chr(0x80fd)+chr(0x5206)+chr(0x6790), chr(0x600e)+chr(0x4e48)+chr(0x770b)]) + ("so what", "what does that mean")
-_ANALYSIS_HINTS = ("analysis", "analyze", "impact", chr(0x5206)+chr(0x6790), chr(0x4f5c)+chr(0x7528), chr(0x610f)+chr(0x4e49), chr(0x539f)+chr(0x56e0), chr(0x5f71)+chr(0x54cd), chr(0x8bc4)+chr(0x4f30), chr(0x5224)+chr(0x65ad))
-_IMPACT_HINTS = ("impact", "sensitivity", "parameter", "parameters", "reflux", "purity", "mole fraction", "影响", "参数", "回流比", "纯度", "摩尔分数", "富集", "权衡", chr(0x5f71)+chr(0x54cd), chr(0x53c2)+chr(0x6570), chr(0x56de)+chr(0x6d41), chr(0x7eaf)+chr(0x5ea6), chr(0x5bcc)+chr(0x96c6), chr(0x6743)+chr(0x8861))
-_PARAMETER_SPECIFIC_HINTS = ("sensitivity", "parameter", "parameters", "reflux", "purity", "mole fraction", "参数", "回流比", "纯度", "摩尔分数", "富集", "权衡", chr(0x53c2)+chr(0x6570), chr(0x56de)+chr(0x6d41), chr(0x7eaf)+chr(0x5ea6), chr(0x5bcc)+chr(0x96c6), chr(0x6743)+chr(0x8861))
-
-
 class IntentClassifier:
-    """Classify every turn through strict JSON, with explicit rule fallback."""
+    """Classify every turn through one strictly validated LLM path."""
 
     def __init__(self, *, llm_config: Any = None, llm_call: Callable[..., str] | None = None,
                  confidence_threshold: float = 0.55, logger: Any = None, enabled: bool = True):
         self.llm_config = llm_config
         self.llm_call = llm_call or llm_client.chat_json
         self.response_adapter = IntentResponseAdapter()
+        if type(confidence_threshold) not in (int, float) or not .55 <= confidence_threshold <= 1:
+            raise ValueError("confidence_threshold must be in [.55, 1]")
         self.confidence_threshold = float(confidence_threshold)
         self.logger = logger or logging.getLogger(__name__)
         self.enabled = enabled
 
     def classify(self, question: str, *, session: Any = None) -> Classification:
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("请输入非空问题。")
+        if session is not None:
+            ensure_session_available(session)
         attempts = []
+        try:
+            return self._classify(question, session=session, attempts=attempts)
+        except AgentUnavailableError as error:
+            if session is not None:
+                mark_unavailable(session, error)
+                session.classification_retry_count = error.retry_count
+                session.audit_events.append({"event": "intent_classification_trace", "retry_count": error.retry_count,
+                    "failure_code": error.code, "audit_id": error.audit_id,
+                    "attempts": self._public_attempts(attempts)})
+            self.logger.error("%s: %s", "agent_internal_error" if isinstance(error, AgentInternalError) else "agent_unavailable", error.to_dict())
+            raise
+
+    @staticmethod
+    def _public_attempts(attempts):
+        return [{"attempt": a["attempt"], "error": {
+            k: v for k, v in a.get("error", {}).items() if k in {"code", "cause_type"}}}
+            for a in attempts]
+
+    def _classify(self, question: str, *, session: Any = None, attempts: list) -> Classification:
 
         def finish(result, retries=0):
             result.retry_count = retries
             if session is not None:
                 session.intent = result.intent
                 session.classification_source = result.classification_source
-                session.fallback_reason = result.fallback_reason
                 session.classification_retry_count = retries
                 session.audit_events.append({
                     "event": "intent_classification_trace", "classification_source": result.classification_source,
-                    "fallback_reason": result.fallback_reason, "retry_count": retries, "attempts": attempts,
+                    "retry_count": retries, "attempts": self._public_attempts(attempts),
                 })
             self.logger.debug("intent classification trace: %s", {
-                "source": result.classification_source, "fallback_reason": result.fallback_reason,
-                "retry_count": retries, "attempts": attempts})
+                "source": result.classification_source,
+                "retry_count": retries, "attempts": attempts}, extra={"pao_file_only": True})
             return result
 
-        def fallback(reason, retries=0):
-            return finish(self._fallback(question or "", reason, session=session), retries)
-
         if not isinstance(question, str) or not question.strip():
-            return fallback("empty_message")
-        if not self.enabled:
-            return fallback("llm_disabled")
-        try:
-            cfg = self.llm_config or llm_client.load_llm_config()
-            if not llm_client.is_configured(cfg):
-                return fallback("llm_key_missing")
-        except Exception as exc:
-            self.logger.exception("intent classifier configuration failed")
-            return fallback(self._reason_code(exc))
-
+            raise unavailable("agent_output_invalid", stage="intent_input", user_message="请输入非空问题。")
+        cfg = configured(self.llm_config, enabled=self.enabled)
         focus = ((getattr(session, "runtime_state", {}) or {}).get("conversation_focus") or {})
         request = json.dumps({"question": question, "conversation_focus": focus}, ensure_ascii=False)
         for attempt in range(2):
-            trace = {"attempt": attempt, "request": request}
+            trace = {"attempt": attempt, "request": redact(request, cfg)}
             attempts.append(trace)
             try:
                 raw = self.llm_call(cfg, system=self._system_prompt(), user=request)
             except Exception as exc:
-                trace["error"] = {"code": self._reason_code(exc), "message": str(exc)}
-                self.logger.exception("intent provider request failed (attempt=%s)", attempt)
-                return fallback(self._reason_code(exc), attempt)
-            trace["raw_response"] = raw
-            self.logger.debug("intent raw response attempt=%s: %r", attempt, raw)
+                trace["error"] = {"code": self._reason_code(exc), "cause_type": type(exc).__name__}
+                self.logger.error("intent provider request failed (attempt=%s, type=%s)", attempt, type(exc).__name__)
+                error = failure_from(exc, "intent_request", attempt)
+                error.retry_count = attempt
+                raise error from None
+            trace["raw_response"] = redact(raw, cfg)
+            self.logger.debug("intent raw response attempt=%s: %r", attempt, redact(raw, cfg), extra={"pao_file_only": True})
             try:
-                intent = self.response_adapter.parse(raw)
+                intent = self.response_adapter.parse(redact(raw, cfg), validator=self._validate_provider_payload)
             except (ValueError, TypeError, KeyError) as exc:
-                error = {"code": self._reason_code(exc), "message": str(exc)}
+                error = {"code": self._reason_code(exc), "cause_type": type(exc).__name__, "message": redact(str(exc), cfg)}
                 trace["error"] = error
-                self.logger.warning("intent validation failed attempt=%s: %s", attempt, error)
+                trace["validation_error"] = error
+                self.logger.debug("intent validation failed attempt=%s: %s", attempt, error, extra={"pao_file_only": True})
                 if attempt == 1:
-                    return fallback(error["code"], 1)
+                    raise unavailable("llm_repair_failed",
+                                      stage="intent_validation", retry_count=1, cause=exc) from None
                 request = self.response_adapter.build_repair_request(
-                    question=question, focus=focus, raw=raw, error=error)
-                self.logger.debug("intent repair request: %s", request)
+                    question=redact(question, cfg), focus=redact(focus, cfg), raw=redact(raw, cfg), error=error)
+                self.logger.debug("intent repair request: %s", redact(request, cfg), extra={"pao_file_only": True})
                 continue
-            if intent.confidence < self.confidence_threshold:
+            if intent.confidence < self.confidence_threshold and not intent.missing_information:
                 trace["error"] = {"code": "low_confidence", "message": "confidence below threshold"}
-                return fallback("low_confidence", attempt)
+                raise unavailable("llm_low_confidence", stage="intent_validation", retry_count=attempt)
             return finish(Classification(intent=intent,
                 classification_source="llm_repaired" if attempt else "llm"), attempt)
         raise AssertionError("unreachable classification state")
 
+    def _validate_provider_payload(self, payload):
+        return self.response_adapter.validate_provider_payload(payload)
+
     @staticmethod
     def _system_prompt() -> str:
         return (
+            "For process feed/product/section purpose questions choose analysis and process_advisor. "
+            "Current project questions require process_context. context_required only allows process_context, yaml, node_db, simulation_db, history, files, none. "
+            "analysis must be an object; ordinary intents use {}. "
             "Classify the PAO user message. Return one JSON object only, with exactly these fields: "
             "intent, task_type, project_scope, context_required, subagents, action_type, "
             "requires_confirmation, confidence, missing_information, reason, analysis. "
@@ -127,6 +134,9 @@ class IntentClassifier:
             "Any modify, simulation, optimization, parameter impact or structure action requires_confirmation=true. "
             "For parameter_impact, put slots in analysis: equipment, target_stream, target_component, metric, candidate_parameters. "
             "All five analysis keys are required for parameter_impact; candidate_parameters is an array of strings. "
+            "candidate_parameters is OPTIONAL experimental input: use [] for automatic evidence-based selection. "
+            "Never list candidate_parameters in missing_information merely because the user did not name parameters. "
+            "Populate it only when the user explicitly restricts the parameter scope. "
             "For unresolved scalar slots use null and list their key in missing_information; never invent values. "
             "Input may be a repair_intent_json request containing an invalid response and validation errors. "
             "Return only a corrected COMPLETE JSON object, no explanation and no Markdown. "
@@ -147,140 +157,4 @@ class IntentClassifier:
         if isinstance(exc, TimeoutError):
             return "request_timeout"
         return "llm_api_failure"
-
-    def _fallback(self, question: str, reason: str, *, session: Any = None) -> Classification:
-        q = question.casefold()
-        project = self._is_project_related(q, session)
-        action = self._action_type(q)
-        intent = self._intent(q, project, action)
-        analysis = self._impact_slots(question, session) if intent == "parameter_impact" else {}
-        if intent == "parameter_impact":
-            action = "simulate_once"
-        confirmation = action in {"modify_file", "set_parameter", "simulate_once", "optimize", "modify_structure"}
-        context = ["process_context"] if project else ["none"]
-        subagents = self._subagents(intent, q)
-        schema = IntentSchema(
-            intent=intent,
-            task_type=self._task_type(intent),
-            project_scope="current_session" if project and session is not None else ("current_project" if project else "none"),
-            context_required=context,
-            subagents=subagents,
-            action_type=action,
-            requires_confirmation=confirmation,
-            confidence=0.35 if project else 0.2,
-            missing_information=self._impact_missing(analysis) if intent == "parameter_impact" else [],
-            reason=f"rule fallback: {reason}",
-            analysis=analysis,
-        )
-        result = Classification(intent=schema, classification_source="rule_fallback", fallback_reason=reason)
-        return result
-
-    @staticmethod
-    def _is_project_related(q: str, session: Any) -> bool:
-        if not q.strip(" ?!.,;:???"):
-            return False
-        if any(h in q for h in _PROJECT_HINTS + _CHINESE_PROJECT_HINTS) or _EQUIPMENT_ID_RE.search(q) or (re.search(r"(?<!\d)\d{4}(?!\d)", q) and any(x in q for x in ("\u6d41\u80a1", "\u7269\u6d41", "\u7269\u6599", "stream"))):
-            return True
-        # ConversationSession appends the current user turn before invoking
-        # the classifier.  Do not let that single entry make an ordinary
-        # greeting look like an implicit project follow-up.  Only prior turns
-        # containing PAO terms, or explicit context references, carry scope
-        # into an otherwise implicit question.
-        history = getattr(session, "history", None) if session is not None else None
-        prior_history = list(history[:-1]) if isinstance(history, list) and history else []
-        prior_text = " ".join(
-            str(item.get("content", "")) for item in prior_history
-            if isinstance(item, dict)
-        ).casefold()
-        refs = getattr(session, "context_refs", None) if session is not None else None
-        return bool(refs) or any(h in prior_text for h in _PROJECT_HINTS + _CHINESE_PROJECT_HINTS) or bool(_EQUIPMENT_ID_RE.search(prior_text)) or any(h in q for h in _FOLLOW_UP_HINTS)
-
-    @staticmethod
-    def _action_type(q: str) -> str:
-        if any(x in q for x in ("simulate", "simulation", "仿真", "模拟")):
-            return "simulate_once"
-        if any(x in q for x in ("optimize", "optimization", "优化", "pareto")) and any(x in q for x in _ACTION_HINTS):
-            return "optimize"
-        if any(x in q for x in ("boundary", "边界")) and any(x in q for x in ("change", "modify", "set ", "修改", "改变")):
-            return "modify_structure"
-        if any(x in q for x in ("modify", "change", "write", "set ", "save", "修改", "改变", "写入", "保存")):
-            return "modify_file"
-        return "read"
-
-    @staticmethod
-    def _intent(q: str, project: bool, action: str) -> str:
-        # Impact requests have their own slot schema and must be routed before
-        # generic analysis, including short follow-ups with implicit context.
-        if any(x in q for x in _PARAMETER_SPECIFIC_HINTS + ("影响", "参数", "富集", "纯度", "回收率", "能耗", "再沸器负荷")) and (project or action in {"read", "simulate_once"}) and not any(x in q for x in ("改大", "改小", "调高", "调低")):
-            return "parameter_impact"
-        if "刚才" in q and "参数" in q and "影响" in q and not any(x in q for x in ("目标组分", "目标物流", "富集")):
-            return "analysis"
-        if action in {"modify_file", "set_parameter", "modify_structure"}:
-            return "modify_request"
-        if action == "simulate_once":
-            return "simulation_request"
-        if action == "optimize":
-            return "optimization_request"
-        if any(x in q for x in ("report", "报告")):
-            return "report_request"
-        if any(x in q for x in ("code", "代码", "源码")):
-            return "code_request"
-        if project:
-            return "analysis" if any(x in q for x in _ANALYSIS_HINTS + _FOLLOW_UP_HINTS) else "project_query"
-        return "chat" if len(q.split()) < 12 else "general_question"
-
-    @staticmethod
-    def _impact_slots(question: str, session: Any = None) -> dict[str, Any]:
-        """Extract slots and inherit only structured conversation focus."""
-        q = question.strip()
-        focus = dict(((getattr(session, "runtime_state", {}) or {}).get("conversation_focus") or {}) if session is not None else {})
-        ids = [m.group(1) for m in _EQUIPMENT_ID_RE.finditer(q)]
-        streams = re.findall(r"(?<![A-Za-z0-9])\d{4}(?![A-Za-z0-9])", q)
-        components = re.findall(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9_-]{1,15})(?![A-Za-z0-9])", q)
-        components = [x for x in components if x != "ASPEN" and not re.match(r"^[A-Z]{1,4}\d{3,4}$", x)]
-        low = q.casefold()
-        if any(x in low for x in ("mole fraction", "molar fraction", "enrichment", "富集", "摩尔分数")): metric = "mole_fraction"
-        elif any(x in low for x in ("purity", "纯度")): metric = "purity"
-        elif any(x in low for x in ("recovery", "回收率")): metric = "recovery"
-        elif any(x in low for x in ("energy", "能耗")): metric = "energy"
-        elif any(x in low for x in ("duty", "再沸器负荷", "冷凝器负荷", "热负荷")): metric = "duty"
-        else: metric = None
-        return {"equipment": ids[-1] if ids else focus.get("equipment"),
-                "target_stream": streams[-1] if streams else focus.get("stream"),
-                "target_component": components[0] if components else focus.get("component"),
-                "metric": metric or focus.get("metric"), "candidate_parameters": []}
-
-
-    @staticmethod
-    def _impact_missing(slots: dict[str, Any]) -> list[str]:
-        prompts = {"equipment": "请提供目标设备名称。", "target_stream": "请提供目标物流。", "target_component": "请提供目标组分。", "metric": "请提供评价指标（如 mole_fraction、purity、energy）。"}
-        return [prompts[k] for k, v in slots.items() if k in prompts and not v]
-
-    @staticmethod
-    def _task_type(intent: str) -> str:
-        return {
-            "chat": "chat", "project_query": "project_query", "analysis": "analysis",
-            "modify_request": "modify_request", "simulation_request": "simulation_request",
-            "optimization_request": "optimization_request", "report_request": "report_request",
-            "code_request": "code_request", "general_question": "general_question",
-            "parameter_impact": "parameter_impact",
-        }[intent]
-
-    @staticmethod
-    def _subagents(intent: str, q: str) -> list[SubagentRequest]:
-        if intent in {"chat", "general_question"}:
-            return []
-        if intent in {"optimization_request", "parameter_impact"}:
-            return [SubagentRequest("optimization_advisor", "Review objectives, constraints, budget and history.")]
-        if "边界" in q or "boundary" in q:
-            return [SubagentRequest("boundary_advisor", "Review soft search bounds against PAO hard bounds.")]
-        if "动力学" in q or "kinetic" in q:
-            return [SubagentRequest("kinetics_advisor", "Analyze kinetics data and parameter evidence.")]
-        if intent in {"project_query", "analysis"}:
-            return [SubagentRequest("process_advisor", "Analyze the read-only PAO process context.")]
-        if intent == "code_request":
-            return [SubagentRequest("code_engineer", "Inspect the requested code concern without writing files.")]
-        if intent == "report_request":
-            return [SubagentRequest("report_writer", "Prepare a report from verified evidence.")]
-        return [SubagentRequest("general_agent", "Answer the general question.")]
 

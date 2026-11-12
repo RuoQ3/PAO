@@ -76,7 +76,7 @@ class TunableVariable:
     unit: str
     confidence: Literal["high", "medium", "low"]
     reason: str
-    priority_score: float = 0.5   # 0.0~1.0；LLM 评分，降级时由 confidence 映射
+    priority_score: float = 0.5   # 0.0~1.0；LLM 评分，只接受已验证的 LLM 评分
     priority_reason: str = ""     # LLM 给出的重要性说明
 
 
@@ -375,5 +375,5 @@ class PrioritizationResult:
     ranked_variables: list[TunableVariable]   # 已按 priority_score 降序排列
     ranking_notes: str = ""                    # LLM 对整体排序的说明
     warnings: list[str] = field(default_factory=list)
-    source: str = "llm"                        # "llm" | "fallback"
+    source: str = "llm"                        # verified LLM
 

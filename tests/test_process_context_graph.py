@@ -1,4 +1,6 @@
 """Cross-case contracts for the read-only normalized process graph."""
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 
 from src.agents import ConversationSession, LeadAgent, SessionState
 from src.agents.context import ProcessContextBuilder
@@ -57,7 +59,7 @@ def test_duplicate_sources_are_retained_as_conflicts():
 
 def test_short_followup_uses_current_project_context_without_case_names():
     builder = ProcessContextBuilder(config=_config(), read_only=True)
-    session = ConversationSession(SessionState(), LeadAgent(context_builder=builder, use_llm=False))
+    session = ConversationSession(SessionState(), LeadAgent(context_builder=builder, **fake_kwargs()))
     first = session.submit("这个项目有哪些设备和物流？")
     second = session.submit("然后呢？")
     assert first.facts

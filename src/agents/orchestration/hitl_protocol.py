@@ -588,7 +588,7 @@ def start_session(
     node_db_path:
         节点目录数据库路径（.db）；空字符串时不使用 NodeDB。
     llm_config:
-        LLMConfig 实例，None 表示不使用 LLM（降级到关键词匹配意图解析）。
+        LLMConfig 实例，None 表示加载 LLM 配置；不可用则终止。
     max_iterations:
         状态机允许的最大优化轮次（传递给 PAOGraphState.max_iterations）。
     max_confirm_retries:

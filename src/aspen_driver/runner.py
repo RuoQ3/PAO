@@ -125,6 +125,13 @@ class SimulationRunner:
         -------
         SimulationResult
         """
+        from src.agents.actions.authorization import require_authorization, _evaluation, validate_inputs
+        grant = require_authorization()
+        timeout = min(timeout, grant.deadline - time.monotonic())
+        frame = _evaluation.get()
+        if frame is None or frame["inputs"] != inputs:
+            raise PermissionError("SimulationRunner requires a reserved Gateway evaluation")
+        validate_inputs({**inputs, **(extra_init_values or {})}, grant.schema, grant.scope)
         # source_filepath 在整个 run_case 期间不会变化，提前记录一次即可。
         # mutation_snapshot 每次返回时通过 _make_result() 读取当前值，
         # 确保快照反映的是本次尝试结束后 Aspen 树的实际输入状态。
@@ -137,13 +144,12 @@ class SimulationRunner:
                 **kwargs,
             )
 
-        # 1. 写入输入变量（写失败的变量记入警告并跳过，不中止整个工况）
+        # 1. 写入输入变量；任何失败都停止，禁止使用文件旧值继续运行。
         write_errors = self._write_inputs(inputs)
         if write_errors:
-            _log.warning(
-                "run_case：%d 个输入变量写入失败，已跳过，继续使用文件当前值运行：\n%s",
-                len(write_errors), "\n".join(write_errors),
-            )
+            return _make_result(status=RunStatus.RUN_FAILED, success=False,
+                                requested_inputs=inputs, actual_inputs={},
+                                error="Input write failed; model was not run: " + "; ".join(write_errors))
 
         # 2. 读回校验输入
         verifications: list[InputVerification] = []
@@ -161,6 +167,10 @@ class SimulationRunner:
                     msg = f"输入不一致 {v.path}：请求={v.requested!r} 实际={v.actual!r} {v.note}"
                     _log.warning("  %s", msg)
                     input_warnings.append(msg)
+            if unmatched:
+                return _make_result(status=RunStatus.RUN_FAILED, success=False,
+                                    requested_inputs=inputs, actual_inputs=actual_inputs,
+                                    input_verifications=verifications, error="Input readback mismatch; model was not run")
 
         # 3. Reinit
         if reinit:
@@ -289,14 +299,6 @@ class SimulationRunner:
             history_text = "Aspen history diagnostics: " + " | ".join(history_diagnostics)
             status_error = f"{status_error}\n{history_text}" if status_error else history_text
             # 收敛知识库：对原始错误文本做模式匹配，追加结构化中文诊断建议
-            try:
-                from src.optimization.convergence_kb import match_failure_patterns
-                for _diag in match_failure_patterns(history_diagnostics, max_patterns=2):
-                    _kb_msg = f"[收敛KB] {_diag.description} → {_diag.fixes[0]}"
-                    all_warnings.append(_kb_msg)
-                    _log.warning("runner.run_case: %s", _kb_msg)
-            except Exception:
-                pass  # KB 匹配失败不影响主流程
 
         # 输入不一致时，将 SUCCESS 降级为 WARNINGS
         if input_warnings and overall_status == RunStatus.SUCCESS:

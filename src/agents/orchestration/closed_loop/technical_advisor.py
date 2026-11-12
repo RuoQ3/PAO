@@ -5,6 +5,8 @@ an Aspen action and it treats all advice as untrusted evidence for the primary
 decision agent and the existing ``ActionPlan`` validator.
 """
 from __future__ import annotations
+from src.agents.errors import AgentUnavailableError, unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured, redact
 
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -102,7 +104,11 @@ def consult(snapshot: dict, state: dict, context: dict | None, *, advisor: Any =
     try:
         result = (advisor or TechnicalAdvisor(None)).advise(question, _process_context(context, snapshot))
         raw = _as_dict(result)
+        if raw.get("degraded"):
+            raise unavailable("subagent_unavailable", stage="technical_advisor_legacy")
         advice = raw.get("advice") if isinstance(raw.get("advice"), dict) else raw
+        if not isinstance(advice.get("conclusion"), str) or not advice["conclusion"].strip():
+            raise unavailable("agent_output_invalid", stage="technical_advisor_summary")
         evidence_ids = set()
         for item in (raw.get("simulation_evidence") or []) + (advice.get("evidence") or []):
             item = _as_dict(item)
@@ -122,6 +128,10 @@ def consult(snapshot: dict, state: dict, context: dict | None, *, advisor: Any =
         clean = []
         for i, h in enumerate(hypotheses[:8]):
             h = _as_dict(h)
+            if not isinstance(h.get("statement", h.get("hypothesis")), str):
+                raise unavailable("agent_output_invalid", stage="technical_hypothesis")
+            if not set(h.get("evidence_case_ids", [])) <= known or not set(h.get("probe_variables", h.get("suggested_probe_variables", []))) <= hard:
+                raise unavailable("agent_output_invalid", stage="technical_references")
             refs = [x for x in h.get("evidence_case_ids", []) if x in known]
             probes = [x for x in h.get("probe_variables", h.get("suggested_probe_variables", [])) if x in hard]
             if not probes:
@@ -140,10 +150,9 @@ def consult(snapshot: dict, state: dict, context: dict | None, *, advisor: Any =
             source = _as_dict(source)
             sources.append({k: str(source.get(k))[:300] for k in ("source", "title", "chapter", "page", "quote") if source.get(k) is not None})
         summary = str(advice.get("conclusion") or "")[:max_chars]
-        return {"available": True, "degraded": bool(raw.get("degraded")), "trigger": trigger,
+        return {"available": True, "trigger": trigger,
                 "summary": summary, "hypotheses": clean, "ima_sources": sources,
                 "risks": [str(x)[:300] for x in (advice.get("risks") or [])[:8]],
                 "query": str(raw.get("query") or "")[:500]}
     except Exception as exc:
-        return {"available": False, "degraded": True, "trigger": trigger, "summary": None,
-                "hypotheses": [], "ima_sources": [], "error": f"{type(exc).__name__}: {exc}"[:500]}
+        raise failure_from(exc, "closed_loop_technical_advisor") from None

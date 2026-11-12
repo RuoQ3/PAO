@@ -119,6 +119,12 @@ def _dict_to_process_case(row: dict[str, Any]) -> Any:
         constraints=constraints,
         tags=list(row.get("tags") or []),
         notes=row.get("notes", ""),
+        session_id=row.get("session_id", ""), run_id=row.get("run_id"),
+        impact_inputs=dict(row.get("impact_inputs") or {}), impact_outputs=dict(row.get("impact_outputs") or {}),
+        converged=row.get("converged"), errors=list(row.get("errors") or []),
+        warnings=list(row.get("warnings") or []), result_source=row.get("result_source"),
+        execution_algorithm=row.get("execution_algorithm"), model_path=row.get("model_path"),
+        timestamp=row.get("timestamp"),
     )
 
 

@@ -4,6 +4,8 @@ These tests use deterministic fake handlers/executors.  They intentionally do
 not require Aspen COM, a provider SDK, a database server, or an LLM key.
 """
 from __future__ import annotations
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from src.agents import LeadAgent
-from src.agents.actions import ActionGateway
+from src.agents.actions import MockExecutor, ActionGateway
 from src.agents.actions.models import ModelIdentity, ModelSchema, ParameterSpec, ActionRequest, ActionType
 from src.agents.orchestration import (
     ActionProposal, ApprovalRequest, OrchestrationRuntime, RuntimePolicy,
@@ -21,8 +23,9 @@ from src.agents.subagents.registry import SubagentRegistry
 
 
 def test_lead_answers_general_and_routes_project_question_without_context():
-    lead = LeadAgent()
+    lead = LeadAgent(**fake_kwargs(kind="chat"))
     assert lead.answer("What is a control chart?").facts
+    lead = LeadAgent(**fake_kwargs(role="kinetics_advisor"))
     answer = lead.answer("请分析动力学数据")
     assert answer.task_results[0].agent == "kinetics_advisor"
     assert answer.text
@@ -52,9 +55,8 @@ def test_runtime_failure_isolated_and_delegation_is_bounded():
 
     policy = RuntimePolicy(max_tasks=2, total_budget=2, allow_subagent_delegation=False)
     runtime = OrchestrationRuntime({"bad": boom, "ok": ok}, policy=policy)
-    bad, good = runtime.run([TaskSpec(agent="bad", allow_subtasks=True), TaskSpec(agent="ok")])
-    assert bad.status is TaskStatus.FAILED
-    assert good.status is TaskStatus.COMPLETED
+    with pytest.raises(AgentUnavailableError):
+        runtime.run([TaskSpec(agent="bad", allow_subtasks=True), TaskSpec(agent="ok")])
     assert not TaskSpec(agent="ok", allow_subtasks=True).allow_subtasks or not policy.allow_subagent_delegation
 
 
@@ -72,12 +74,12 @@ def _gateway():
             r"\Data\Blocks\T1\Input\RR", value_type="float", minimum=0.1, maximum=5.0,
             impact_targets=("objective",), requires_simulation=True)},
     )
-    return ActionGateway(schema)
+    return ActionGateway(schema, executor=MockExecutor())
 
 
 def test_write_request_creates_pending_approval_and_gateway_requires_confirmation():
     gateway = _gateway()
-    lead = LeadAgent(action_gateway=gateway, policy=RuntimePolicy(allow_writes=True))
+    lead = LeadAgent(action_gateway=gateway, policy=RuntimePolicy(allow_writes=True), **fake_kwargs(kind="modify_request", action="modify_structure"))
     answer = lead.answer("修改边界")
     assert isinstance(answer.approval_request, ApprovalRequest)
     assert answer.approval_request.status == "pending"
@@ -94,12 +96,12 @@ def test_action_gateway_executes_only_after_approval_and_records_audit():
     gateway.preview(action.audit_id)
     gateway.approve(action.audit_id)
     output = gateway.execute(action.audit_id)
-    assert output["status"] == "executed"
+    assert output["status"] == "simulated" and not output["real_execution"]
     assert {event.event_type.value for event in gateway.audit.events} >= {"user_request", "validation", "preview", "confirmation", "execution"}
 
 
 def test_checkpoint_round_trip_preserves_nested_approval_and_task_result():
-    state = SessionState(pending_approval=ApprovalRequest(ActionProposal("inspect", "project")), task_results=[TaskResult("1", "a", summary="ok")])
+    state = SessionState(classification_source="llm", pending_approval=ApprovalRequest(ActionProposal("inspect", "project")), task_results=[TaskResult("1", "a", summary="ok")])
     restored = SessionState.from_json(state.to_json())
     assert restored.pending_approval.proposal.action_type == "inspect"
     assert restored.task_results[0].summary == "ok"
@@ -121,5 +123,6 @@ def test_no_llm_key_is_clear_and_unrelated_question_does_not_build_process_conte
             calls.append(kwargs)
             raise AssertionError("context should not be built")
 
-    answer = LeadAgent(context_builder=Builder()).answer("hello")
-    assert answer.facts and not calls
+    with pytest.raises(AgentUnavailableError):
+        LeadAgent(context_builder=Builder()).answer("hello")
+    assert not calls

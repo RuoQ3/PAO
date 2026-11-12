@@ -1,3 +1,5 @@
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,21 +20,18 @@ def test_closed_loop_service_requires_explicit_confirmation():
 
 def test_confirmed_closed_loop_runs_fake_runner_and_writes_metadata(tmp_path: Path):
     calls = []
-    service = ClosedLoopService(runner=lambda driver, config, **kwargs: calls.append(kwargs) or {"status": "done", "used": 1})
+    service = ClosedLoopService(runner=lambda *a, **k: calls.append(True))
     checkpoint = tmp_path / "agent.db"
-    result = service.run(driver=None, config=SimpleNamespace(agent_loop={"max_evaluations": 3}), approved=True,
-                         checkpoint_path=checkpoint, checkpoint_metadata={"intent": {"intent": "optimization_request"}})
-    assert result["status"] == "done"
-    assert calls
-    saved = service.load_checkpoint(checkpoint)
-    assert saved["status"] == "completed"
-    assert saved["metadata"]["intent"]["intent"] == "optimization_request"
+    with pytest.raises(PermissionError, match="disabled"):
+        service.run(config=SimpleNamespace(), approved=True, checkpoint_path=checkpoint)
+    assert calls == [] and not checkpoint.exists()
+
 
 
 def test_lead_closed_loop_does_not_start_before_confirmation():
     calls = []
     service = ClosedLoopService(runner=lambda *args, **kwargs: calls.append(True) or {"status": "done"})
-    lead = LeadAgent(action_gateway=None, closed_loop_service=service, use_llm=False)
+    lead = LeadAgent(action_gateway=None, closed_loop_service=service, **fake_kwargs(kind="optimization_request", action="optimize"))
     # No gateway means proposal remains pending and no service call occurs.
     session = SessionState()
     answer = lead.propose_closed_loop(question="run optimization", config=SimpleNamespace(), session=session)
@@ -41,11 +40,8 @@ def test_lead_closed_loop_does_not_start_before_confirmation():
 
 
 def test_service_checkpoint_does_not_contain_driver_object(tmp_path: Path):
-    service = ClosedLoopService(runner=lambda driver, config, **kwargs: {"status": "done"})
-    driver = object()
+    service = ClosedLoopService()
     checkpoint = tmp_path / "checkpoint.db"
-    service.run(driver=driver, config=SimpleNamespace(agent_loop={}), approved=True,
-                checkpoint_path=checkpoint, checkpoint_metadata={"driver": "excluded"})
-    raw = checkpoint.read_bytes()
-    assert b"object at" not in raw
-    assert b"driver" in raw
+    service.save_checkpoint(checkpoint, {"status": "read_only", "driver": "excluded"})
+    assert service.load_checkpoint(checkpoint)["driver"] == "excluded"
+    assert b"object at" not in checkpoint.read_bytes()

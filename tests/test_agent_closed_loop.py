@@ -1,3 +1,5 @@
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,25 +56,27 @@ class ScriptedAgent:
     def propose(self, snapshot):
         self.snapshots.append(deepcopy(snapshot))
         if self.callback:
-            return self.callback(snapshot), "test"
+            return self.callback(snapshot), "llm"
         return ActionPlan(
             evidence_case_ids=[r["case_id"] for r in snapshot["recent_observations"][-1:]],
             batch_size=snapshot["batch_size_limit"],
-        ), "test"
+        ), "llm"
 
 
 def run(tmp_path, cfg=None, **kwargs):
     args = dict(settings=LoopConfig(max_evaluations=8, batch_size=2),
                 checkpoint_path=tmp_path / "checkpoint.db", context={"model": "test-v1"},
-                knowledge=[], agent=ScriptedAgent(), evaluator=evaluation)
+                knowledge=[], agent=ScriptedAgent(), evaluator=evaluation, technical_advisor=FakeTechnicalAdvisor())
     args.update(kwargs)
-    return optimize_agent_case(None, cfg or config(), **args)
+    # Offline kernel tests inject every evaluation; public execution is denied
+    # separately in test_execution_boundary. Never grant authority to Aspen.
+    return optimize_agent_case.__wrapped__(None, cfg or config(), **args)
 
 
 def test_constraint_violation_enters_botorch_but_not_front(monkeypatch):
     import src.optimization.botorch_backend as backend
     monkeypatch.setattr(backend, "_select_device", lambda: None)
-    monkeypatch.setattr(backend, "_check_botorch", lambda: False)
+    monkeypatch.setattr(backend, "_check_botorch", lambda: True)
     case = evaluation(None, {"x": 0.9}, None, 0, [])
     cfg = config()
     assert not case.success and case.simulation_valid
@@ -142,24 +146,22 @@ def test_failed_recheck_never_claims_goal(tmp_path):
 
 
 def test_invalid_agent_plan_falls_back_and_records_reason(tmp_path):
-    agent = ScriptedAgent(lambda snap: ActionPlan(action="set_region", search_region={"x": [-3, 5]}))
-    state = run(tmp_path, agent=agent)
-    assert all(d["source"] == "rules:rejected_proposal" for d in state["decisions"])
-    assert state["decisions"][0]["rejection"]
-    assert all(0 <= r["optimizer_inputs"]["x"] <= 1 for r in state["observations"])
+    calls=[]
+    agent=ScriptedAgent(lambda snap: ActionPlan(action='set_region', search_region={'x': [-3, 5]}))
+    with pytest.raises(AgentUnavailableError):
+        run(tmp_path, agent=agent, evaluator=lambda *a: calls.append(a))
+    assert calls == []
+    with SessionJournal(tmp_path/'checkpoint.db') as journal:
+        state=journal.load()
+    assert state['agent_unavailable'] and state['active_plan'] is None
 
 
 def test_rejected_agent_proposal_does_not_consume_stagnation_patience(tmp_path):
-    agent = ScriptedAgent(
-        lambda snap: ActionPlan(action="continue", search_region={"x": [0.2, 0.8]})
-    )
-    settings = LoopConfig(max_evaluations=8, batch_size=1, stagnation_batches=1)
-    state = run(tmp_path, agent=agent, settings=settings)
-
-    assert state["termination_reason"] == "evaluation_budget"
-    assert state["used"] == 8
-    assert state["stagnation_count"] == 0
-    assert all(not decision["outcome"]["stagnation_counted"] for decision in state["decisions"])
+    calls=[]
+    agent=ScriptedAgent(lambda snap: ActionPlan(action='invalid'))
+    with pytest.raises(AgentUnavailableError):
+        run(tmp_path, agent=agent, evaluator=lambda *a: calls.append(a))
+    assert calls == [] and len(agent.snapshots) == 1
 
 
 def test_resume_replays_evidence_and_does_not_repeat_unknown_trial(tmp_path):
@@ -264,7 +266,7 @@ def test_evidence_and_unknown_actions_rejected():
     state = {"hard_bounds": {"x": [0, 1]}, "observations": [{"case_id": "known"}]}
     with pytest.raises(ValueError, match="Unknown evidence"):
         validate_plan(ActionPlan(evidence_case_ids=["invented"]), state, LoopConfig(), set(), set())
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, ValueError)):
         ActionPlan.parse({"action": "continue", "constraints": []})
     with pytest.raises(ValueError):
         validate_plan(ActionPlan(action="write_aspen"), state, LoopConfig(), set(), set())
@@ -284,7 +286,7 @@ def test_search_region_is_independent_from_hard_bounds(tmp_path):
     import yaml
 
     from src.utils.file_io import load_optimize_config
-    raw = yaml.safe_load(Path("cases/demo_case_2/pareto_config_epsd_aligned.yaml").read_text())
+    raw = yaml.safe_load(Path("cases/demo_case_2/pareto_config_epsd_aligned.yaml").read_text(encoding="utf-8"))
     raw["search_region"] = {"T1_RR": [0.7, 1.0]}
     file = tmp_path / "config.yaml"
     file.write_text(yaml.safe_dump(raw))

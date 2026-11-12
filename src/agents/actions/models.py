@@ -23,6 +23,8 @@ class ActionType(_Enum):
     MODIFY_STRUCTURE = "modify_structure"
 
 class ApprovalStatus(_Enum):
+    RUNNING = "running"
+    SIMULATED = "simulated"
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
@@ -77,6 +79,8 @@ class ModelSchema:
     dependencies: dict[str, dict[str, str]] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
     derived_variables: set[str] = field(default_factory=set)
+    model_path: str | None = None
+    config_path: str | None = None
 
 @dataclass
 class ActionRequest:
@@ -96,6 +100,7 @@ class ActionRequest:
     # Optional per-action override.  ``None`` keeps the schema default.
     run_simulation: bool | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+    session_id: str = ""
 
     def __post_init__(self):
         self.action_type = ActionType(self.action_type)
@@ -138,6 +143,7 @@ class ActionPreview:
     value_type: str | None = None
     writable: bool = True
     backup_required: bool = True
+    execution_plan: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self): return asdict(self)
 

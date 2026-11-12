@@ -1,20 +1,7 @@
-"""
-agent.py — ProcessAdvisor agent 核心逻辑。
-
-分两层：
-  run_process_advisor()       — 只读证据收集器（规则型，调用 6 个安全工具）
-  run_process_advisor_agent() — LLM 层：读取证据报告，输出语言分析
-
-安全边界：
-  - 严格只读：不驱动 Aspen、不重跑仿真、不写数据库。
-  - LLM 只读取证据文本做分析，不被授予任何写工具。
-  - 缺 API key 或 LLM 调用失败时降级返回证据报告 + 说明，绝不伪装成"已分析"。
-
-禁止导入（保持只读隔离）：
-  src.aspen_driver、win32com、src.agents.subagents.tools.run_case、
-  src.agents.subagents.tools.optimize_pareto
-"""
+"""Read-only evidence collection followed by verified Agent reasoning."""
 from __future__ import annotations
+from src.agents.errors import AgentUnavailableError, unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured, redact
 
 import logging
 from pathlib import Path
@@ -71,93 +58,7 @@ def _indent_block(text: str, prefix: str = "  ", max_lines: int = 80) -> str:
 # 规则型 next_action 生成器
 # ---------------------------------------------------------------------------
 
-def _determine_next_actions(
-    *,
-    config_parse_error: str | None,
-    config_mode: bool,
-    is_pareto: bool,
-    eff_db_path: str | None,
-    db_resolved: Path | None,
-    db_query_ok: bool,
-    pareto_ok: bool,
-    diagnosed_ids: list[str],
-    objective_names: list[str],
-) -> list[str]:
-    """根据只读体检结果，用规则推断下一步建议。"""
-    actions: list[str] = []
-
-    if config_parse_error is not None:
-        actions.append("配置解析失败：请检查 YAML 路径与语法，修复后重新体检。")
-        return actions
-
-    if config_mode:
-        actions.append(
-            "当前为 mode='config' 纯配置体检：如需历史数据分析，"
-            "请用 mode='db' 重新运行，并确认 simulation.db 已存在。"
-        )
-        return actions
-
-    if eff_db_path is None or db_resolved is None:
-        if not is_pareto:
-            actions.append(
-                "无历史数据库且当前非 pareto_bayesian 分支：如需多目标分析，"
-                "请将 optimizer.type 设为 pareto_bayesian 并先运行一次优化。"
-            )
-        else:
-            actions.append(
-                "无历史数据库：尚未产生仿真记录，请先运行优化"
-                "（python -m src.main <config>）生成 simulation.db 后再体检。"
-            )
-        return actions
-
-    if not db_query_ok:
-        actions.append(
-            "历史数据库查询失败：请确认 simulation.db 未损坏、可读，"
-            "必要时用 query_simulation_db_tool 手动复查。"
-        )
-        return actions
-
-    if diagnosed_ids:
-        actions.append(
-            f"发现 {len(diagnosed_ids)} 个失败工况已诊断：请按【4. 失败诊断】中的建议"
-            "收窄设计变量边界或修正初始值，再运行下一轮优化。"
-        )
-
-    if is_pareto and pareto_ok:
-        actions.append(
-            "Pareto 前沿已成功汇总：请在【3. Pareto 摘要】中筛选满足纯度/能耗约束的"
-            "候选操作点，进行能耗与经济性分析。"
-        )
-        actions.append(
-            "若前沿覆盖度足够，可收窄变量范围做局部精化，或调整目标权重后再优化。"
-        )
-    elif is_pareto and not pareto_ok:
-        if len(objective_names) < 2:
-            actions.append(
-                "Pareto 摘要因目标不足跳过：请在配置中提供至少 2 个 objectives 后重试。"
-            )
-        else:
-            actions.append(
-                "Pareto 摘要失败：可用 query_simulation_db_tool mode='by_objective' "
-                "手动检查目标分布，确认数据库中已有可行工况。"
-            )
-    elif not is_pareto:
-        actions.append(
-            "历史数据库可读但当前非 pareto_bayesian 分支：可用 query_simulation_db_tool "
-            "查看单次/单目标运行记录，确认关键输出合理。"
-        )
-
-    if not actions:
-        actions.append("历史数据库健康且无失败工况：可按需进入下一阶段分析或继续优化。")
-
-    return actions
-
-
-# ---------------------------------------------------------------------------
-# 主入口：只读证据收集
-# ---------------------------------------------------------------------------
-
-def run_process_advisor(
+def _collect_process_evidence(
     case_config_path: str,
     db_path: str | None = None,
     node_db_path: str | None = None,
@@ -212,6 +113,8 @@ def run_process_advisor(
         base = Path(resolved_config).parent
         inferred_db = str(base / "output" / "simulation.db")
         inferred_node_db = str(base / "output" / "node.db")
+    except AgentUnavailableError:
+        raise
     except Exception as exc:  # noqa: BLE001
         config_parse_error = f"{type(exc).__name__}: {exc}"
 
@@ -239,12 +142,16 @@ def run_process_advisor(
         cfg_lines.append(f"  推断 node_db_path : {eff_node_db or '无'}")
         try:
             load_report = runner.load_config(resolved_config)
+        except AgentUnavailableError:
+            raise
         except Exception as exc:  # noqa: BLE001
             load_report = f"错误：load_config 调用异常 [{type(exc).__name__}] — {exc}"
         cfg_lines.append("  ── load_config ──")
         cfg_lines.append(_indent_block(load_report, prefix="    ", max_lines=40))
         try:
             validate_report = runner.validate_config(resolved_config)
+        except AgentUnavailableError:
+            raise
         except Exception as exc:  # noqa: BLE001
             validate_report = f"错误：validate_config 调用异常 [{type(exc).__name__}] — {exc}"
         cfg_lines.append("  ── validate_config ──")
@@ -279,6 +186,8 @@ def run_process_advisor(
                     db_path=str(db_resolved), mode="query", limit=10,
                     session_id=session_id,
                 )
+            except AgentUnavailableError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 q_report = f"错误：query_simulation_db 调用异常 [{type(exc).__name__}] — {exc}"
             db_query_ok = not _is_tool_error(q_report)
@@ -308,6 +217,8 @@ def run_process_advisor(
                 include_infeasible=False,
                 session_id=session_id,
             )
+        except AgentUnavailableError:
+            raise
         except Exception as exc:  # noqa: BLE001
             sp_report = f"错误：summarize_pareto 调用异常 [{type(exc).__name__}] — {exc}"
         pareto_ok = not _is_tool_error(sp_report)
@@ -335,6 +246,8 @@ def run_process_advisor(
                     db_path=str(db_resolved), limit=3, session_id=session_id,
                 )
                 diagnosed_ids = [c for c in (raw_ids or []) if c and c.strip()][:3]
+            except AgentUnavailableError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 d_lines.append(
                     f"  [失败] 失败 case_id 查询异常 [{type(exc).__name__}] — {exc}"
@@ -345,6 +258,8 @@ def run_process_advisor(
             for cid in diagnosed_ids:
                 try:
                     diag = runner.diagnose_case(db_path=str(db_resolved), case_id=cid)
+                except AgentUnavailableError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     diag = f"错误：diagnose_case({cid}) 调用异常 [{type(exc).__name__}] — {exc}"
                 d_lines.append(f"  ── case_id: {cid} ──")
@@ -359,6 +274,8 @@ def run_process_advisor(
                             case_id=diagnosed_ids[0],
                             limit=20,
                         )
+                    except AgentUnavailableError:
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         node_rep = (
                             f"错误：query_node_db 调用异常 [{type(exc).__name__}] — {exc}"
@@ -368,23 +285,6 @@ def run_process_advisor(
     sections.append("\n".join(d_lines))
     sections.append("")
 
-    # ── 章节 5：下一步建议 ────────────────────────────────────────────────
-    next_actions = _determine_next_actions(
-        config_parse_error=config_parse_error,
-        config_mode=config_mode,
-        is_pareto=is_pareto,
-        eff_db_path=eff_db_path,
-        db_resolved=db_resolved,
-        db_query_ok=db_query_ok,
-        pareto_ok=pareto_ok,
-        diagnosed_ids=diagnosed_ids,
-        objective_names=objective_names,
-    )
-    na_lines = ["【5. 下一步建议】"]
-    for i, action in enumerate(next_actions, 1):
-        na_lines.append(f"  [{i}] {action}")
-    sections.append("\n".join(na_lines))
-
     return "\n".join(sections)
 
 
@@ -392,77 +292,23 @@ def run_process_advisor(
 # LLM 层入口
 # ---------------------------------------------------------------------------
 
-def run_process_advisor_agent(
-    case_config_path: str,
-    db_path: str | None = None,
-    session_id: str | None = None,
-    node_db_path: str | None = None,
-    mode: Literal["config", "db"] = "db",
-    model: str | None = None,
-    llm_config=None,
-    advisor_runner: ProcessAdvisorToolRunner | None = None,
-) -> str:
-    """收集只读证据并交大模型分析，返回"证据 + LLM 分析"合并报告。
+@fail_closed("process_advisor")
+def run_process_advisor_agent(case_config_path, db_path=None, session_id=None,
+                              node_db_path=None, mode="db", model=None, llm_config=None,
+                              advisor_runner=None, question="Analyze the current process and its evidence."):
+    from src.agents.reasoning import reason
+    cfg = configured(llm_config or load_llm_config(model=model))
+    # A validated provider response precedes evidence access at this standalone entry.
+    from src.agents.lead.intent import IntentClassifier
+    IntentClassifier(llm_config=cfg, llm_call=chat).classify(question)
+    evidence = _collect_process_evidence(case_config_path, db_path, node_db_path,
+                                         mode, session_id, advisor_runner)
+    data, _ = reason(question, context={"report_evidence": evidence}, role="process_advisor",
+                     llm_config=cfg, llm_call=chat)
+    return data["text"]
 
-    严格只读：内部仅调用 run_process_advisor（6 个安全工具）+ LLM 文本推理，
-    任何环节都不驱动 Aspen、不写数据库。
 
-    Args:
-        case_config_path: YAML 配置路径。
-        db_path:          SimulationDB 路径；None 时从配置推断。
-        session_id:       仅分析指定 session 的工况；None=全库历史。
-        node_db_path:     NodeDB 路径；None 时从配置推断。
-        mode:             "db"（默认）| "config"。
-        model:            覆盖 PAO_LLM_MODEL。
-        llm_config:       直接注入 LLMConfig（测试用）；None 时从环境变量构造。
-        advisor_runner:   注入证据收集层的 tool_runner（测试用）。
-
-    Returns:
-        合并报告：先是只读证据报告，再追加【LLM 顾问分析】小节。
-        未配置 key 或 LLM 调用失败时，仅返回证据报告 + 降级说明。
-    """
-    # chat / is_configured / load_llm_config 从模块级 import 引入，支持 monkeypatch
-
-    evidence = run_process_advisor(
-        case_config_path=case_config_path,
-        db_path=db_path,
-        node_db_path=node_db_path,
-        mode=mode,
-        session_id=session_id,
-        tool_runner=advisor_runner,
-    )
-
-    cfg = llm_config if llm_config is not None else load_llm_config(model=model)
-
-    if not is_configured(cfg):
-        return (
-            f"{evidence}\n\n"
-            "【LLM 顾问分析】\n"
-            "  [降级] 未配置大模型 API key，本次仅返回只读证据报告，未做语言模型分析。\n"
-            f"  如需启用：请设置环境变量 {cfg.api_key_env}"
-            "（以及可选 PAO_LLM_PROVIDER / PAO_LLM_MODEL）后重试。\n"
-            f"  当前 LLM 配置：{cfg.redacted()}"
-        )
-
-    try:
-        analysis = chat(
-            cfg,
-            system=SYSTEM_PROMPT,
-            user=USER_TEMPLATE.format(evidence=evidence),
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("LLM 分析失败，降级返回证据报告：%s", exc)
-        return (
-            f"{evidence}\n\n"
-            "【LLM 顾问分析】\n"
-            f"  [降级] 大模型调用失败，本次仅返回只读证据报告。\n"
-            f"  失败原因：{exc}\n"
-            f"  当前 LLM 配置：{cfg.redacted()}"
-        )
-
-    return (
-        f"{evidence}\n\n"
-        "【LLM 顾问分析】\n"
-        f"  （provider={cfg.provider}, model={cfg.model}）\n\n"
-        f"{analysis}"
-    )
+def run_process_advisor(case_config_path, db_path=None, node_db_path=None, mode="db",
+                        session_id=None, tool_runner=None, **kwargs):
+    return run_process_advisor_agent(case_config_path, db_path, session_id, node_db_path,
+                                    mode, advisor_runner=tool_runner, **kwargs)

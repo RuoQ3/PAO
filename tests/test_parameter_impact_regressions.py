@@ -1,3 +1,6 @@
+from execution_fakes import run_simulation, simulation_schema
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,15 +49,15 @@ def test_clipped_steps_are_deduplicated_before_budget_check():
     {'success': True, 'outputs': {}},
     {'success': True, 'outputs': {'mole_fraction': float('nan')}},
 ])
-def test_baseline_failure_stops_and_cleans_up(tmp_path, output):
+def test_baseline_failure_is_diagnosed_and_cleans_up(tmp_path, output):
     plan = simulation(tmp_path)
     calls = []
     def evaluate(**kwargs):
         calls.append(kwargs)
         return output
-    results = AspenSandboxRunner(evaluate, allowed_paths=[PATH]).run(plan)
-    assert len(calls) == len(results) == 1
-    assert '基准预检失败' in results[0].errors[-1]
+    results = run_simulation(AspenSandboxRunner(evaluate, allowed_paths=[PATH]), plan)
+    assert len(calls) == len(results) == (3 if not output['success'] else 1)
+    assert results[0].impact_outputs['_assessment']['reasons']
     assert not Path(plan.temporary_model).exists()
     assert Path(plan.base_model).read_bytes() == b'original'
 
@@ -89,14 +92,16 @@ def test_real_failure_preserves_aspen_diagnostics(tmp_path):
 
 def case(x, z, y, name='case'):
     return ProcessCase(case_id=name, status=CaseStatus.SUCCESS, converged=True,
-                       impact_inputs={'x': x, 'z': z}, impact_outputs={'m': y})
+                       impact_inputs={'x': x, 'z': z}, impact_outputs={'m': y, '_assessment': {
+                           'metric': 'm', 'fresh': True, 'target_validity': 'valid',
+                           'is_reference': name == 'baseline'}})
 
 
 def test_ofat_statistics_exclude_other_factors_and_duplicates():
     results = [case(1, 1, 10, 'baseline'), case(.9, 1, 9), case(1.1, 1, 11),
                case(.9, 1, 9), case(1, .9, -1000), case(1, 1.1, 1000)]
     report = SensitivityAnalyzer().analyze(results, metric='m', parameters=['x', 'z'])
-    x = next(r for r in report['parameter_rank'] if r['parameter'] == 'x')
+    x = next(r for r in report['parameters'] if r['parameter'] == 'x')
     assert x['local_slope'] == pytest.approx(10)
     assert x['metric_change'] == 2
     assert x['sample_count'] == 3
@@ -107,14 +112,27 @@ def test_ofat_statistics_exclude_other_factors_and_duplicates():
 
 def approved_session(tmp_path, evaluator):
     plan = simulation(tmp_path)
-    gateway = ActionGateway(ModelSchema(ModelIdentity('model'), targets=('model',)),
+    gateway = ActionGateway(simulation_schema(plan),
                             simulation_runner=FakeAspenSandboxRunner(evaluator))
     proposal = ActionProposal('run_simulation', 'model', reason='test impact', payload={
         'simulation_plan': plan.to_dict(), 'parameter_impact_plan': impact().to_dict()})
     preview = gateway.preview_proposal(proposal)
     assert preview['valid']
     state = SessionState(pending_approval=ApprovalRequest(proposal, preview=preview))
-    return ConversationSession(state, LeadAgent(action_gateway=gateway, use_llm=False))
+    kwargs = fake_kwargs(kind="chat")
+    original = kwargs['llm_call']
+    def provider(cfg, *, system, user):
+        import json
+        if 'PAO action_result_analysis.' in system:
+            result = json.loads(user)['evidence']['result']
+            failures = [c for c in result.get('simulation_cases', []) if not c['converged']]
+            text = ('T0302 工况失败，无法判断参数影响。' if failures else
+                    '本次局部敏感性仅支持已测试范围内的方向判断。')
+            return json.dumps(dict(text=text + ' 未执行 0 个工况。', confidence=.9, uncertainties=[], blocks=[
+                dict(kind='paragraph', text=text, epistemic='observed', evidence_refs=['/result/execution_evidence'])]))
+        return original(cfg, system=system, user=user)
+    kwargs['llm_call'] = provider
+    return ConversationSession(state, LeadAgent(action_gateway=gateway, **kwargs))
 
 
 @pytest.mark.parametrize('success', [True, False])
@@ -129,7 +147,7 @@ def test_confirmation_returns_answer_and_history_without_reexecution(tmp_path, s
     assert answer.recommendations == []
     assert session.state.history[-1]['content'] == answer.text
     assert session.state.pending_approval is None
-    assert len(calls) == (3 if success else 1)
+    assert len(calls) == 3
     assert 'T0302' in answer.text if not success else '局部敏感性' in answer.text
     count = len(calls)
     session.submit('确认')
@@ -167,10 +185,10 @@ def test_real_runner_reads_composition_as_subtree_and_closes_driver(tmp_path, mo
         assert cfg.check_status_paths is None  # retain full-flow checks
         return ProcessCase(status=CaseStatus.SUCCESS, streams={'0319': stream('0319', .01)})
     monkeypatch.setattr(workflow, 'run_case', run_case)
-    results = AspenSandboxRunner(driver_factory=lambda path: driver, allowed_paths=[PATH]).run(plan)
-    assert len(results) == 3
+    results = run_simulation(AspenSandboxRunner(driver_factory=lambda path: driver, allowed_paths=[PATH]), plan)
+    assert len(results) == 1  # Missing real-run provenance must fail closed.
     assert all(c.impact_outputs['mole_fraction'] == .01 for c in results)
-    assert events == ['connect', 'open', 'disconnect', 'close'] * 3
+    assert events == ['connect', 'open', 'disconnect']  # one owner close protocol
 
 
 def test_cli_confirmation_failure_is_printed_and_loop_survives(tmp_path, monkeypatch, capsys):
@@ -184,6 +202,9 @@ def test_cli_confirmation_failure_is_printed_and_loop_survives(tmp_path, monkeyp
     monkeypatch.setattr(lead_module, 'ConversationSession', lambda *args: session)
     builder = SimpleNamespace(build=lambda: SimpleNamespace(), close=lambda: None)
     monkeypatch.setattr(context_module, 'ProcessContextBuilder', lambda **kwargs: builder)
+    from src.agents.lead import llm_client
+    monkeypatch.setattr(llm_client, 'load_llm_config', lambda: CFG)
+    monkeypatch.setattr(llm_client, 'chat_json', fake_kwargs(kind='chat')['llm_call'])
     turns = iter(['确认', 'hello', 'exit'])
     monkeypatch.setattr('builtins.input', lambda prompt: next(turns))
     assert cli._run_unified_chat_loop(config_path=tmp_path/'model.bkp', yaml_path=None,
@@ -191,14 +212,14 @@ def test_cli_confirmation_failure_is_printed_and_loop_survives(tmp_path, monkeyp
         initial_intent='', log=logging.getLogger('test')) == 0
     output = capsys.readouterr().out
     assert 'T0302' in output
-    assert '未执行 2 个' in output
+    assert '未执行 0 个' in output
     assert '已退出' in output
     assert '??/??' not in output
 
 
 def test_analysis_exception_is_visible_in_answer():
     result = {'simulation_cases': [], 'sensitivity': {'error': 'analysis broke'}}
-    result['answer'] = LeadAgent._render_parameter_impact_result({}, result)
+    result['answer'] = Answer('分析失败：analysis broke，无法判断参数影响。', details=result.copy()).to_dict()
     answer = ConversationSession._action_answer(result)
     assert 'analysis broke' in answer.text
 

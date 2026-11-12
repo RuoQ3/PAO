@@ -1,3 +1,4 @@
+from execution_fakes import run_simulation, simulation_schema
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ PATH = r"\Data\Blocks\X\Input\RR"
 def plan(**kw):
     data = dict(name="RR", aspen_path=PATH, baseline=2.0, lower=1.0, upper=3.0, unit="-")
     data.update(kw)
-    return ParameterImpactPlan("X", "S", "C", "mole_fraction", [data], max_cases=5, expected_outputs=["m"])
+    return ParameterImpactPlan("X", "S", "C", "mole_fraction", [data], max_cases=5, expected_outputs=[r"\Data\Blocks\X\Output\M"])
 
 
 def test_plan_checks_bounds_and_integer_neighbor():
@@ -43,10 +44,11 @@ def test_fake_results_are_analyzable_and_single_point_is_limited(tmp_path: Path)
     model = tmp_path / "model.bkp"
     model.write_bytes(b"original")
     p = make_simulation_plan(plan(), base_model=str(model)); p.approved = True
+    p.output_spec = {"metric": "m"}
     runner = FakeAspenSandboxRunner(lambda inputs: {"outputs": {"m": inputs[PATH]}})
-    results = runner.run(p)
-    report = SensitivityAnalyzer().analyze(results, metric="m", parameters=[PATH])
-    assert report["parameter_rank"][0]["pearson"] == pytest.approx(1.0)
+    results = run_simulation(runner, p)
+    report = SensitivityAnalyzer().analyze(results, metric="m", parameters=[PATH], parameter_specs=p.adaptive_policy["parameters"])
+    assert report["parameter_rank"][0]["local_slope"] == pytest.approx(1.0)
     assert all(x.result_source == "fake_aspen" for x in results)
     assert model.read_bytes() == b"original"
 

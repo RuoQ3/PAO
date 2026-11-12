@@ -4,14 +4,15 @@ venv/
 env/
 .venv312/
 # 测试运行时产物（跟踪测试源码 .py，只忽略运行时产物）
-tests/__pycache__/
-tests/.pytest_cache/
-tests/**/__pycache__/
+tests/
+
 # Python 编译缓存
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.pytest/
+.review/
 .pytest-tmp/
 .pycache-tmp/
 .Python
@@ -62,6 +63,10 @@ ehthumbs.db
 .claude/
 scripts/
 .pytest_cache/
+
+docs/
+reports/
+runs/
 
 cases/demo_case_2/epsd/
 cases/demo_case_2/GLY2.1/

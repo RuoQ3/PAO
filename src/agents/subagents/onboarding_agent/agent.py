@@ -3,10 +3,12 @@ onboarding_agent/agent.py — B1 接入向导核心逻辑
 
 公开接口：
   OnboardingResult   — 向导结果 dataclass
-  run_onboarding     — 主入口：扫描 → 意图解析 → 配置草案 → 提问列表
+  run_onboarding     — 主入口：严格意图解析 → 扫描 → 配置草案 → 提问列表
   apply_user_feedback — 将用户反馈合并进草案
 """
 from __future__ import annotations
+from src.agents.errors import unavailable, fail_closed, failure_from
+from src.agents.reasoning import configured
 
 import copy
 import json
@@ -26,60 +28,19 @@ from src.agents.subagents.config_builder import (
 
 
 # ---------------------------------------------------------------------------
-# 内部：默认意图（TAC 最小 + 排放最小）
+# 向导结果与输入完整性检查
 # ---------------------------------------------------------------------------
 
-def _make_default_intent(notes: str = "") -> OptimizationIntent:
-    """当用户未提供意图或 LLM 不可用时使用的保守默认意图。"""
-    return OptimizationIntent(
-        goals=[
-            GoalSpec(metric="TAC", direction="min"),
-            GoalSpec(metric="emissions", direction="min"),
-        ],
-        hard_constraints=[],
-        n_initial=20,
-        n_iterations=60,
-        notes=notes,
-    )
-
-
-# ---------------------------------------------------------------------------
-# B1-1  OnboardingResult
-# ---------------------------------------------------------------------------
 
 @dataclass
 class OnboardingResult:
-    """
-    run_onboarding 的产出，汇总了向导流程的全部结果。
-
-    Attributes
-    ----------
-    config_draft:
-        基于扫描结果与用户意图生成的配置草案。
-    tunable_report:
-        变量发现扫描报告（含 TunableVariable 和 ReadableTarget 列表）。
-    questions_for_user:
-        需要用户确认或补充的问题列表，每项是一个完整的中文问句。
-        - confidence != "high" 的设计变量边界各生成一条
-        - 目标函数映射有 warning 时各生成一条
-        - 采样/迭代次数建议生成一条
-    warnings:
-        汇总所有需要用户关注的警告（来自扫描 + 配置构建）。
-    intent:
-        本轮使用的优化意图（由 parse_intent_from_text 解析或默认意图）。
-        保留在此以便 apply_user_feedback 提升变量时可重建草案。
-    """
     config_draft: ConfigDraft
     tunable_report: TunableReport
     questions_for_user: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     intent: OptimizationIntent | None = None
-    prioritization_notes: str = ""   # LLM 对变量优先级排序的说明；降级时为空
+    prioritization_notes: str = ""
 
-
-# ---------------------------------------------------------------------------
-# 内部：生成 questions_for_user
-# ---------------------------------------------------------------------------
 
 def _build_questions(
     report: TunableReport,
@@ -145,6 +106,7 @@ def _build_questions(
 # B1-2  run_onboarding
 # ---------------------------------------------------------------------------
 
+@fail_closed("onboarding")
 def run_onboarding(
     aspen_file_path: str,
     intent_text: str,
@@ -157,7 +119,7 @@ def run_onboarding(
     流程：
       1. 调用 discover_tunables_tool 扫描 Aspen 文件，获得 TunableReport
       2. 若 intent_text 非空，调用 parse_intent_from_text 解析意图；
-         LLM 不可用时使用默认意图
+         LLM 不可用时立即终止
       3. 调用 build_config_draft 生成 ConfigDraft
       4. 生成 questions_for_user
 
@@ -168,16 +130,18 @@ def run_onboarding(
     aspen_file_path:
         Aspen 仿真文件路径（.bkp/.apw）。
     intent_text:
-        用户自由文本描述的优化意图；空字符串时使用默认意图。
+        用户自由文本描述的优化意图；空字符串为输入错误。
     node_db_path:
         节点目录数据库路径（NodeDB .db 文件）。
     llm_config:
-        LLMConfig 实例；None 表示不使用 LLM。
+        LLMConfig 实例；None 表示加载 LLM 配置。
 
     Returns
     -------
     OnboardingResult
     """
+    # Parse and validate the actual intent before touching project evidence.
+    intent = parse_intent_from_text(intent_text, llm_config)
     # ── 1. 变量发现 ──────────────────────────────────────────────────────────
     raw_json = discover_tunables_tool.invoke({
         "aspen_file_path": aspen_file_path,
@@ -186,43 +150,12 @@ def run_onboarding(
     })
 
     if raw_json.startswith("错误："):
-        # 扫描完全失败：构造空报告，仍能继续（但所有变量 confidence=low）
-        report = TunableReport(
-            aspen_file=aspen_file_path,
-            aspen_file_hash="",
-            scan_warnings=[raw_json],
-            semantic_coverage=0.0,
-        )
-    else:
-        report = _parse_tunable_report(raw_json, aspen_file_path)
-
-    # ── 2. 意图解析 ──────────────────────────────────────────────────────────
-    if intent_text.strip():
-        try:
-            intent = parse_intent_from_text(intent_text, llm_config)
-        except (IntentParseError, Exception):
-            intent = _make_default_intent("LLM 解析失败，已使用默认意图")
-    else:
-        intent = _make_default_intent("未提供意图文本，已使用默认意图")
-
-    # ── 2b. LLM 优先级排序（可选，LLM 不可用时自动降级）────────────────────
-    prioritization_notes = ""
-    try:
-        from src.agents.subagents.tools.prioritize_tunables import prioritize_tunables_impl
-        priority_result = prioritize_tunables_impl(report, intent, llm_config)
-        report.tunable_variables = priority_result.ranked_variables
-        prioritization_notes = priority_result.ranking_notes
-        if priority_result.warnings:
-            report.scan_warnings.extend(priority_result.warnings)
-        _src = "LLM" if priority_result.source == "llm" else "规则降级"
-        import logging as _logging
-        _logging.getLogger(__name__).info(
-            "run_onboarding: 优先级排序完成（source=%s，%d 个变量）",
-            priority_result.source, len(priority_result.ranked_variables),
-        )
-    except Exception as exc:
-        import logging as _logging
-        _logging.getLogger(__name__).warning("优先级排序失败，跳过：%s", exc)
+        raise unavailable("agent_output_invalid", stage="onboarding_evidence")
+    report = _parse_tunable_report(raw_json, aspen_file_path)
+    from src.agents.subagents.tools.prioritize_tunables import prioritize_tunables_impl
+    priority_result = prioritize_tunables_impl(report, intent, llm_config)
+    report.tunable_variables = priority_result.ranked_variables
+    prioritization_notes = priority_result.ranking_notes
 
     # ── 3. 配置草案 ──────────────────────────────────────────────────────────
     draft = build_config_draft(report, intent, node_db_path=node_db_path)
@@ -249,13 +182,8 @@ def _parse_tunable_report(raw_json: str, aspen_file_path: str) -> TunableReport:
 
     try:
         data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return TunableReport(
-            aspen_file=aspen_file_path,
-            aspen_file_hash="",
-            scan_warnings=[f"discover_tunables_tool 返回非法 JSON：{raw_json[:120]}"],
-            semantic_coverage=0.0,
-        )
+    except json.JSONDecodeError as exc:
+        raise failure_from(exc, "onboarding_evidence") from None
 
     tunable_vars = []
     for v in data.get("tunable_variables", []):
@@ -271,8 +199,8 @@ def _parse_tunable_report(raw_json: str, aspen_file_path: str) -> TunableReport:
                 confidence=v.get("confidence", "low"),
                 reason=v.get("reason", ""),
             ))
-        except (KeyError, TypeError):
-            pass
+        except (KeyError, TypeError) as exc:
+            raise failure_from(exc, "onboarding_evidence") from None
 
     readable_targets = []
     for t in data.get("readable_targets", []):
@@ -284,8 +212,8 @@ def _parse_tunable_report(raw_json: str, aspen_file_path: str) -> TunableReport:
                 unit=t.get("unit", "-"),
                 current_value=t.get("current_value"),
             ))
-        except (KeyError, TypeError):
-            pass
+        except (KeyError, TypeError) as exc:
+            raise failure_from(exc, "onboarding_evidence") from None
 
     return TunableReport(
         aspen_file=data.get("aspen_file", aspen_file_path),

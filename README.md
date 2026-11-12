@@ -17,8 +17,8 @@ PAO 是一个面向 Aspen Plus 的化工流程优化工具。它把 Aspen Plus �
 - Aspen Plus COM 驱动、输入回读校验、超时和失败恢复。
 - 单目标贝叶斯优化：`optimizer.type: bayesian`。
 - 多目标 Pareto 优化：`optimizer.type: pareto_bayesian`。
-- skopt 代理模型和随机采样降级路径。
-- 可选 BoTorch qEHVI/qNEHVI 后端；未安装 `torch/botorch/gpytorch` 时自动降级。
+- skopt GP/RF/ET/GBRT 及显式 random 搜索；依赖或 fit/tell/ask 失败时停止。
+- BoTorch qEHVI/NEHVI 后端；显式选择后依赖缺失即停止，不替换算法。
 - 可行性判断、工程边界校验、敏感性分析、Pareto 和超体积计算。
 - 派生变量、整数变量、变量依赖和输入去重。
 
@@ -40,7 +40,7 @@ PAO 是一个面向 Aspen Plus 的化工流程优化工具。它把 Aspen Plus �
 - 汇总结构化 `TaskResult`、`Evidence`、不确定性和建议；
 - 对修改或执行请求生成 `ActionProposal`/`ApprovalRequest`，等待人工确认。
 
-没有 LLM key 时，系统使用规则路由和确定性降级逻辑，并明确标记证据不足；不会伪造 LLM 结论或仿真结果。
+必要 LLM 或 Agent 不可用时明确停止；只读配置与静态计划不需要执行审批。
 
 ## Agent 架构
 
@@ -69,7 +69,7 @@ PAO 是一个面向 Aspen Plus 的化工流程优化工具。它把 Aspen Plus �
 
 - Python 3.10 或更高版本；CI 使用 Python 3.12。
 - Windows + Aspen Plus + 可用许可证 + `.bkp`/`.apw` 文件，才能运行真实 Aspen COM 仿真。
-- Linux/macOS 可以运行不连接 Aspen 的规则模式、配置检查、数据库分析和大多数测试。
+- Linux/macOS 可以运行不连接 Aspen 的配置检查、数据库分析和大多数测试。
 
 ```powershell
 python -m venv .venv
@@ -107,7 +107,7 @@ PAO_LLM_TEMPERATURE=0.2
 PAO_LLM_MAX_TOKENS=2048
 ```
 
-LLM key 不写入 checkpoint，也不会出现在 Agent 上下文或日志中。没有 key 时使用规则模式。IMA 默认使用本地 mock；只有明确配置 HTTP 地址和鉴权后才访问外部服务。
+LLM key 不写入 checkpoint，也不会出现在 Agent 上下文或日志中。缺少必要 key 时停止 Agent 任务。IMA 默认使用本地 mock；只有明确配置 HTTP 地址和鉴权后才访问外部服务。
 
 ## CLI
 
@@ -144,40 +144,28 @@ python -m src.main path/to/case_config.yaml --db output/run1.db --log DEBUG --lo
 
 真实运行需要 Aspen Plus；没有 Aspen 时使用 `--dry-run` 或测试中的 fake driver。
 
-### Agent 闭环
+### 执行授权与迁移
 
-闭环请求统一通过 `--conversation` 进入 `ConversationSession`。YAML 中的
-`agent_loop.enabled: true` 仍由内部 `ClosedLoopService` 执行；普通优化 CLI 不会进入
-Lead Agent。
+普通优化 CLI 展示完整执行包络，输入 `APPROVE` 后由 `ActionGateway` 执行。
+YAML 必须显式配置 `execution.max_evaluations`、`execution.max_seconds`、
+`execution.max_failures`；总预算包括预探索、预热、探针、DOE、搜索、失败、重试与复验。
+`optimizer.n_iterations` 仍表示搜索轮数，不能替代总运行预算。
 
-```powershell
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --dry-run
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --conversation
+```yaml
+execution:
+  max_evaluations: 40
+  max_seconds: 3600
+  max_failures: 5
 ```
 
-也可以对已有 Pareto YAML 使用 `--conversation` 发起闭环请求：
-
-```powershell
-python -m src.main cases/demo_case_2/pareto_config_epsd_aligned.yaml --conversation
-```
-
-恢复中断的闭环：
-
-```powershell
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --conversation --resume
-```
-
-指定新的 checkpoint：
-
-```powershell
-python -m src.main cases/demo_case_2/agent_loop_config.yaml --conversation --checkpoint cases/demo_case_2/output/my_agent_run.db
-```
-
-checkpoint 是闭环恢复的权威记录，不能与 `SimulationDB` 使用同一个 SQLite 文件。恢复时会检查配置、模型文件、目标模块和知识库指纹。
+旧 `agent_loop.enabled: true` 执行、恢复、图编排试写/优化及直接执行工具已禁用；
+derived 变量和 recycle warmstart 尚无完整物理写入包络，也拒绝生产优化执行。
+对话可审批参数影响计划及资料完整的单次仿真。没有模型硬边界、基准输入或标量输出时停止规划。
+只读问答和 `--dry-run` 不打开 Aspen。详见 [执行边界与迁移](docs/execution_authorization.md)。
 
 ### 统一只读对话
 
-`--conversation` 是唯一的 Agent 对话入口。该模式不会直接写 YAML、数据库、Aspen 或执行优化：
+`--conversation` 是唯一的 Agent 对话入口。问答和计划生成只读；明确审批后可经 Gateway 运行受支持的仿真计划，结果写入数据库与审计：
 
 ```powershell
 python -m src.main cases/demo_case/pareto_config.yaml --conversation
@@ -336,7 +324,7 @@ python -m pytest --basetemp E:\\PAO-test-tmp\\pytest-base -q
 git diff --check
 ```
 
-测试覆盖 Lead Agent 路由和降级、Runtime 并发/预算/超时/失败隔离、证据不足、ActionGateway 确认链、checkpoint 往返恢复、普通闭环和离线分析。真实 Aspen 集成测试需要 Windows + Aspen 环境。
+测试覆盖 Lead Agent fail-closed 路由、Runtime 并发/预算/超时/失败隔离、证据不足、ActionGateway 确认链、checkpoint 往返恢复、普通闭环和离线分析。真实 Aspen 集成测试需要 Windows + Aspen 环境。
 
 ## 文档和迁移
 
@@ -345,12 +333,18 @@ git diff --check
 - [Agent 迁移说明](docs/agent_migration.md)
 - [IMA adapter 阶段说明](docs/ima_adapter_phase1.md)
 
-从旧入口迁移时，使用 `LeadAgent + ConversationSession`。`--conversation` 是唯一用户可见的 Agent CLI 入口；旧版 Agent CLI 选项已删除。闭环由内部 `ClosedLoopService` 调度，所有修改、仿真和优化动作都经过 `ActionProposal`、校验、预览、人工确认和 `ActionGateway.execute()`。普通确定性优化 CLI 仍使用 `python -m src.main <yaml>`，不依赖 LeadAgent、LLM 或 Agent Runtime。
+从旧入口迁移时，使用 `LeadAgent + ConversationSession`。`--conversation` 是唯一用户可见的 Agent CLI 入口；旧版 Agent CLI 选项已删除。旧 `ClosedLoopService` 执行已禁用，所有修改、仿真和优化动作都经过 `ActionProposal`、校验、预览、人工确认和 `ActionGateway.execute()`。普通确定性优化 CLI 经完整预览和审批后仍使用 `python -m src.main <yaml>`，不依赖 LeadAgent、LLM 或 Agent Runtime。
 
-没有 LLM key 时使用明确标记的规则模式，不伪造仿真结果；真实 Aspen/COM 验证需要 Windows 和 Aspen 环境。旧 Coordinator、Conversation、Demo Workflow 和 Analysis Agent/Optimization Agent 入口已收敛到 LeadAgent 及其 Subagent/内部闭环服务。
+没有必要 LLM key 时明确停止，不伪造回答或执行结果；真实 Aspen/COM 验证需要 Windows 和 Aspen 环境。旧 Coordinator、Conversation、Demo Workflow 和 Analysis Agent/Optimization Agent 入口已收敛到 LeadAgent 及其 Subagent/内部闭环服务。
 
 ## 限制
 
 - 真实 Aspen 结果只能由 Aspen Plus 实际运行产生；规则模式或 LLM 输出不能替代仿真。
-- BoTorch、IMA HTTP 和具体 LLM provider 都是可选能力，缺失时使用明确的 skip、mock 或规则降级。
+- 任务所需的 BoTorch、LLM 或其他后端不可用时停止；Mock 只可显式注入并标记为 simulated。
 - 合成测试验证软件边界，不证明任何具体化工流程的优化收益。
+
+# 第二批执行与证据边界
+
+沙盒等待超时、底层停止与资源清理分别记录；状态未知时停止派发、保留额度与资源，不自动重试。
+执行证据、分析版本、终端/导出/历史回读及上下文缓存规则见
+[执行生命周期、证据与上下文](docs/execution_evidence_context.md)。本批验证均为离线模拟，未运行真实 Aspen。

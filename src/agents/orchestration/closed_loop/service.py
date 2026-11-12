@@ -10,6 +10,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Callable
+from src.agents.errors import AgentUnavailableError, unavailable
 
 
 class ClosedLoopService:
@@ -21,36 +22,8 @@ class ClosedLoopService:
     def run(self, *, driver: Any = None, config: Any = None, approved: bool = False,
             checkpoint_path: str | Path | None = None, checkpoint_metadata: dict[str, Any] | None = None,
             resume: bool = False, **kwargs: Any) -> Any:
-        """Run the internal loop after LeadAgent has obtained approval.
-
-        A runner can be injected by tests or applications.  The default is the
-        legacy workflow adapter, which keeps ProcessDecisionAgent private to
-        the closed-loop implementation.
-        """
-        if not approved and not kwargs.pop("_internal", False):
-            raise PermissionError("closed-loop execution requires ActionGateway confirmation")
-        runner = self._runner
-        injected = runner is not None
-        if runner is None:
-            from src.workflows.agent_entry import run_configured_agent
-            runner = run_configured_agent
-        if config is None:
-            raise ValueError("closed-loop config is required")
-        if checkpoint_path:
-            self.save_checkpoint(checkpoint_path, {
-                "status": "running", "metadata": checkpoint_metadata or {},
-                "budget": self._budget(config), "resume": bool(resume),
-            })
-        if injected:
-            result = runner(driver, config, **kwargs)
-        else:
-            result = runner(driver, config, _internal=True, **kwargs)
-        if checkpoint_path:
-            self.save_checkpoint(checkpoint_path, {
-                "status": "completed", "metadata": checkpoint_metadata or {},
-                "budget": self._budget(config), "result_summary": self._summary(result),
-            })
-        return result
+        """Disabled legacy execution entry. Checkpoint read/write utilities remain."""
+        raise PermissionError("Legacy closed-loop execution disabled: approved/_internal booleans are not Gateway authorization")
 
     @staticmethod
     def _budget(config: Any) -> dict[str, Any]:
@@ -89,4 +62,3 @@ class ClosedLoopService:
             return json.loads(row[0]) if row else None
         finally:
             db.close()
-

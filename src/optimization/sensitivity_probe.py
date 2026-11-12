@@ -73,6 +73,7 @@ sensitivity=0 → doe_radius = 1.0（全局范围）
   阶段 3（REFREEZE）：扩张后失败率升高，自动回收范围。
 """
 from __future__ import annotations
+from src.agents.actions.authorization import ExecutionBoundaryError
 
 import logging
 import math
@@ -296,6 +297,8 @@ def run_sensitivity_probe(
             if warmup_fn is not None:
                 try:
                     warmup_fn(center)
+                except ExecutionBoundaryError:
+                    raise
                 except Exception as exc:
                     _log.warning(
                         "敏感度探针 [var=%s, k=%d]：warmup_fn 异常，跳过热启动。%s",
@@ -304,6 +307,8 @@ def run_sensitivity_probe(
 
             try:
                 converged, margins = run_fn_new(candidate)
+            except ExecutionBoundaryError:
+                raise
             except Exception as exc:
                 _log.warning(
                     "敏感度探针 [var=%s, k=%d]：run_fn 异常，计为不收敛。%s",

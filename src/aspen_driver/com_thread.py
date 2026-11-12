@@ -85,8 +85,7 @@ class _ComJob:
         except queue.Empty:
             raise TimeoutError(
                 f"COM 操作超时（{timeout}s）。"
-                "仿真运行时请通过 run_timeout 参数控制超时，"
-                "并确保 com_timeout = run_timeout + 30 留有余量。"
+                "仅调用方等待结束；底层执行与资源清理状态未知。"
             )
         if status == "err":
             raise value
@@ -120,6 +119,7 @@ class ComApartment:
         self._job_q: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._started = threading.Event()
+        self._quarantined = False
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -148,7 +148,7 @@ class ComApartment:
         _log.debug("ComApartment: STA 线程已就绪（thread_id=%d）。",
                    self._thread.ident)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 10.0) -> None:
         """
         停止 STA 线程，等待退出（最多 10s）。
 
@@ -157,16 +157,17 @@ class ComApartment:
         """
         if self._thread is not None and self._thread.is_alive():
             self._job_q.put(_STOP_SENTINEL)
-            self._thread.join(timeout=10.0)
+            self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                _log.warning("ComApartment: STA 线程在 10s 内未退出。")
+                self._quarantined = True
+                raise TimeoutError("COM worker still alive; cleanup incomplete")
         _log.debug("ComApartment: STA 线程已关闭。")
 
     # ------------------------------------------------------------------ #
     # 任务提交
     # ------------------------------------------------------------------ #
 
-    def submit(self, fn: Callable[[], T], timeout: float = _DEFAULT_TIMEOUT) -> T:
+    def submit(self, fn: Callable[[], T], timeout: float = _DEFAULT_TIMEOUT, *, cleanup: bool = False) -> T:
         """
         将 fn 提交到 STA 线程执行，阻塞等待结果。
 
@@ -190,9 +191,15 @@ class ComApartment:
         任意异常:
             fn() 抛出的异常（原样传回调用线程）。
         """
+        if self._quarantined and not cleanup:
+            raise RuntimeError("COM apartment quarantined after wait timeout")
         job = _ComJob(fn)
         self._job_q.put(job)
-        return job.wait(timeout)
+        try:
+            return job.wait(timeout)
+        except TimeoutError:
+            self._quarantined = True
+            raise
 
     # ------------------------------------------------------------------ #
     # STA 线程主循环（内部）

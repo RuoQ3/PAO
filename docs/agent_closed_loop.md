@@ -1,5 +1,9 @@
 # PAO 自主实验闭环
 
+> 2026-11 执行边界更新：旧 Agent 闭环和布尔授权入口已禁用，以下闭环执行内容属于历史实现说明。当前入口、限制和迁移以 [execution_authorization.md](execution_authorization.md) 为准。
+
+> 2026-11-10：Agent 失败行为由 [fail-closed 架构](agent_fail_closed.md) 更新。不可用立即终止，不生成规则 Answer、替代计划或审批；公开 trace 不含 raw response。
+
 本版本把 Agent 接到每批仿真的决策位置。一个主决策 Agent 使用工艺事实、知识条目和历史证据生成结构化实验动作；程序校验后调用现有 Pareto 优化器和 Aspen 单次运行接口。每次结果都进入下一批决策，并保存动作效果。
 
 ## 快速开始
@@ -184,8 +188,8 @@ python -m pytest -q
 
 snapshot 只携带触发原因、结论摘要、最多 8 条假设、合法证据 case ID、建议探测变量、风险和最多 8 条 IMA 来源。完整 IMA 原文不会进入 prompt 或 checkpoint。decision 记录顾问触发、假设和 IMA 来源；observation 的 `action_audit` 记录 decision、实际 action、假设 ID、IMA 来源和实际输入。
 
-顾问输出会经过 case ID 和变量名校验。无效证据/变量会被丢弃；顾问不能扩大硬边界或写入 Aspen 路径。顾问、IMA 或解析失败时继续使用既有规则 fallback，`completed_verified`、`verification_failed` 等结果语义不变。
+顾问输出会经过 case ID 和变量名校验，无效引用导致当前 Agent 请求失败。顾问不能扩大硬边界或写入 Aspen 路径。顾问、IMA 或解析失败抛出 AgentUnavailableError，保存不可用 checkpoint，不生成替代计划。
 
-接入前，失败和停滞只依赖确定性 fallback；接入后，主决策 Agent 可引用设备/物流机理假设和受控探测建议。执行、预算扣除、checkpoint 提交、Aspen 恢复和复验流程保持不变；IMA 不可用时行为退化为原有闭环。
+主决策 Agent 可引用已验证的设备/物流机理假设和受控探测建议。数值优化、预算扣除和复验仍由工具执行；IMA 不可用时闭环立即停止。
 
 \r\n

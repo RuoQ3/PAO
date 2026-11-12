@@ -205,7 +205,7 @@ def _stop_explanation(reason: Any, state: Mapping[str, Any], settings: Any) -> s
         "decision_budget": "达到主决策次数上限；系统停止继续向 Agent 请求动作，并对代表可行工况进行复验。",
         "stagnation": "连续若干个已计数动作未带来新的可行性、收敛性或 Pareto/HV 改善，达到停滞耐心上限。",
         "agent_stop": "主决策 Agent 明确提出 stop；程序仍按协议尝试对代表可行工况进行复验。",
-        "driver_unavailable": "Aspen 驱动不可用或恢复失败，流程被安全终止，结果不能视为已复验。",
+        "driver_unavailable": "Aspen 驱动不可用，已停止后续派发；底层停止及清理状态以资源记录为准，结果未复验。",
     }
     explanation = explanations.get(reason, "流程以未分类原因结束；请结合 checkpoint 中的 pending、决策和观测记录复核。")
     no_case_actions = sum(
@@ -314,7 +314,7 @@ def _render_final_evidence(analysis: Mapping[str, Any] | None) -> list[str]:
         for diagnosis in diagnoses[:5]:
             lines.append(
                 f"- `{diagnosis.get('pattern_id', 'unknown')}`（{diagnosis.get('severity', 'unknown')}）："
-                f"{diagnosis.get('description', '未提供描述')}；建议：{', '.join(map(str, diagnosis.get('fixes') or []))}"
+                f"{diagnosis.get('description', '')}（规则匹配标签，不是 Agent 诊断）"
             )
         for example in (failures.get("examples") or [])[:3]:
             lines.append(f"- 原始错误样例：{example}")
@@ -421,410 +421,28 @@ def _render_decision(
     return lines
 
 
-def _parameter_metadata(state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Map persisted optimizer keys to the names an engineer recognizes."""
-    context = (state.get("problem") or {}).get("context") or {}
-    metadata: dict[str, dict[str, Any]] = {}
-    for item in context.get("design_variables") or []:
-        if not isinstance(item, Mapping):
-            continue
-        name = str(item.get("name") or item.get("aspen_path") or "")
-        key = name if item.get("type") == "derived" else str(item.get("aspen_path") or name)
-        if key:
-            metadata[key] = dict(item)
-    return metadata
-
-
-def _parameter_label(key: Any, metadata: Mapping[str, Mapping[str, Any]]) -> str:
-    raw = str(key)
-    item = metadata.get(raw) or {}
-    name = str(item.get("name") or raw)
-    if name.endswith("_NSTAGE"):
-        return name.replace("_NSTAGE", " 理论板数")
-    if name.endswith("_RR"):
-        return name.replace("_RR", " 回流比")
-    if name.endswith("_PRES"):
-        return name.replace("_PRES", " 操作压力")
-    if name.startswith("SOL") and name.endswith("_FLOW"):
-        return name.replace("SOL", "S").replace("_FLOW", " 溶剂流量")
-    if "_FEED_" in name and name.endswith("_FRAC"):
-        prefix, feed = name.split("_FEED_", 1)
-        return f"{prefix} {feed.removesuffix('_FRAC')} 进料位置"
-    return name.replace("_", " ")
-
-
-def _same_value(left: Any, right: Any) -> bool:
-    left_number, right_number = _number(left), _number(right)
-    if left_number is None or right_number is None:
-        return left == right
-    return math.isclose(left_number, right_number, rel_tol=1e-8, abs_tol=1e-10)
-
-
-def _reference_inputs(
-    plan: Mapping[str, Any],
-    state: Mapping[str, Any],
-    cases: Mapping[str, Mapping[str, Any]],
-) -> Mapping[str, Any]:
-    for case_id in reversed(plan.get("evidence_case_ids") or []):
-        row = cases.get(str(case_id))
-        if row and row.get("optimizer_inputs"):
-            return row["optimizer_inputs"]
-    return state.get("initial_point") or {}
-
-
-def _planned_changes(
-    plan: Mapping[str, Any],
-    state: Mapping[str, Any],
-    cases: Mapping[str, Mapping[str, Any]],
-    metadata: Mapping[str, Mapping[str, Any]],
-    limit: int = 6,
-) -> list[str]:
-    """Summarize only changed variables, never dump a full candidate vector."""
-    reference = _reference_inputs(plan, state, cases)
-    candidate = plan.get("candidate") or {}
-    changes: list[str] = []
-    for key, value in candidate.items():
-        old = reference.get(key) if isinstance(reference, Mapping) else None
-        if old is not None and _same_value(old, value):
-            continue
-        label = _parameter_label(key, metadata)
-        if old is None:
-            changes.append(f"{label}={_fmt(value)}")
-        else:
-            changes.append(f"{label} {_fmt(old)} → {_fmt(value)}")
-    if not changes:
-        for key, pair in (plan.get("search_region") or {}).items():
-            label = _parameter_label(key, metadata)
-            changes.append(f"{label} 搜索区 [{_fmt(pair[0])}, {_fmt(pair[1])}]")
-    return changes[:limit]
-
-
-def _row_conclusion(row: Mapping[str, Any]) -> str:
-    status = str(row.get("status", "unknown"))
-    if row.get("success"):
-        return "可行"
-    if status == "infeasible":
-        return "已收敛，但违反产品约束"
-    if row.get("simulation_valid"):
-        return "已收敛，但目标/约束结果不可用"
-    return "仿真失败或结果未知"
-
-
-def _decision_outcome(
-    decision: Mapping[str, Any],
-    cases: Mapping[str, Mapping[str, Any]],
-) -> tuple[str, int, int, int]:
-    ids = [str(item) for item in (decision.get("outcome") or {}).get("case_ids") or []]
-    rows = [cases[item] for item in ids if item in cases]
-    feasible = sum(bool(row.get("success")) for row in rows)
-    infeasible = sum(str(row.get("status")) == "infeasible" for row in rows)
-    failed = len(rows) - feasible - infeasible
-    if not rows:
-        return "未形成新的 Aspen 工况证据", 0, 0, 0
-    if feasible and not infeasible and not failed:
-        return f"获得 {feasible} 个可行工况", feasible, infeasible, failed
-    if infeasible and not feasible and not failed:
-        return f"{infeasible} 个工况收敛但违反约束", feasible, infeasible, failed
-    return f"可行 {feasible}，约束违反 {infeasible}，失败/无效 {failed}", feasible, infeasible, failed
-
-
-def _feasible_rows(observations: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    return [row for row in observations if row.get("success")]
-
-
-def _objective_from_row(row: Mapping[str, Any], name: str) -> float | None:
-    value = _objective_values(row).get(name)
-    return _number(value)
-
-
-def _recommended_row(
-    state: Mapping[str, Any],
-    observations: Sequence[Mapping[str, Any]],
-    objective_names: Sequence[str],
-    analysis: Mapping[str, Any] | None,
-) -> Mapping[str, Any] | None:
-    cases = {str(row.get("case_id")): row for row in observations}
-    reference = cases.get(str(state.get("verification_reference")))
-    if reference and reference.get("success"):
-        return reference
-    feasible = _feasible_rows(observations)
-    if not feasible:
-        return None
-    directions = {
-        name: ((analysis or {}).get("objectives") or {}).get(name, {}).get("direction", "minimize")
-        for name in objective_names
-    }
-    ranges: dict[str, tuple[float, float]] = {}
-    for name in objective_names:
-        values = [v for row in feasible if (v := _objective_from_row(row, name)) is not None]
-        if values:
-            ranges[name] = (min(values), max(values))
-
-    def score(row: Mapping[str, Any]) -> float:
-        total = 0.0
-        count = 0
-        for name in objective_names:
-            value = _objective_from_row(row, name)
-            if value is None or name not in ranges:
-                continue
-            lo, hi = ranges[name]
-            normalized = (value - lo) / max(hi - lo, 1e-12)
-            if directions[name] != "minimize":
-                normalized = 1.0 - normalized
-            total += normalized
-            count += 1
-        return total / max(count, 1)
-
-    return min(feasible, key=score)
-
-
-def _constraint_label(name: str) -> str:
-    replacements = {
-        "D1_PF_purity": "D1 PF 纯度",
-        "D2_NPA_purity": "D2 NPA 纯度",
-        "D3_WATER_purity": "D3 WATER 纯度",
-    }
-    return replacements.get(name, name.replace("_purity", " 纯度").replace("_", " "))
-
-
-def _objective_improvement(item: Mapping[str, Any]) -> str:
-    first = _number(item.get("first_value"))
-    best = _number(item.get("best_value"))
-    if first is None or best is None or first == 0:
-        return "—"
-    improvement = (first - best) / abs(first) if item.get("direction") == "minimize" else (best - first) / abs(first)
-    return _fmt(improvement, percent=True)
-
-
-def _best_feasible_value(
-    observations: Sequence[Mapping[str, Any]],
-    name: str,
-    direction: str | None,
-) -> float | None:
-    values = [
-        value
-        for row in observations
-        if row.get("success")
-        and (value := _objective_from_row(row, name)) is not None
-    ]
-    if not values:
-        return None
-    return min(values) if direction != "maximize" else max(values)
-
-
-def _unique_input_count(rows: Sequence[Mapping[str, Any]]) -> int:
-    fingerprints = {
-        _json(row.get("optimizer_inputs") or {})
-        for row in rows
-        if row.get("optimizer_inputs") is not None
-    }
-    return len(fingerprints)
-
-
-def _status_sentence(result: str, termination: str, targets: Mapping[str, Any]) -> str:
-    if result == "target_verified":
-        return "指定目标已在代表工况上达到，并通过独立复验。"
-    if result == "completed_verified":
-        if targets:
-            return "代表工况通过独立复验，但报告不把它扩大解释为整个 Pareto 前沿或全局最优。"
-        return "代表工况通过独立复验；当前配置未设置数值目标阈值，因此这不是‘目标已达成’的结论。"
-    if result == "verification_failed":
-        return "代表工况未通过独立复验，当前结果不能作为稳定操作点交付。"
-    if result == "no_feasible_solution":
-        return "本轮预算内没有找到可行工况，下一轮应优先扩大可行域探索。"
-    if termination == "stagnation":
-        return "搜索因停滞提前结束，说明当前搜索策略没有继续产生有效改进，不等于不存在更优解。"
-    return "本轮未形成可交付的稳定结论。"
-
-
-def _termination_label(reason: str) -> str:
-    return {
-        "target_observed": "已观察到目标工况",
-        "evaluation_budget": "评估预算用尽",
-        "decision_budget": "决策次数用尽",
-        "stagnation": "搜索停滞",
-        "agent_stop": "Agent 主动停止",
-        "driver_unavailable": "Aspen 驱动不可用",
-    }.get(reason, reason or "未分类原因")
-
-
-def _analyst_report(
-    state: Mapping[str, Any],
-    *,
-    settings: Any,
-    objective_names: Sequence[str],
-) -> str:
-    observations = [row for row in (state.get("observations") or []) if isinstance(row, Mapping)]
-    cases = {str(row.get("case_id")): row for row in observations if row.get("case_id") is not None}
-    decisions = [item for item in (state.get("decisions") or []) if isinstance(item, Mapping)]
-    metadata = _parameter_metadata(state)
+def _analyst_report(state, *, settings, objective_names):
+    """Render persisted facts and a separately versioned Agent analysis only."""
+    from src.agents.actions.authorization import digest
+    from src.agents.orchestration.models import Answer
+    from src.reporting.answer_export import markdown_answer
+    observations = [row for row in state.get("observations", []) if isinstance(row, Mapping)]
     analysis = _latest_analysis(state, objective_names)
-    analysis = analysis or {}
-    result = str(state.get("result", "unverified"))
-    termination = str(state.get("termination_reason") or "unknown")
-    targets = _get(settings, "objective_targets", {}) or {}
-    feasible = _feasible_rows(observations)
-    verified_count = len(state.get("verification_ids") or [])
-    max_evaluations = _get(settings, "max_evaluations", "—")
-    recommended = _recommended_row(state, observations, objective_names, analysis)
-
-    objective_text = "、".join(objective_names) if objective_names else "当前配置目标"
-    status_text = "、".join(f"{key} {value} 次" for key, value in sorted(_status_counts(observations).items())) or "无可用观测"
-    lines = [
-        "# PAO 工艺优化分析报告",
-        "",
-        f"> 报告版本 {EXPLANATORY_REPORT_VERSION}。本报告面向工艺决策：只保留结论、证据和建议。完整运行审计记录见同名 `.report.json`。",
-        "",
-        "## 一、执行摘要",
-        "",
-        f"本轮优化以**最小化 {objective_text}**为目标，同时满足全部产品纯度约束。"
-        f"共完成 {len(observations)} 个 Aspen 工况评估，预算使用 {state.get('used', len(observations))}/{max_evaluations}；"
-        f"其中 {sum(bool(row.get('simulation_valid')) for row in observations)} 个工况完成收敛，{len(feasible)} 个工况满足全部约束"
-        f"（{_unique_input_count(feasible)} 个不同操作点）。",
-        "",
-        f"**总体结论：** {_status_sentence(result, termination, targets)}",
-        "",
-        f"本轮停止原因为“{_termination_label(termination)}”：{_stop_explanation(termination, state, settings)}",
-        "",
-        "## 二、已经完成的工作",
-        "",
-    ]
-    work_items = [
-        f"完成 {len(observations)} 次 Aspen 工况评估，状态分布为：{status_text}。",
-        f"围绕已有可行锚点进行了 {sum((d.get('plan') or {}).get('action') == 'probe' for d in decisions)} 次定向参数试验，重点涉及回流比、溶剂流量和分离段操作条件。",
-        f"完成 {verified_count} 次独立复验；复验只证明代表工况在当前模型下具有重复性，不证明全局最优。",
-    ]
-    rejected = sum(bool(item.get("rejection")) for item in decisions)
-    if rejected:
-        work_items.append(f"有 {rejected} 次自动动作建议未满足执行条件，系统已切换到安全规则继续运行；这些事件不应被解释为工艺实验结论。")
-    lines.extend(f"- {item}" for item in work_items)
-    lines.extend(["", "## 三、结果与工程含义", ""])
-
-    objective_report = analysis.get("objectives") or {}
-    if objective_report:
-        lines.append("### 目标改善")
-        objective_rows = []
-        for name, item in objective_report.items():
-            feasible_best = _best_feasible_value(observations, name, item.get("direction"))
-            first = _number(item.get("first_value"))
-            if feasible_best is None or first is None or first == 0:
-                feasible_improvement = "—"
-            else:
-                change = (first - feasible_best) / abs(first) if item.get("direction") == "minimize" else (feasible_best - first) / abs(first)
-                feasible_improvement = _fmt(change, percent=True)
-            history_best = _number(item.get("best_value"))
-            best_row = cases.get(str(item.get("best_case_id")))
-            history_note = history_best
-            if history_best is not None and best_row is not None and not best_row.get("success"):
-                history_note = f"{_fmt(history_best)}（不可行）"
-            objective_rows.append([name, first, feasible_best, feasible_improvement, history_note])
-        lines.extend(_table(
-            ["目标", "首次值", "最佳可行值", "可行改善", "全历史最低值"],
-            objective_rows,
-        ))
-        lines.append("")
-        lines.append("‘全历史最低值’若标注为不可行，只能说明经济目标有潜力，不能作为工艺候选；正式建议只采用同时满足全部产品约束的工况。")
-        lines.append("目标值的改善只能说明本轮试验观察到了更优结果；由于可行点数量有限，不能单独归因于某一个参数，更不能据此宣称全局最优。")
-        lines.append("")
-
-    constraints = analysis.get("constraints") or {}
-    if constraints:
-        lines.append("### 当前主要瓶颈")
-        ordered = sorted(constraints.items(), key=lambda item: item[1].get("violation_rate") or 0, reverse=True)
-        rows = []
-        for name, item in ordered[:5]:
-            rows.append([
-                _constraint_label(name),
-                _fmt(item.get("violation_rate"), percent=True),
-                item.get("n_satisfied"),
-                item.get("max_violation"),
-                "约束风险高" if (item.get("violation_rate") or 0) > 0.5 else "需要继续确认",
-            ])
-        lines.extend(_table(["约束", "违反率", "满足次数", "最大违反", "判断"], rows))
-        top = ordered[0]
-        lines.append("")
-        if (top[1].get("violation_rate") or 0) > 0:
-            lines.append(
-                f"当前最主要的可行域瓶颈是 {_constraint_label(top[0])}（违反率 {_fmt(top[1].get('violation_rate'), percent=True)}）。"
-                "因此下一阶段应先扩大该约束附近的可行裕量，再继续压低经济目标；单纯追求更低成本可能会把工况推回不可行区域。"
-            )
-        else:
-            lines.append("本轮已评估工况均满足产品约束，暂未观察到明确的约束瓶颈；下一阶段可以把重点转向经济目标改善。")
-        lines.append("")
-
-    if recommended:
-        lines.append("### 建议保留的代表工况")
-        rows = []
-        for name in objective_names:
-            rows.append([name, _objective_from_row(recommended, name)])
-        lines.extend(_table(["指标", "代表工况值"], rows))
-        changes = []
-        initial = state.get("initial_point") or {}
-        for key, value in (recommended.get("optimizer_inputs") or {}).items():
-            old = initial.get(key)
-            if old is not None and not _same_value(old, value):
-                changes.append(f"{_parameter_label(key, metadata)} {_fmt(old)} → {_fmt(value)}")
-        if changes:
-            lines.append("")
-            lines.append("相对初始点的主要变化：" + "；".join(changes[:8]) + "。")
-        constraint_summary = []
-        for name, item in _constraint_values(recommended).items():
-            state_text = "满足" if item.get("satisfied") else "违反"
-            constraint_summary.append(f"{_constraint_label(name)}{state_text}")
-        if constraint_summary:
-            lines.append("代表工况约束状态：" + "；".join(constraint_summary) + "。")
-        lines.append("")
-
-    probes = []
-    for decision in decisions:
-        plan = decision.get("plan") or {}
-        if plan.get("action") != "probe":
-            continue
-        outcome = decision.get("outcome") or {}
-        ids = outcome.get("case_ids") or []
-        if not ids:
-            continue
-        conclusion, feasible_n, infeasible_n, failed_n = _decision_outcome(decision, cases)
-        changes = _planned_changes(plan, state, cases, metadata, limit=3)
-        if not changes:
-            continue
-        probes.append(["；".join(changes), conclusion, "有改善" if outcome.get("expected_metric_improved") else "未显示明确改善"])
-    if probes:
-        lines.append("### 关键定向试验")
-        lines.extend(_table(["试验变量", "实际结果", "对目标的意义"], probes[-6:]))
-        lines.append("")
-        lines.append("这些试验采用了单变量或少变量扰动，适合定位边界；但对于同时改变多个参数的试验，只能作为组合效果观察，不能拆分成单变量因果结论。")
-        lines.append("")
-
-    lines.extend(["## 四、专业建议", ""])
-    recommendations: list[str] = []
-    if constraints:
-        ordered = sorted(constraints.items(), key=lambda item: item[1].get("violation_rate") or 0, reverse=True)
-        bottlenecks = "、".join(_constraint_label(name) for name, item in ordered[:2] if (item.get("violation_rate") or 0) > 0)
-        if bottlenecks:
-            recommendations.append(f"优先围绕 {bottlenecks} 做可行域修复实验；建议固定其他变量，每次只改变一个补偿变量，并记录纯度裕量而不只记录是否合格。")
-    if recommended:
-        recommendations.append("将上述代表工况作为下一轮搜索锚点，不要直接从不可行低成本点继续扩大扰动；先确认该锚点的三个产品纯度均留有足够裕量。")
-    if termination == "stagnation" and state.get("used", 0) < (_number(max_evaluations) or state.get("used", 0)):
-        recommendations.append("本轮在预算未用尽时因停滞停止，不能视为优化完成。下一轮应减少无效候选和协议拒绝，采用更窄的局部区域继续搜索。")
-    sensitivity = analysis.get("sensitivity") or {}
-    ranked = [item for item in sensitivity.get("ranked_variables") or [] if item.get("reliable")]
-    if ranked:
-        labels = [_parameter_label(item.get("path"), metadata) for item in ranked[:3]]
-        recommendations.append("敏感性排序仅作为筛选线索；当前可优先考察 " + "、".join(labels) + "，但必须用新的单变量试验验证，不应直接当作物理定律。")
-    if not targets:
-        recommendations.append("如果项目有明确业务底线，建议在下一轮配置中补充 CAPEX/OPEX 目标阈值；当前报告只能判断相对改善，不能判断是否达到业务目标。")
-    if not recommendations:
-        recommendations.append("当前证据不足以给出稳定的参数方向，建议先增加可行工况样本，再进行目标优化。")
-    lines.extend(f"{index}. {item}" for index, item in enumerate(recommendations, 1))
-    lines.extend([
-        "",
-        "## 五、结论边界",
-        "",
-        "本报告基于已完成的 Aspen 仿真与约束计算。收敛不等于产品合格，单次试验后的指标变化是观察关联而不是因果证明；当前结果适合作为下一轮实验依据，不应直接作为全局最优或最终工艺定版。",
-        "",
-    ])
-    return "\n".join(lines)
+    lines = ["# PAO 执行记录与分析", "",
+             f"观测工况 {len(observations)}；停止原因：{state.get('termination_reason', 'unknown')}。", ""]
+    lines.extend(_render_final_evidence(analysis))
+    for row in observations:
+        lines.append(_case_description(row))
+        for obj in row.get("objectives") or []:
+            direction = "minimize" if obj.get("minimize") is True else "maximize" if obj.get("minimize") is False else "unknown"
+            lines.append(f"- {obj.get('name')}：{obj.get('value')} {obj.get('unit', 'unknown')}；方向 {direction}")
+        lines.append(f"- 约束数量：{len(row.get('constraints') or [])}")
+    agent = state.get("agent_analysis") or {}
+    if agent.get("status") == "available" and agent.get("evidence_digest") == digest(observations) and agent.get("answer"):
+        lines.extend(["", f"Agent 分析版本 {agent.get('version', 'unknown')}", markdown_answer(Answer.from_dict(agent["answer"]))])
+    else:
+        lines.extend(["", "分析不可用：缺少绑定当前观测版本的 Agent 分析。仅展示执行与数值记录，不生成专业建议。"])
+    return "\n".join(lines) + "\n"
 
 
 def render_explanatory_report(

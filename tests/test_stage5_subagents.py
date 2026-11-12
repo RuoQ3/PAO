@@ -1,4 +1,6 @@
 """Stage 5 controlled role registry tests with fake read-only context."""
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 from types import SimpleNamespace
 
 from src.agents.orchestration.models import IntentSchema, SubagentRequest, TaskStatus
@@ -23,7 +25,7 @@ def _context():
 
 
 def test_default_registry_registers_all_roles_with_metadata():
-    registry = default_registry()
+    registry = default_registry(**fake_kwargs())
     assert set(registry.names()) == ROLES
     for name in ROLES:
         definition = registry.definition(name)
@@ -36,7 +38,7 @@ def test_default_registry_registers_all_roles_with_metadata():
 
 
 def test_each_role_returns_structured_read_only_task_result():
-    registry = default_registry()
+    registry = default_registry(**fake_kwargs())
     for name in sorted(ROLES):
         from src.agents.orchestration.models import TaskSpec
         result = registry.get(name)(TaskSpec(agent=name, task_type="project_query", prompt="review"), context=_context(), tool_allowlist=())
@@ -49,7 +51,7 @@ def test_each_role_returns_structured_read_only_task_result():
 
 
 def test_code_engineer_and_boundary_are_proposal_only():
-    registry = default_registry()
+    registry = default_registry(**fake_kwargs())
     from src.agents.orchestration.models import TaskSpec
     code = registry.get("code_engineer")(TaskSpec(agent="code_engineer", prompt="change code"), context=_context(), tool_allowlist=())
     boundary = registry.get("boundary_advisor")(TaskSpec(agent="boundary_advisor", prompt="review bounds"), context=_context(), tool_allowlist=())
@@ -58,7 +60,7 @@ def test_code_engineer_and_boundary_are_proposal_only():
 
 
 def test_runtime_applies_role_limits_and_disables_subtasks():
-    registry = default_registry()
+    registry = default_registry(**fake_kwargs())
     intent = IntentSchema(
         intent="project_query", task_type="project_query", project_scope="current_project",
         context_required=["process_context"],
@@ -78,7 +80,7 @@ def test_runtime_applies_role_limits_and_disables_subtasks():
 
 
 def test_role_handler_failure_is_structured_and_runtime_survives():
-    registry = default_registry()
+    registry = default_registry(**fake_kwargs())
     result = registry.get("process_advisor")(
         __import__("src.agents.orchestration.models", fromlist=["TaskSpec"]).TaskSpec(agent="process_advisor", prompt="inspect"),
         context=None, tool_allowlist=(),

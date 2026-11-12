@@ -1,4 +1,7 @@
 """Smoke tests for the public unified Agent architecture."""
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
+import pytest
 from pathlib import Path
 
 from src.agents import LeadAgent, OrchestrationRuntime, SessionState
@@ -21,15 +24,14 @@ def test_lead_general_answer_is_read_only_and_context_builder_is_lazy():
             calls.append(kwargs)
             raise AssertionError("general questions must not load process context")
 
-    answer = LeadAgent(context_builder=FakeBuilder()).answer("Explain a mass balance")
+    answer = LeadAgent(context_builder=FakeBuilder(), **fake_kwargs(kind="chat")).answer("Explain a mass balance")
     assert answer.facts and not calls
     assert answer.text != "Explain a mass balance"
 
 
 def test_rule_mode_does_not_echo_general_chat():
-    answer = LeadAgent().answer("你好呀")
-    assert answer.text != "你好呀"
-    assert any(f.get("kind") == "rule_fallback" for f in answer.facts)
+    with pytest.raises(AgentUnavailableError):
+        LeadAgent(use_llm=False).answer('你好呀')
 
 
 def test_process_context_builder_accepts_in_memory_config_without_aspen():
@@ -47,9 +49,9 @@ def test_project_equipment_question_uses_yaml_context_without_aspen():
             {"name": "temp", "aspen_path": r"\Data\Blocks\T2\Input\TEMP"},
         ]}, read_only=True,
     )
-    answer = LeadAgent(context_builder=builder).answer("这个项目里有什么设备？")
+    answer = LeadAgent(context_builder=builder, **fake_kwargs(text="T1 and T2 evidence requires further analysis.")).answer("这个项目里有什么设备？")
     assert "T1" in answer.text and "T2" in answer.text
-    assert any(item.get("kind") == "equipment_inventory" for item in answer.facts)
+    assert answer.evidence and answer.task_results
 
 
 def test_yaml_conversation_reads_equipment_and_streams_from_bkp_index():
@@ -73,7 +75,7 @@ def test_conversation_first_general_turn_does_not_inherit_current_history_as_pro
         def build(self, **kwargs):
             raise AssertionError("a first general turn must not load process context")
 
-    session = ConversationSession(SessionState(), LeadAgent(context_builder=FakeBuilder(), use_llm=False))
+    session = ConversationSession(SessionState(), LeadAgent(context_builder=FakeBuilder(), **fake_kwargs(kind="chat")))
     answer = session.submit("???")
     assert answer.facts
     assert session.state.context_summary == {}

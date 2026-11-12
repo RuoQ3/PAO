@@ -40,6 +40,7 @@ Knowles J., "ParEGO: A Hybrid Algorithm With On-Line Landscape Approximation
 for Expensive Multiobjective Optimization Problems", IEEE TEVC 2006.
 """
 from __future__ import annotations
+from src.agents.actions.authorization import authorized_workflow, ExecutionBoundaryError
 
 import logging
 import math
@@ -348,6 +349,7 @@ class ParetoOptimizeResult:
 # 主入口
 # ---------------------------------------------------------------------------
 
+@authorized_workflow
 def optimize_pareto_case(
     driver: AspenDriver,
     config: ParetoOptimizeCaseConfig,
@@ -380,6 +382,8 @@ def optimize_pareto_case(
         return ClosedLoopService().run(driver=driver, config=config, approved=True)
 
     _validate_config(config)
+    from src.agents.actions.plans import preflight_optimizer
+    preflight_optimizer(config)
 
     paths = list(config.param_bounds.keys())
     bounds = [config.param_bounds[p] for p in paths]
@@ -537,6 +541,8 @@ def optimize_pareto_case(
                             if _c.available and _c.value is not None:
                                 margins[_c.name] = -_c.value
                     return converged, margins
+                except ExecutionBoundaryError:
+                    raise
                 except Exception as exc:
                     _log.warning("敏感度探针 run_fn 异常：%s", exc)
                     return False, {}
@@ -571,6 +577,8 @@ def optimize_pareto_case(
                         run_id=str(_uuid.uuid4()),
                     )
                     return bool(_case.success)
+                except ExecutionBoundaryError:
+                    raise
                 except Exception as exc:
                     _log.warning("探针热启动异常：%s", exc)
                     return False
@@ -705,6 +713,8 @@ def optimize_pareto_case(
             _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
             hv_history.append(hv)
             break
+        except ExecutionBoundaryError:
+            raise
         except Exception as exc:
             _log.warning("初始 DOE [%d/%d]：run_case() 意外异常（已隔离）：%s",
                          idx + 1, config.n_initial, exc)
@@ -1085,6 +1095,8 @@ def optimize_pareto_case(
                 _fixed_ref_point, hv = _compute_hv_fixed(cases, config, _fixed_ref_point)
                 hv_history.append(hv)
                 break
+            except ExecutionBoundaryError:
+                raise
             except Exception as exc:
                 _log.warning("贝叶斯优化 [%d/%d]：run_case() 意外异常（已隔离）：%s",
                              idx + 1, n_total, exc)
@@ -1596,6 +1608,8 @@ def _feasibility_search(
                 _save_case(db, case, config.session_id)
                 global_iter += 1
                 break
+            except ExecutionBoundaryError:
+                raise
             except Exception as exc:
                 _log.warning("Phase 0 [%d/%d]：run_case() 意外异常：%s", global_iter + 1, n_trials, exc)
                 case = ProcessCase(
@@ -1687,7 +1701,7 @@ class _MultiObjectiveBayesianOptimizer:
       3. 用标量化值重新拟合 GP，通过采集函数推荐下一个候选点
 
     成功观测数 < n_initial_min 时退化为随机采样。
-    skopt 不可用时始终随机采样。
+    skopt 后端不可用时在真实执行前停止。
     """
 
     def __init__(
@@ -1716,8 +1730,7 @@ class _MultiObjectiveBayesianOptimizer:
         self._effective_bounds: list[tuple[float, float]] | None = None
 
         # BoTorch 路径：预先创建持久化优化器（避免每次 ask 重建）。
-        # 若 BoTorch 未安装，make_surrogate_optimizer 会返回 skopt GP fallback；
-        # 此时不能继续按 BoTorch 接口传 y_vec，应退回本类下方的 ParEGO/skopt 路径。
+        # 所选后端不可用时工厂抛错，不允许切换 ParEGO/GP。
         self._is_botorch = config.surrogate_model in ("qEHVI", "NEHVI")
         if self._is_botorch:
             surrogate_cfg = SurrogateConfig(
@@ -1732,19 +1745,14 @@ class _MultiObjectiveBayesianOptimizer:
                 bounds, surrogate_cfg, self._integer_indices,
                 n_objectives=self._n_obj,
             )
-            if botorch_candidate.__class__.__name__ == "BoTorchMOOptimizer":
-                self._botorch_opt = botorch_candidate
-            else:
-                self._botorch_opt = None
-                self._is_botorch = False
-                self._surrogate_model = "GP"
-                _log.warning(
-                    "%s 不可用，_MultiObjectiveBayesianOptimizer 已切换到 "
-                    "ParEGO/skopt GP fallback。",
-                    config.surrogate_model,
-                )
+            self._botorch_opt = botorch_candidate
         else:
             self._botorch_opt = None
+            # Preflight the exact backend before DOE/pre-exploration.
+            make_surrogate_optimizer(bounds, SurrogateConfig(
+                model=config.surrogate_model, acquisition=config.acquisition,
+                xi=config.xi, kappa=config.kappa, n_initial_min=config.n_initial_min,
+                random_seed=config.random_seed), self._integer_indices)
 
     def tell(
         self,
@@ -1792,8 +1800,10 @@ class _MultiObjectiveBayesianOptimizer:
         if self._botorch_opt is not None:
             self._botorch_opt._effective_bounds = None
 
-        if self._botorch_opt is None and len(self._observations) < self._n_initial_min:
-            return [lo + self._rng.random() * (hi - lo) for lo, hi in active_bounds]
+        if self._botorch_opt is None and (self._surrogate_model == "random" or len(self._observations) < self._n_initial_min):
+            import math
+            return [float(self._rng.randint(math.ceil(lo), math.floor(hi))) if i in self._integer_indices
+                    else lo + self._rng.random() * (hi - lo) for i, (lo, hi) in enumerate(active_bounds)]
 
         # BoTorch 路径：qEHVI/qNEHVI
         if self._botorch_opt is not None:
@@ -1819,7 +1829,7 @@ class _MultiObjectiveBayesianOptimizer:
                 acquisition=self._acquisition,
                 xi=self._xi,
                 kappa=self._kappa,
-                n_initial_min=0,
+                n_initial_min=1,
                 random_seed=self._rng.randint(0, 2 ** 31),
             )
             opt = make_surrogate_optimizer(self._bounds, surrogate_cfg, self._integer_indices)
@@ -1828,9 +1838,10 @@ class _MultiObjectiveBayesianOptimizer:
             for x in self._failed_xs:
                 opt.tell(x, penalty, is_success=False)
             return opt.ask(active_bounds=active_bounds)
+        except ExecutionBoundaryError:
+            raise
         except Exception as exc:
-            _log.warning("代理模型多目标优化失败，回退到随机采样：%s", exc)
-            return [lo + self._rng.random() * (hi - lo) for lo, hi in active_bounds]
+            raise RuntimeError(f"{self._surrogate_model} Pareto fit/ask failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1993,6 +2004,8 @@ def _compute_hv_fixed(
         hv = hypervolume(first_front_vecs, fixed_ref)
         return fixed_ref, hv
 
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:
         _log.debug("超体积快照计算失败（已忽略）：%s", exc)
         return fixed_ref, None
@@ -2047,15 +2060,9 @@ def _log_infeasible_diagnosis(
 
 
 def _tell_optimizer(optimizer: Any, x: Any, y_vec: Any, *, is_success: bool, c_vec: Any = None) -> None:
-    """向 optimizer.tell 提交观测,兼容不接受 c_vec 的旧/桩 optimizer。
+    """提交完整观测；tell 异常必须传播，不能以签名重试吞掉后端故障。"""
+    optimizer.tell(x, y_vec, is_success=is_success, c_vec=c_vec)
 
-    优先带 c_vec 调用(约束感知后端用得到);若该 optimizer.tell 不接受
-    c_vec 关键字,回退到不带 c_vec 的调用。两种签名都能工作。
-    """
-    try:
-        optimizer.tell(x, y_vec, is_success=is_success, c_vec=c_vec)
-    except TypeError:
-        optimizer.tell(x, y_vec, is_success=is_success)
 
 
 def _compute_refined_overlay(
@@ -2080,6 +2087,8 @@ def _compute_refined_overlay(
                 len(feasible), len(overlay),
             )
         return overlay
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:  # noqa: BLE001
         _log.warning("boundary_refine 重估异常(已忽略)：%s", exc)
         return {}
@@ -2103,6 +2112,8 @@ def _preflight_blocked(design_vars: dict[str, Any], config: Any) -> str | None:
             config=pf,
             var_dependencies=config.var_dependencies,
         )
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:  # noqa: BLE001
         _log.warning("飞行前检查异常(已放行该点)：%s", exc)
         return None
@@ -2128,21 +2139,10 @@ def _maybe_recover_driver(driver: Any, where: str) -> bool:
         True  无需恢复,或恢复成功 → 可继续。
         False 恢复失败 → 调用方应置 driver_dead 并终止本轮。
     """
-    needs = getattr(driver, "needs_recovery", False)
-    if not needs:
-        return True
-    recover = getattr(driver, "recover", None)
-    if not callable(recover):
-        # 测试桩或不支持自愈的 driver:清不掉标志,保守视为不可继续
-        _log.warning("%s：driver 标记需恢复但不支持 recover(),无法自愈。", where)
+    if getattr(driver, "needs_recovery", False):
+        _log.error("%s: execution state unknown; no automatic reconnect/retry", where)
         return False
-    _log.warning("%s：仿真超时/COM 异常,尝试重建 Aspen 连接……", where)
-    ok = bool(recover())
-    if ok:
-        _log.info("%s：Aspen 连接已自愈,继续后续工况。", where)
-    else:
-        _log.error("%s：Aspen 连接自愈失败,终止本轮优化。", where)
-    return ok
+    return True
 
 
 def _save_case(db: Any, case: ProcessCase, session_id: str = "") -> None:
@@ -2153,6 +2153,8 @@ def _save_case(db: Any, case: ProcessCase, session_id: str = "") -> None:
         if session_id:
             d["session_id"] = session_id
         db.save_case(d)
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:
         _log.warning("工况 '%s' 保存到数据库失败（已忽略）：%s", case.case_id, exc)
 
@@ -2167,6 +2169,8 @@ def _fire_callback(
         return
     try:
         callback(case, idx, total)
+    except ExecutionBoundaryError:
+        raise
     except Exception as exc:
         _log.warning("on_case_complete 回调异常（已忽略）：%s", exc)
 

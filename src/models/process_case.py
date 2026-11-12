@@ -216,8 +216,10 @@ class ProcessCase:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     result_source: str | None = None
+    execution_algorithm: dict[str, Any] | None = None
     model_path: str | None = None
     timestamp: str | None = None
+    session_id: str = ""
 
     # ------------------------------------------------------------------ #
     # 便捷属性
@@ -432,6 +434,7 @@ class ProcessCase:
 
         return {
             "case_id": self.case_id,
+            "session_id": self.session_id,
             "iteration": self.iteration,
             "status": self.status.value,
             "simulation_valid": self.simulation_valid,
@@ -460,6 +463,7 @@ class ProcessCase:
             "errors": list(self.errors),
             "warnings": list(self.warnings),
             "result_source": self.result_source,
+            "execution_algorithm": self.execution_algorithm,
             "model_path": self.model_path,
             "timestamp": self.timestamp,
         }
@@ -474,6 +478,7 @@ class ProcessCase:
         """
         return {
             "case_id": self.case_id,
+            "session_id": self.session_id,
             "iteration": self.iteration,
             "status": self.status.value,
             "simulation_valid": self.simulation_valid,

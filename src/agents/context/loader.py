@@ -100,30 +100,55 @@ class ContextLoader:
             generated_at=context.generated_at, status=context.status,
             diagnostics=list(context.diagnostics), conflicts=list(context.conflicts),
             facts=list(context.facts), inferences=list(context.inferences),
+            attachments=list(context.attachments), dependency_versions=dict(context.dependency_versions),
+            configuration=dict(context.configuration) if keep_yaml or keep_process else {},
         )
 
     def _attach_files(self, context: Any, files: Iterable[str], sources: list[dict[str, Any]]) -> Any:
+        from .versions import file_version
+        from dataclasses import replace
         selected = []
+        remaining = self.max_file_bytes
         for raw in files:
             path = Path(str(raw)).expanduser()
-            if not path.is_file():
+            record = {"path": str(path.resolve()), "status": "unavailable"}
+            # Explicit selection grants content access, except secrets. Never
+            # recursively collect siblings, home directories or project trees.
+            sensitive = path.name.lower().startswith(".env") or path.name.lower() in {"credentials", "id_rsa", "id_ed25519"} or path.suffix.lower() in {".pem", ".key", ".p12"}
+            sensitive |= any(part.lower() in {".aws", ".ssh"} for part in path.parts)
+            if sensitive:
+                record["reason"] = "secret file excluded"
+                selected.append(record)
                 continue
             try:
-                text = path.read_text(encoding="utf-8")[: self.max_file_bytes]
-            except (OSError, UnicodeError):
-                continue
-            selected.append({"path": str(path.resolve()), "content": text})
-            sources.append({"source": "file", "source_ref": str(path.resolve()), "claim": "User-selected file snapshot"})
+                with path.open("rb") as stream:
+                    payload = stream.read(remaining + 1)
+                truncated = len(payload) > remaining
+                payload = payload[:remaining]
+                # Incomplete UTF-8 tail is explicitly accounted for below.
+                import codecs
+                text = codecs.getincrementaldecoder("utf-8-sig")("strict").decode(payload, final=not truncated)
+                record.update(status="partial" if truncated else "available", content=text,
+                    version=file_version(path), encoding="utf-8-sig", truncated=truncated,
+                    byte_range=[0, len(payload)], content_sha256=__import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
+                    line_range=[1, len(text.splitlines())],
+                    selection="prefix within shared attachment byte budget")
+                remaining -= len(payload)
+            except (OSError, UnicodeError) as exc:
+                record["reason"] = str(exc)
+            selected.append(record)
+            sources.append({"source": "file", "source_ref": str(path.resolve()),
+                            "claim": "User-selected file snapshot", **record})
         if isinstance(context, ProcessContext):
-            diagnostics = list(context.diagnostics) + ([f"loaded_files={len(selected)}"] if selected else [])
-            return ProcessContext(**{**context.__dict__, "diagnostics": diagnostics, "sources": list(context.sources)})
+            diagnostics = list(context.diagnostics) + [f"attachment {r['path']}: {r['status']} {r.get('reason', '')}" for r in selected]
+            return replace(context, diagnostics=diagnostics, attachments=selected)
         return {"context": context, "files": selected}
 
     @staticmethod
     def _session_files(session: Any) -> list[str]:
         if session is None:
             return []
-        value = session.get("files") if isinstance(session, dict) else getattr(session, "context_refs", {}).get("files")
+        value = session.get("files", session.get("context_refs", {}).get("files")) if isinstance(session, dict) else getattr(session, "context_refs", {}).get("files")
         return [value] if isinstance(value, str) else list(value or [])
 
     @staticmethod

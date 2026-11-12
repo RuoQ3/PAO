@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 # Parameter-impact plans use the same approval boundary as the closed loop.
@@ -73,6 +73,31 @@ class ActionPlan:
     def parse(cls, raw: dict) -> "ActionPlan":
         if not isinstance(raw, dict):
             raise ValueError("Action must be a JSON object")
+        if set(raw) != {f.name for f in fields(cls)}:
+            raise ValueError("Action requires every protocol field and no unknown fields")
+        if raw["action"] not in {"continue", "set_region", "probe", "stop"}:
+            raise ValueError("Unsupported action")
+        if not isinstance(raw["hypothesis"], str) or not raw["hypothesis"].strip():
+            raise ValueError("A hypothesis is required")
+        if raw["expected_effect"] not in {"feasibility", "convergence", "objective", "information"}:
+            raise ValueError("Invalid expected_effect")
+        if raw["initialization"] not in {"reset", "previous"} or type(raw["repeat"]) is not bool:
+            raise ValueError("Invalid initialization/repeat")
+        if type(raw["batch_size"]) is not int or raw["batch_size"] < (0 if raw["action"] == "stop" else 1):
+            raise ValueError("Invalid batch_size")
+        for key in ("evidence_case_ids", "knowledge_ids"):
+            if not isinstance(raw[key], list) or not all(isinstance(x, str) and x for x in raw[key]):
+                raise ValueError("Invalid evidence references")
+        for key in ("search_region", "candidate"):
+            if not isinstance(raw[key], dict):
+                raise ValueError("Invalid action parameters")
+        for value in raw["candidate"].values():
+            if type(value) not in (int, float):
+                raise ValueError("Candidate must contain numbers")
+            finite(value)
+        for pair in raw["search_region"].values():
+            if not isinstance(pair, list) or len(pair) != 2 or any(type(v) not in (int, float) for v in pair) or finite(pair[0]) > finite(pair[1]):
+                raise ValueError("Invalid region interval")
         # Unknown fields (including constraints/objectives/hard_bounds) fail closed.
         return cls(**raw)
 
@@ -90,7 +115,7 @@ def validate_plan(plan: ActionPlan, state: dict, cfg: LoopConfig,
         raise ValueError("Unknown expected_effect")
     if plan.initialization not in {"reset", "previous"} or type(plan.repeat) is not bool:
         raise ValueError("Invalid initialization/repeat")
-    if type(plan.batch_size) is not int or not 1 <= plan.batch_size <= cfg.batch_size:
+    if type(plan.batch_size) is not int or not (0 if plan.action == "stop" else 1) <= plan.batch_size <= cfg.batch_size:
         raise ValueError("Action exceeds per-decision batch budget")
     if not isinstance(plan.evidence_case_ids, list) or not isinstance(plan.knowledge_ids, list):
         raise ValueError("Evidence and knowledge references must be arrays")

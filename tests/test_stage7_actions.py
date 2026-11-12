@@ -42,7 +42,7 @@ def test_confirmed_action_executes_and_audits():
     gateway.preview(action.audit_id)
     gateway.approve(action.audit_id)
     output = gateway.execute(action.audit_id)
-    assert output["status"] == "executed"
+    assert output["status"] == "simulated" and not output["real_execution"]
     assert executor.calls
     assert any(event.event_type.value == "execution" for event in gateway.audit.events)
 
@@ -60,7 +60,7 @@ def test_preview_and_validation_failures_are_not_executable():
 
 def test_expired_action_cannot_be_approved():
     gateway = _gateway(ttl_seconds=0)
-    action = ActionRequest(ActionType.RUN_SIMULATION, "model", reason="simulate")
+    action = ActionRequest(ActionType.SET_PARAMETER, r"\Data\Blocks\T1\Input\RR", new_value=.7, reason="simulate")
     assert gateway.submit(action).valid
     with pytest.raises(ApprovalError):
         gateway.approve(action.audit_id)

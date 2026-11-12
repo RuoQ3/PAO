@@ -1,5 +1,7 @@
 """Stage 2 protocol tests using fake LLM responses and no external services."""
 from __future__ import annotations
+from agent_fakes import fake_kwargs, CFG, FakeTechnicalAdvisor
+from src.agents.errors import AgentUnavailableError
 
 from types import SimpleNamespace
 
@@ -46,53 +48,44 @@ def test_json_fenced_provider_response_is_parsed_but_schema_remains_strict():
 
 
 def test_provider_scalar_fields_require_repair_instead_of_silent_normalization():
-    payload = _payload(
-        intent="general_question",
-        task_type="clarification",
-        project_scope="none",
-        context_required=False,
-        subagents=[],
-        action_type="none",
-        confidence=0.9,
-        missing_information="",
-    )
-    result = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: __import__("json").dumps(payload)).classify("hello")
-    assert result.classification_source == "rule_fallback"
-    assert result.retry_count == 1
-    assert result.fallback_reason == "schema_validation_failed"
+    calls=[]
+    def provider(*a, **k):
+        calls.append(k)
+        return __import__('json').dumps(_payload(context_required=False))
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=_cfg(), llm_call=provider).classify('hello')
+    assert error.value.code == 'llm_repair_failed' and len(calls) == 2
 
 
 @pytest.mark.parametrize("raw,reason", [("not json", "invalid_json"), ("", "empty_model_result")])
 def test_invalid_llm_output_is_explicit_rule_fallback(raw, reason):
-    result = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: raw).classify("Why did the tower fail?")
-    assert result.classification_source == "rule_fallback"
-    assert result.fallback_reason == reason
-    assert result.intent.project_scope != "none"
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: raw).classify('Why did the tower fail?')
+    assert error.value.retry_count == 1 and error.value.code == 'llm_repair_failed'
 
 
 def test_missing_key_is_the_only_key_gate_for_rule_fallback(monkeypatch):
-    monkeypatch.setattr("src.agents.lead.intent.llm_client.is_configured", lambda cfg: False)
-    result = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: (_ for _ in ()).throw(AssertionError())).classify("hello")
-    assert result.classification_source == "rule_fallback"
-    assert result.fallback_reason == "llm_key_missing"
+    monkeypatch.setattr('src.agents.lead.intent.llm_client.is_configured', lambda cfg: False)
+    calls=[]
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: calls.append(k)).classify('hello')
+    assert error.value.code == 'llm_not_configured' and calls == []
 
 
 def test_api_failure_is_explicit_fallback_and_is_recorded():
-    def fail(*args, **kwargs):
-        raise RuntimeError("provider unavailable")
-
-    result = IntentClassifier(llm_config=_cfg(), llm_call=fail).classify("为什么这个塔一直跑不出来？")
-    assert result.classification_source == "rule_fallback"
-    assert result.fallback_reason == "llm_api_failure"
-    assert result.intent.project_scope == "current_project"
+    def fail(*a, **k): raise RuntimeError('provider unavailable')
+    state=SessionState()
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=_cfg(), llm_call=fail).classify('为什么这个塔失败？', session=state)
+    assert error.value.code == 'llm_request_failed' and state.agent_unavailable
+    assert state.unavailable_error['audit_id'] == error.value.audit_id
 
 
 def test_low_confidence_falls_back_and_preserves_implicit_project_context():
-    result = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: __import__("json").dumps(_payload(confidence=0.1))).classify("Why did it fail?")
-    assert result.classification_source == "rule_fallback"
-    assert result.fallback_reason == "low_confidence"
-    assert result.intent.project_scope == "current_project"
-    assert result.intent.context_required == ["process_context"]
+    state=SessionState()
+    with pytest.raises(AgentUnavailableError) as error:
+        IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: __import__('json').dumps(_payload(confidence=.1))).classify('Why did it fail?', session=state)
+    assert error.value.code == 'llm_low_confidence' and state.intent is None
 
 
 def test_schema_rejects_unknown_fields_and_inconsistent_confirmation():
@@ -103,13 +96,12 @@ def test_schema_rejects_unknown_fields_and_inconsistent_confirmation():
 
 
 def test_session_round_trip_preserves_intent_and_fallback_metadata():
-    classifier = IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: "bad")
-    classification = classifier.classify("继续刚才的实验")
-    state = SessionState(intent=classification.intent, classification_source=classification.classification_source,
-                         fallback_reason=classification.fallback_reason)
-    restored = SessionState.from_json(state.to_json())
-    assert restored.intent.intent == "project_query"
-    assert restored.classification_source == "rule_fallback"
+    state=SessionState()
+    with pytest.raises(AgentUnavailableError):
+        IntentClassifier(llm_config=_cfg(), llm_call=lambda *a, **k: 'bad').classify('继续实验', session=state)
+    restored=SessionState.from_json(state.to_json())
+    assert restored.internal_error and not restored.agent_unavailable and restored.pending_approval is None
+    assert restored.internal_error == state.internal_error
 
 
 def test_lead_always_records_structured_classification_and_routes_implicit_project_question():
@@ -121,8 +113,8 @@ def test_lead_always_records_structured_classification_and_routes_implicit_proje
             return SimpleNamespace(variables={}, objectives=[], constraints=[], equipment=[], streams=[], diagnostics=[])
 
     state = SessionState()
-    answer = LeadAgent(context_builder=Builder()).answer("刚才那个参数改大之后有什么影响？", state)
-    assert state.classification_source == "rule_fallback"
+    answer = LeadAgent(context_builder=Builder(), **fake_kwargs()).answer("刚才那个参数改大之后有什么影响？", state)
+    assert state.classification_source == "llm"
     assert state.intent.project_scope != "none"
     assert builder_calls
     assert answer.task_results

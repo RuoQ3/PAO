@@ -32,7 +32,7 @@ constraints=list[Callable] 把可行概率乘进 HV 期望值里：
 
 回退机制
 --------
-BoTorch 初始化或优化失败时，ask() 返回随机点并写 WARNING 日志，
+BoTorch 初始化或优化失败时抛出错误并停止，
 不向上层抛异常，保证优化循环不中断。
 
 参考文献
@@ -159,7 +159,7 @@ class BoTorchMOOptimizer:
         self._integer_indices = integer_indices
         self._model_type = getattr(config, "model", "qEHVI")
         self._random_seed = getattr(config, "random_seed", None)
-        self._n_initial_min = n_initial_min
+        self._n_initial_min = getattr(config, "n_initial_min", n_initial_min)
         self._device = _select_device()
         self._rng = _random.Random(self._random_seed)
 
@@ -180,7 +180,8 @@ class BoTorchMOOptimizer:
         self._effective_bounds: list[tuple[float, float]] | None = None
 
         if not _check_botorch():
-            _log.warning("BoTorch 未安装，BoTorchMOOptimizer 将始终返回随机点。")
+            raise RuntimeError(f"backend unavailable for {self._model_type}: torch/botorch/gpytorch required")
+        _import_qlog_ehvi()  # Verify the selected acquisition API before any DOE/model execution.
 
     # ------------------------------------------------------------------
     # tell / ask 接口
@@ -239,18 +240,19 @@ class BoTorchMOOptimizer:
         推荐下一个候选点。
 
         成功样本数 < n_initial_min 或 BoTorch 不可用时，返回随机点。
-        失败时回退到随机采样并写 WARNING 日志。
+        后端失败时抛出错误；只保留正常初始采样。
         """
         active_bounds = self._effective_bounds if self._effective_bounds else self._bounds
 
-        if len(self._train_X) < self._n_initial_min or not _check_botorch():
+        if not _check_botorch():
+            raise RuntimeError(f"backend unavailable for {self._model_type}")
+        if len(self._train_X) < self._n_initial_min:
             return self._random_point(active_bounds)
 
         try:
             return self._ask_botorch(active_bounds)
         except Exception as exc:
-            _log.warning("qEHVI ask() 失败，回退到随机采样：%s", exc)
-            return self._random_point(active_bounds)
+            raise RuntimeError(f"{self._model_type} fit/ask failed: {exc}") from exc
 
     def set_effective_bounds(self, bounds: list[tuple[float, float]]) -> None:
         """设置本次 ask() 使用的局部 bounds（Trust Region 调用）。"""
@@ -297,9 +299,7 @@ class BoTorchMOOptimizer:
                 )
                 return result
             except Exception as exc:
-                _log.warning(
-                    "constrained qEHVI 失败，降级为无约束版本：%s", exc
-                )
+                raise RuntimeError(f"constrained {self._model_type} failed: {exc}") from exc
         elif self._constraint_names:
             _log.debug(
                 "约束 GP：有效数据点 %d < n_initial_min %d，本轮使用无约束 qEHVI。",

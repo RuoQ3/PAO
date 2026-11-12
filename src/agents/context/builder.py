@@ -15,6 +15,7 @@ import json
 from src.agents.evidence.models import EvidenceItem, EvidenceSource, ProcessContext
 from src.database.node_db import NodeDB
 from src.database.simulation_db import SimulationDB
+from .resources import resolve_model_file, session_model_file
 
 
 class ProcessContextBuildError(ValueError):
@@ -59,6 +60,7 @@ class ProcessContextBuilder:
         self.topology = topology or {}
         self.model_id = model_id
         self.catalog_id = catalog_id
+        self._explicit_catalog_id = catalog_id
         self._owns_node = not isinstance(node_db, NodeDB) and self.node_db is not None
         self._owns_sim = not isinstance(simulation_db, SimulationDB) and self.simulation_db is not None
         self.catalog_warning: str | None = None
@@ -108,22 +110,16 @@ class ProcessContextBuilder:
         return EvidenceItem(id=eid, source=source, claim=claim, source_ref=ref, value=value, unit=unit)
 
     def _configured_aspen_file(self, cfg: dict[str, Any] | None = None) -> Path | None:
-        if self.aspen_file is not None:
-            target = self.aspen_file
-        else:
-            simulator = (cfg or {}).get("simulator", {}) or {}
-            raw = simulator.get("filepath") if isinstance(simulator, dict) else None
-            if not raw:
-                return None
-            target = Path(str(raw)).expanduser()
-            if not target.is_absolute():
-                cwd_candidate = Path.cwd() / target
-                yaml_candidate = (self.yaml_path.parent / target) if self.yaml_path else cwd_candidate
-                target = cwd_candidate if cwd_candidate.exists() or not yaml_candidate.exists() else yaml_candidate
-        try:
-            return target.resolve(strict=False)
-        except OSError:
-            return target.absolute()
+        return self.resolve_model_resource(config=cfg).candidate_path
+
+    def resolve_model_resource(self, *, session=None, config=None):
+        override = session_model_file(session)
+        cfg = self._load_config() if config is None else config
+        simulator = cfg.get("simulator", {}) or {}
+        raw = override or self.aspen_file or (simulator.get("filepath") if isinstance(simulator, dict) else None)
+        source = "session.model_file" if override else ("aspen_file" if self.aspen_file else "simulator.filepath")
+        return resolve_model_file(raw, yaml_path=self.yaml_path, source=source,
+                                  source_ref=str(self.yaml_path) if self.yaml_path else None)
 
     @staticmethod
     def _normalize_path(path: str | Path) -> str:
@@ -132,13 +128,13 @@ class ProcessContextBuilder:
         except OSError:
             return str(path).replace("/", "\\").casefold()
 
-    def _catalog_entries(self, cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def _catalog_entries(self, cfg: dict[str, Any] | None = None, resource=None) -> list[dict[str, Any]]:
         if not self.node_db:
             return []
-        catalog = self.catalog_id
+        catalog = self._explicit_catalog_id
         if not catalog:
             scans = self.node_db.list_catalog_scans()
-            expected = self._configured_aspen_file(cfg)
+            expected = resource.candidate_path if resource else self._configured_aspen_file(cfg)
             if expected is not None:
                 normalized = self._normalize_path(expected)
                 scan = next((item for item in scans if self._normalize_path(
@@ -150,6 +146,24 @@ class ProcessContextBuilder:
                 scan = scans[0] if scans else None
             catalog = scan.get("catalog_id") if scan else None
         if not catalog:
+            self.catalog_id = None
+            return []
+        scan = self.node_db.get_catalog_scan(catalog)
+        expected = resource.path if resource else self._configured_aspen_file(cfg)
+        if expected and scan:
+            import hashlib
+            stamp = str(scan.get("aspen_file_hash") or "")
+            if len(stamp) in {32, 64}:
+                actual = hashlib.md5(Path(expected).read_bytes()).hexdigest() if len(stamp) == 32 else hashlib.sha256(Path(expected).read_bytes()).hexdigest()
+                if actual != stamp:
+                    self.catalog_id = None
+                    self.catalog_warning = f"NodeDB catalog {catalog} 与当前模型摘要冲突，未加载过期节点"
+                    return []
+            else:
+                self.catalog_warning = f"NodeDB catalog {catalog} 未提供可验证的模型版本，仅为历史静态快照"
+        if scan and resource and resource.candidate_path and self._normalize_path(scan["aspen_file_path"]) != self._normalize_path(resource.candidate_path):
+            self.catalog_warning = "显式 catalog 指向其他模型，未载入"
+            self.catalog_id = None
             return []
         self.catalog_id = catalog
         return self.node_db.get_catalog_entries(catalog)
@@ -279,10 +293,10 @@ class ProcessContextBuilder:
                 streams.add(s)
         return {"nodes": list(blocks.values()), "edges": [], "streams": [{"name": s} for s in sorted(streams)]}
 
-    def _model_parts(self, cfg: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[EvidenceItem]]:
+    def _model_parts(self, cfg: dict[str, Any] | None = None, resource=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[EvidenceItem]]:
         cfg = cfg or {}
         self._config_node_db(cfg)
-        entries = self._catalog_entries(cfg)
+        entries = self._catalog_entries(cfg, resource)
         self._catalog_entries_cache = entries
         topo = self.topology or self._infer_topology(entries)
         nodes = list(topo.get("nodes") or [])
@@ -305,8 +319,8 @@ class ProcessContextBuilder:
             evidence.append(self._evidence("model.topology", EvidenceSource.ASPEN_MODEL, f"读取到 {len(equipment)} 个设备和 {len(stream_items)} 条物流", self.catalog_id or "topology", {"equipment": len(equipment), "streams": len(stream_items)}))
         else:
             evidence.append(self._evidence("model.missing", EvidenceSource.ASPEN_MODEL, "未找到拓扑快照；模型可能未打开或尚未导出", self.catalog_id))
-        bkp_path = self._configured_aspen_file(cfg)
-        if bkp_path and bkp_path.exists() and bkp_path.suffix.casefold() in {".bkp", ".apw"}:
+        bkp_path = resource.path if resource else self.resolve_model_resource(config=cfg).path
+        if bkp_path and bkp_path.exists() and bkp_path.suffix.casefold() == ".bkp":
             # BKP is the primary portable topology snapshot.  Keep it even
             # when a NodeDB catalog is also present so normalization can
             # retain both observations and report disagreements explicitly.
@@ -331,6 +345,10 @@ class ProcessContextBuilder:
         session_id = self._session_value(session, "session_id")
         case_id = self._session_value(session, "case_id")
         row = self.simulation_db.get_case(str(case_id)) if case_id else None
+        if row is not None and session_id and row.get("session_id") != session_id:
+            return [], [], {"nodes": [], "edges": []}, [self._evidence(
+                "simulation.session_conflict", EvidenceSource.SYSTEM,
+                "请求的历史工况不属于当前会话，未载入", str(case_id))]
         if row is None:
             summaries = self.simulation_db.query_cases(session_id=session_id, limit=1, newest_first=True) if session_id else self.simulation_db.query_cases(limit=1, newest_first=True)
             if summaries:
@@ -510,7 +528,7 @@ class ProcessContextBuilder:
             entry = dict(item) if isinstance(item, dict) else {"name": name}
             entry["name"] = str(name)
             if parsed is not None:
-                if "mole_fraction" in entry or "mole" in entry or "value" in entry:
+                if "mole_fraction" in entry or "mole" in entry:
                     entry["mole_fraction"] = parsed
             result.append(entry)
         return result, diagnostics
@@ -619,11 +637,16 @@ class ProcessContextBuilder:
             # value when supplied by existing Aspen readers.
             raw_provenance = item.get("provenance_source")
             raw_source = item.get("source")
+            item.setdefault("endpoint_fields_present", {
+                "source": any(k in raw for k in ("source_node", "upstream", "source_equipment")) or
+                          ("source" in raw and (raw_source is None or str(raw_source).casefold() in node_map)),
+                "target": any(k in raw for k in ("target_node", "target", "downstream", "target_equipment")),
+            })
             endpoint_values = {item.get("upstream"), item.get("source_equipment"), item.get("source_node")}
             if raw_provenance is None and raw_source and raw_source not in endpoint_values and str(raw_source).casefold() not in node_map:
                 raw_provenance = raw_source
             source_node = item.get("source_node") or item.get("upstream") or item.get("source_equipment")
-            target_node = item.get("target") or item.get("downstream") or item.get("target_equipment")
+            target_node = item.get("target_node") or item.get("target") or item.get("downstream") or item.get("target_equipment")
             if source_node is None and item.get("source") and str(item.get("source")).casefold() in node_map:
                 source_node = item.get("source")
                 item["provenance_source"] = item.get("provenance_source") or "topology"
@@ -725,8 +748,15 @@ class ProcessContextBuilder:
         return normalized_nodes, normalized_streams, canonical_topology, compositions, conflicts, facts, inferences, diagnostics
 
     def build(self, *, session: Any = None, model_id: str | None = None) -> ProcessContext:
+        from .versions import dependencies
+        from src.agents.actions.authorization import digest
         cfg = self._load_config()
-        equipment, streams, topology, sources = self._model_parts(cfg)
+        resource = self.resolve_model_resource(session=session, config=cfg)
+        self.catalog_warning = None
+        equipment, streams, topology, sources = self._model_parts(cfg, resource)
+        sources.append(self._evidence("case.model_file", EvidenceSource.SYSTEM,
+                                      resource.error or "已验证 case 模型文件可读", resource.source_ref,
+                                      resource.to_dict()))
         equipment_parameters = self._equipment_parameter_parts(self._catalog_entries_cache)
         variables, objectives, constraints, yaml_evidence = self._yaml_parts(cfg)
         configured_parameters = cfg.get("equipment_parameters", {})
@@ -765,13 +795,13 @@ class ProcessContextBuilder:
                     {"equipment": [x["name"] for x in equipment]},
                 ))
         sim_equipment, sim_streams, sim_topology, sim_sources = self._simulation_model_parts(session)
+        sources.extend(sim_sources)
         if sim_equipment or sim_streams:
             equipment.extend(sim_equipment)
             streams.extend(sim_streams)
             topology = {"nodes": list(topology.get("nodes", [])) + list(sim_topology.get("nodes", [])),
                         "streams": list(topology.get("streams", [])) + list(sim_topology.get("streams", [])),
                         "edges": list(topology.get("edges", [])) + list(sim_topology.get("edges", []))}
-            sources.extend(sim_sources)
         sources.extend(yaml_evidence)
         # Normalize after YAML-only equipment discovery so every input mode
         # (BKP, YAML, NodeDB, SimulationDB or an in-memory mapping) has the
@@ -792,9 +822,11 @@ class ProcessContextBuilder:
         diagnostics.extend(graph_diagnostics)
         if self.catalog_warning:
             diagnostics.append(self.catalog_warning)
+        if resource.path and resource.path.suffix.casefold() == ".apw":
+            diagnostics.append("APW 不支持静态正文解析；仅提供文件版本及已有 NodeDB/拓扑快照，未运行验证")
         if self.node_db and case_id:
             for row in self.node_db.get_node_values(str(case_id), include_errors=True):
-                current_values[row["path"]] = {"value": row.get("value"), "unit": row.get("unit", ""), "error": row.get("error"), "source": "aspen_model"}
+                current_values[row["path"]] = {"value": row.get("value"), "unit": row.get("unit", ""), "error": row.get("error"), "source": "historical_node_snapshot", "case_id": case_id}
         elif self.node_db and not case_id:
             diagnostics.append("未提供 case_id，NodeDB 当前值未绑定到具体工况")
         history: list[EvidenceItem] = []
@@ -803,7 +835,10 @@ class ProcessContextBuilder:
             if not rows:
                 diagnostics.append("SimulationDB 历史数据为空")
             for i, row in enumerate(rows):
-                history.append(self._evidence(f"simulation.case.{i}", EvidenceSource.SIMULATION_DB, f"历史工况 {row.get('case_id')} 状态 {row.get('status')}", row.get("case_id"), row))
+                stored = self.simulation_db.get_case(row["case_id"]) or row
+                history.append(self._evidence(f"simulation.case.{row['case_id']}", EvidenceSource.SIMULATION_DB, f"历史工况 {row.get('case_id')} 状态 {row.get('status')}，不是当前实时值", row.get("case_id"), stored))
+            if len(rows) == 100:
+                diagnostics.append("历史上下文仅选取精确会话范围内最近 100 条工况；其余记录未读取，可按工况 ID 查询")
         if not equipment and not streams:
             diagnostics.append("未找到设备/物流节点；请确认 NodeDB catalog 或只读拓扑快照可用")
         for kind, items in (("设备", equipment), ("物流", streams)):
@@ -880,6 +915,11 @@ class ProcessContextBuilder:
             generated_at=datetime.now(timezone.utc).isoformat(), status=status,
             diagnostics=diagnostics, conflicts=conflicts, facts=facts,
             inferences=inferences,
+            configuration=dict(cfg),
+            dependency_versions={**dependencies({"yaml": self.yaml_path, "model": resource.path,
+                "node_db": getattr(self.node_db, "_path", None),
+                "simulation_db": getattr(self.simulation_db, "_path", None)}),
+                "configuration_digest": digest(cfg), "topology_digest": digest(self.topology)},
         )
 
     @staticmethod
@@ -947,7 +987,9 @@ class ProcessContextBuilder:
             history_evidence=context.history_evidence, sources=context.sources,
             session_id=context.session_id, generated_at=context.generated_at,
             status=context.status, diagnostics=context.diagnostics,
-            conflicts=context.conflicts, facts=context.facts, inferences=context.inferences)
+            conflicts=context.conflicts, facts=context.facts, inferences=context.inferences,
+            attachments=context.attachments, dependency_versions=context.dependency_versions,
+            configuration=context.configuration)
 
     # Explicit builder-level wrappers make the read-only API convenient for
     # callers that do not want to depend on ProcessContext implementation
