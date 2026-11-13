@@ -101,8 +101,7 @@ def _scan_aspen_file(
         - entries: list[dict]（get_catalog_entries 返回的字典列表）
         - warnings: 扫描过程中产生的警告文本列表
     """
-    warnings: list[str] = []
-    driver = None
+    raise PermissionError("COM discovery disabled: no ActionGateway approved read-plan adapter; use a static NodeDB snapshot")
 
     try:
         # 懒加载 COM 相关模块，确保导入时不触碰 aspen_driver

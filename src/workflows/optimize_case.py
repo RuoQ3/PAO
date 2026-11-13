@@ -183,6 +183,10 @@ class OptimizeCaseConfig:
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     # Phase 0 可行性搜索（以初始收敛解为中心的局部 LHS）；None=不启用
     feasibility_search: Any = None
+    objective_definitions: Any = None
+    constraint_definitions: list = field(default_factory=list)
+    problem_identity: dict = field(default_factory=dict)
+    total_evaluation_budget: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -480,18 +484,8 @@ def optimize_case(
     n_bo = n_total - config.n_initial
 
     if not driver_dead and n_bo > 0:
-        optimizer = make_surrogate_optimizer(
-            bounds,
-            SurrogateConfig(
-                model=config.surrogate_model,
-                acquisition=config.acquisition,
-                xi=config.xi,
-                kappa=config.kappa,
-                n_initial_min=config.n_initial_min,
-                random_seed=config.random_seed,
-            ),
-            integer_indices,
-        )
+        from src.optimization.bo_adapter import make_legacy_bo
+        optimizer = make_legacy_bo(config)
 
         # 用初始 DOE 的观测初始化优化器（成功样本用真实 y，失败样本用惩罚值）
         for c, x in zip(cases, case_xs):

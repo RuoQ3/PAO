@@ -32,10 +32,16 @@ class IntentResponseAdapter:
             "Do not put equipment, stream or component names in context_required. "
             "For current project questions and parameter_impact, replace context_required with [\"process_context\"]. "
             "For parameter_impact, equipment, target_stream, target_component, metric, candidate_parameters "
-            "must all exist inside analysis; ordinary intents use analysis: {}. "
+            "must all exist inside analysis. For optimization_request preserve explicitly requested algorithm/method, "
+            "equipment, component, metric, target and execution inside analysis; other ordinary intents use analysis: {}. "
+            "For optimization_request, omit unspecified execution, optimizer_parameters and random_seed; "
+            "execution and optimizer_parameters must be JSON objects when provided. "
             "For parameter_impact set action_type to simulate_once and requires_confirmation to true. "
             "Never return an empty context_required for current_project, current_case, or current_session. "
             "The value none must appear alone."
+            " Use only registered subagent names listed in the system role catalogue. "
+            "Project read/analysis requests require at least one registered subagent; "
+            "repair missing or unknown routes yourself, without a host-selected fallback."
         )
         # Explain the actual invalid identifiers without changing the payload
         # or hard-coding a particular equipment/stream/component name.
@@ -86,8 +92,20 @@ class IntentResponseAdapter:
         return value
 
     @staticmethod
+    def validate_routes(payload, *, allowed_roles):
+        """Reject dispatch-invalid classification while one LLM repair remains."""
+        routes = payload["subagents"]
+        names = [route.get("name") for route in routes]
+        if any(not isinstance(name, str) or name not in allowed_roles for name in names):
+            raise ValueError("subagents contains unregistered role; allowed names: " + ", ".join(sorted(allowed_roles)))
+        direct_general = (payload["intent"] in {"chat", "general_question"}
+                          and payload["project_scope"] in {"none", "external"})
+        if payload["action_type"] in {"none", "read"} and not direct_general and not routes:
+            raise ValueError("subagents must include at least one registered role for project read/analysis requests")
+
+    @staticmethod
     def validate_provider_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        """Validate the wire contract without coercing invalid provider fields."""
+        """Validate the wire contract, normalizing documented optional null slots."""
         required = {"intent", "task_type", "project_scope", "context_required", "subagents",
                     "action_type", "requires_confirmation", "confidence", "missing_information", "reason", "analysis"}
         missing = required - payload.keys()
@@ -121,6 +139,9 @@ class IntentResponseAdapter:
                     raise ValueError(f"missing_information must include unresolved slot: {key}")
             if not isinstance(analysis["candidate_parameters"], list) or not all(isinstance(x, str) for x in analysis["candidate_parameters"]):
                 raise TypeError("analysis.candidate_parameters must be a list of strings")
+        elif payload["intent"] == "optimization_request":
+            from src.agents.orchestration.models import validate_optimization_analysis
+            payload = {**payload, "analysis": validate_optimization_analysis(analysis)}
         elif analysis:
             raise ValueError("analysis must be {} for ordinary intents")
         return payload

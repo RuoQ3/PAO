@@ -211,6 +211,13 @@ class TreeExporter:
     def __init__(self, driver: AspenDriver) -> None:
         self._driver = driver
 
+    def _enumerate_names(self, path: str, *, strict: bool) -> list[str]:
+        if not self._driver.node_exists(path):
+            if strict:
+                raise AspenNodeError(f"枚举根节点不存在：{path}")
+            return []
+        return AspenNode(self._driver, path).child_names()
+
     # ------------------------------------------------------------------ #
     # Stream 表
     # ------------------------------------------------------------------ #

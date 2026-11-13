@@ -238,6 +238,10 @@ class ParetoOptimizeCaseConfig:
     agent_checkpoint_path: str | None = None
     agent_resume: bool = False
     agent_llm_config: Any = None
+    objective_definitions: Any = None
+    constraint_definitions: list = field(default_factory=list)
+    problem_identity: dict = field(default_factory=dict)
+    total_evaluation_budget: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +751,8 @@ def optimize_pareto_case(
     n_bo = n_total - config.n_initial
 
     if not driver_dead and n_bo > 0:
-        optimizer = _MultiObjectiveBayesianOptimizer(bounds, config, paths)
+        from src.optimization.bo_adapter import make_legacy_bo
+        optimizer = make_legacy_bo(config)
 
         for c, x in zip(cases, case_xs):
             y_vec = _extract_all_objectives(c, config, allow_infeasible=True)
@@ -1691,7 +1696,7 @@ def _lhs_sample(
 # 多目标贝叶斯优化器（ParEGO 随机标量化）
 # ---------------------------------------------------------------------------
 
-class _MultiObjectiveBayesianOptimizer:
+class MultiObjectiveBayesianOptimizer:
     """
     多目标贝叶斯优化器，基于 ParEGO 随机标量化策略。
 
@@ -1792,13 +1797,24 @@ class _MultiObjectiveBayesianOptimizer:
         if self._botorch_opt is not None:
             self._botorch_opt.set_effective_bounds(bounds)
 
+    def rng_state(self):
+        if self._botorch_opt is not None:
+            raise ValueError("BoTorch exact RNG resume unsupported; torch/backend state is not serialized")
+        return {"outer": self._rng.getstate(), "backend": None}
+
+    def restore_rng(self, state):
+        if self._botorch_opt is not None:
+            raise ValueError("BoTorch exact resume unsupported")
+        if state:
+            def tuples(x):
+                return tuple(tuples(v) for v in x) if isinstance(x, list) else x
+            self._rng.setstate(tuples(state["outer"]))
+
     def ask(self) -> list[float]:
         """推荐下一个候选点。成功观测不足 n_initial_min 时返回随机点。"""
         active_bounds = self._effective_bounds if self._effective_bounds else self._bounds
         # 每次 ask 后清除临时局部 bounds（下次迭代由 Phase 2 循环重新设置）
         self._effective_bounds = None
-        if self._botorch_opt is not None:
-            self._botorch_opt._effective_bounds = None
 
         if self._botorch_opt is None and (self._surrogate_model == "random" or len(self._observations) < self._n_initial_min):
             import math
@@ -1847,6 +1863,10 @@ class _MultiObjectiveBayesianOptimizer:
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
+
+# Compatibility import only. New callers use the public class or registry.
+_MultiObjectiveBayesianOptimizer = MultiObjectiveBayesianOptimizer
+
 
 def _extract_all_objectives(
     case: ProcessCase,

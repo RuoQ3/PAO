@@ -145,7 +145,7 @@ class TerminalRenderer:
     def _block(self, block, *, full=False):
         fmt = clean if full else self._shorten
         lines = []
-        labels = {"observed": "实测", "mechanism": "机理解释", "hypothesis": "推测", "insufficient": "数据不足"}
+        labels = {"observed": "证据记录", "mechanism": "机理解释", "hypothesis": "推测", "insufficient": "数据不足"}
         title = " · ".join(x for x in (block.title, labels.get(block.epistemic, "")) if x)
         if title:
             lines.extend(wrap(fmt(title), self._width))

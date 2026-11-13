@@ -437,7 +437,7 @@ class BoTorchMOOptimizer:
             ref_point=ref_point_t, Y=Y_obj[(C_mat >= 0).all(dim=-1)],
         )
         sampler = self._make_sampler(device, dtype)
-        qLogEHVI, _ = _import_qlog_ehvi()
+        qLogEHVI, qLogNEHVI = _import_qlog_ehvi()
 
         # objective 告诉 qLogEHVI 只把前 n_obj 维当目标（其余维是约束，不进 HV）
         objective = IdentityMCMultiOutputObjective(
@@ -445,14 +445,12 @@ class BoTorchMOOptimizer:
             num_outcomes=self._n_obj + n_constraints,
         )
 
-        acqf = qLogEHVI(
-            model=joint_model,
-            ref_point=ref_point,
-            partitioning=partitioning,
-            sampler=sampler,
-            objective=objective,
-            constraints=constraint_callables,
-        )
+        if self._model_type == "NEHVI":
+            acqf = qLogNEHVI(model=joint_model, ref_point=ref_point, X_baseline=X_joint,
+                sampler=sampler, objective=objective, constraints=constraint_callables)
+        else:
+            acqf = qLogEHVI(model=joint_model, ref_point=ref_point, partitioning=partitioning,
+                sampler=sampler, objective=objective, constraints=constraint_callables)
 
         _log.info(
             "本轮使用 constrained qLogEHVI：%d 个约束（%s），有效样本 %d/%d 个。",

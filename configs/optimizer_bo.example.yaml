@@ -1,0 +1,16 @@
+simulator:
+  filepath: user-model.bkp
+  timeout: 120
+design_variables:
+  - {name: temperature, type: continuous, aspen_path: '\Data\Blocks\B1\Input\TEMP', lower_bound: 20, upper_bound: 100, unit: C}
+objectives:
+  - {name: duty, type: aspen_path, aspen_path: '\Data\Blocks\B1\Output\DUTY', minimize: true, unit: kW}
+optimizer:
+  type: bayesian
+  surrogate_model: GP
+  acquisition_function: EI
+  n_initial_points: 4
+  n_initial_min: 3
+  n_iterations: 12
+  random_seed: 42
+execution: {max_evaluations: 20, max_failures: 5, max_seconds: 1800}

@@ -12,6 +12,17 @@ PAO 是一个面向 Aspen Plus 的化工流程优化工具。它把 Aspen Plus �
 
 ## 当前能力
 
+第三批已接通专业角色受控工具调用及无需手写 YAML 的项目草稿。完整能力、状态和模拟示例见 [专业工具与项目建立](docs/specialist_tools_projects.md)。
+
+```powershell
+python -m src.main --new-project
+python -m src.main "D:\Models\plant.apw" --new-project --node-db "D:\Models\nodes.db"
+python -m src.main --project-draft "output\project-draft.json"
+python -m src.main "output\project.yaml" --conversation
+```
+
+对话中使用 `/project model 文件路径` 选择模型，直接描述目标和纠正要求；`/project confirm` 确认业务配置，`/project save 新文件.yaml` 保存有效配置，`/project use` 进入该项目专业问答。`/capabilities` 查询当前工具接线；`--file 路径` 可重复选择只读附件。以上操作不授权 Aspen 执行，后续具体计划仍经 Gateway 审批。
+
 ### 确定性优化和仿真
 
 - Aspen Plus COM 驱动、输入回读校验、超时和失败恢复。
@@ -91,7 +102,7 @@ python -m pip install torch botorch gpytorch
 
 ### LLM 配置
 
-复制 `.env.example` 为 `.env`，只配置所选 provider 的 key：
+可在项目根目录 `.env` 配置所选 provider 的 key；启动时自动加载，无需额外开关。导入模块不会读取文件，加载配置时才读取；保持既有 `.env` 优先行为。测试或只使用系统环境变量时，可设置 `$env:PAO_LOAD_DOTENV='0'` 禁用文件读取。只配置所选 provider 的 key：
 
 ```powershell
 Copy-Item .env.example .env
@@ -107,7 +118,7 @@ PAO_LLM_TEMPERATURE=0.2
 PAO_LLM_MAX_TOKENS=2048
 ```
 
-LLM key 不写入 checkpoint，也不会出现在 Agent 上下文或日志中。缺少必要 key 时停止 Agent 任务。IMA 默认使用本地 mock；只有明确配置 HTTP 地址和鉴权后才访问外部服务。
+LLM key 不写入 checkpoint。上下文和日志进行凭据脱敏，缺少必要 key 时停止 Agent 任务。生产专业工具尚未接通 IMA；不会把 mock 知识结果当成专业证据。
 
 ## CLI
 
@@ -165,7 +176,7 @@ derived 变量和 recycle warmstart 尚无完整物理写入包络，也拒绝�
 
 ### 统一只读对话
 
-`--conversation` 是唯一的 Agent 对话入口。问答和计划生成只读；明确审批后可经 Gateway 运行受支持的仿真计划，结果写入数据库与审计：
+`--conversation`、`--new-project` 和 `--project-draft` 共用 ConversationSession 对话入口。问答和计划生成只读；明确审批后可经 Gateway 执行受支持的具体计划，结果写入数据库与审计：
 
 ```powershell
 python -m src.main cases/demo_case/pareto_config.yaml --conversation
@@ -348,3 +359,8 @@ git diff --check
 沙盒等待超时、底层停止与资源清理分别记录；状态未知时停止派发、保留额度与资源，不自动重试。
 执行证据、分析版本、终端/导出/历史回读及上下文缓存规则见
 [执行生命周期、证据与上下文](docs/execution_evidence_context.md)。本批验证均为离线模拟，未运行真实 Aspen。
+# 第四批优化器接入
+
+通用问题/协议、BO 迁移桥、PSO/NSGA-II 适配代码与审批、预算、证据已接线。
+支持矩阵、迁移政策、配置示例及验收限制见 [优化器接入文档](docs/optimizer_adapters.md)。
+本机缺少 pymoo 且禁止网络，PSO/NSGA-II 的真实库测试尚未验收；不会自动安装或替换算法。

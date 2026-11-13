@@ -19,8 +19,33 @@ class ConversationSession:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("请输入非空问题。")
         ensure_session_available(self.state)
+        from src.agents.subagents.onboarding_agent.project import ProjectOnboarding
+        project = ProjectOnboarding(self)
+        command, _, argument = text.strip().partition(" ")
+        if command == "/project":
+            return self._record_answer(project.command(argument))
+        if command == "/capabilities":
+            return self._record_answer(self.lead.capabilities(self.state))
+        if project.draft is not None and project.draft.status in {"draft", "confirmed"}:
+            self.state.history.append({"role": "user", "content": text})
+            return self._record_answer(project.turn(text))
         self.state.history.append({"role": "user", "content": text})
         task = self.state.pending_task
+        confirmation = text.strip().casefold() in {"确认", "确认执行", "confirm", "yes", "批准"}
+        if (confirmation and self.state.pending_approval is None and task is not None
+                and task.phase == "ready"
+                and any(e.get("event") == "approval_invalidated_on_restore" for e in task.audit)):
+            self.lead._revoke_restored_approvals(self.state)
+            # Restoration never grants execution authority. Revalidate the task
+            # and create a fresh Gateway preview; a later confirmation is needed.
+            answer = self.lead._continue_task(task, self.state)
+            answer.text = "恢复的审批已失效；以下为重新校验的计划，请重新审核后另行确认。\n" + answer.text
+            return self._record_answer(answer)
+        if confirmation and self.state.pending_approval is None and (task is None or not task.active):
+            executions = [e for e in self.state.audit_events if e.get("event") == "action_executed"]
+            suffix = (f"上次动作 {executions[-1]['result'].get('audit_id', '')} 已有执行记录，不能重复确认；如需新运行，请先生成并审核新计划。"
+                      if executions else "请先提出任务并审核具体计划，再确认执行。")
+            return self._record_answer(Answer(text="当前没有待审批的执行计划。" + suffix))
         if (text.strip().casefold() in {"确认", "确认执行", "confirm", "yes", "批准"}
                 and self.state.pending_approval is not None
                 and (task is None or task.phase == "awaiting_approval")):
@@ -67,9 +92,10 @@ class ConversationSession:
         """Persist explicit conversation targets; never scan arbitrary history."""
         focus = self.state.runtime_state.setdefault("conversation_focus", {})
         ids = re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{1,4}\d{3,4})(?![A-Za-z0-9])", str(text))
-        streams = re.findall(r"(?<![A-Za-z0-9])\d{4}(?![A-Za-z0-9])", str(text))
+        streams = re.findall(r"(?<![A-Za-z0-9.])\d{4}(?![A-Za-z0-9.])", str(text))
         comps = re.findall(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9_-]{1,15})(?![A-Za-z0-9])", str(text))
-        comps = [x for x in comps if x != "ASPEN" and not re.match(r"^[A-Z]{1,4}\d{3,4}$", x)]
+        comps = [x for x in comps if x not in {"ASPEN", "GA", "PSO", "BO", "NSGA-II", "YAML"}
+                 and not re.match(r"^[A-Z]{1,4}\d{3,4}$", x)]
         if ids:
             focus["equipment"] = ids[-1]
         if streams:
@@ -112,4 +138,14 @@ class ConversationSession:
             raise internal_error("conversation_checkpoint_invalid", stage="session_restore")
         session = cls(SessionState.from_dict(payload["session"]), lead)
         lead._revoke_restored_approvals(session.state)
+        if session.state.runtime_state.get("project_draft"):
+            from src.agents.subagents.onboarding_agent.project import ProjectOnboarding
+            project = ProjectOnboarding(session)
+            draft = project.draft
+            draft.confirmed_digest, draft.status = None, "draft"
+            for entry in draft.fields.values():
+                entry["confirmed"] = False
+            project._clear()
+            project._store(draft)
+            project._refresh(draft)
         return session

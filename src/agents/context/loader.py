@@ -115,7 +115,7 @@ class ContextLoader:
             # Explicit selection grants content access, except secrets. Never
             # recursively collect siblings, home directories or project trees.
             sensitive = path.name.lower().startswith(".env") or path.name.lower() in {"credentials", "id_rsa", "id_ed25519"} or path.suffix.lower() in {".pem", ".key", ".p12"}
-            sensitive |= any(part.lower() in {".aws", ".ssh"} for part in path.parts)
+            sensitive |= any(part.lower() in {".aws", ".ssh", ".codex"} for part in path.resolve().parts)
             if sensitive:
                 record["reason"] = "secret file excluded"
                 selected.append(record)

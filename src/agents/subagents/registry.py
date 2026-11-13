@@ -28,9 +28,27 @@ class SubagentDefinition:
 
 
 def _reasoning_agent(task: TaskSpec, *, context: Any = None, llm_config=None, llm_call=None, definition=None, **kwargs) -> TaskResult:
+    if definition is not None:
+        if task.agent != definition.name:
+            raise PermissionError("role handler identity mismatch")
+        from copy import deepcopy
+        task = deepcopy(task)
+        task.tool_allowlist = [name for name in task.tool_allowlist if name in definition.tool_allowlist]
+        task.max_steps = min(task.max_steps, definition.max_steps)
+        task.budget = min(task.budget, definition.budget)
     from src.agents.reasoning import reason, snapshot
     context = snapshot(context)
     context["conversation"] = task.metadata.get("conversation", [])
+    if "optimization_request" in task.metadata:
+        context["optimization_request"] = deepcopy(task.metadata["optimization_request"])
+        # Present the active configuration alongside its source, with explicit
+        # origins, so source comments cannot masquerade as active thresholds.
+        from src.utils.file_io import apply_config_overrides
+        context["source_configuration"] = deepcopy(context.get("configuration") or {})
+        context["configuration"] = apply_config_overrides(context.get("configuration") or {},
+            context["optimization_request"].get("overrides"))
+        context["objectives"] = deepcopy(context["configuration"].get("objectives", []))
+        context["constraints"] = deepcopy(context["configuration"].get("constraints", []))
     from .tool_runtime import ToolSession
     tools = kwargs.get("tools") or default_tools_for_roles()
     tool_session = ToolSession(tools, task, context, max_tool_calls=kwargs.get("max_tool_calls", 32),
@@ -76,23 +94,27 @@ class SubagentRegistry:
 
 def default_registry(*, llm_config=None, llm_call=None, tools=None) -> SubagentRegistry:
     registry = SubagentRegistry()
-    definitions = {
-        "project_researcher": SubagentDefinition("project_researcher", "Research source, configuration, tests and historical results.", ("read_files", "read_yaml", "read_node_db", "read_simulation_db", "read_checkpoint"), 8, 6, True, False, ("yaml", "files", "node_db", "simulation_db", "history"), ("yaml", "files", "NodeDB", "SimulationDB", "checkpoint")),
+    definitions = role_definitions()
+    from functools import partial
+    from .tool_runtime import default_tools
+    registry.tools = tools if tools is not None else default_tools(definitions)
+    for name, definition in definitions.items():
+        registry.register(name, partial(_reasoning_agent, llm_config=llm_config, llm_call=llm_call, definition=definition, tools=registry.tools), definition=definition)
+    return registry
+
+
+def role_definitions():
+    return {
+        "project_researcher": SubagentDefinition("project_researcher", "Research source, configuration, tests and historical results.", ("read_files", "read_yaml", "read_node_db", "read_simulation_db", "validate_config"), 8, 6, True, False, ("yaml", "files", "node_db", "simulation_db", "history"), ("yaml", "files", "NodeDB", "SimulationDB")),
         "process_advisor": SubagentDefinition("process_advisor", "Review process, equipment and streams from read-only snapshots.", ("read_process_context", "read_node_db", "read_simulation_db"), 8, 6, True, False, ("process_context", "node_db", "simulation_db"), ("ProcessContext", "NodeDB", "SimulationDB")),
-        "optimization_advisor": SubagentDefinition("optimization_advisor", "Review objectives, Pareto evidence, convergence and budget.", ("read_yaml", "read_simulation_db", "read_checkpoint", "plan_optimization"), 10, 8, True, False, ("yaml", "simulation_db", "history"), ("yaml", "SimulationDB", "checkpoint")),
+        "optimization_advisor": SubagentDefinition("optimization_advisor", "Review objectives, Pareto evidence, convergence and budget.", ("read_yaml", "read_simulation_db", "validate_config", "plan_optimization", "list_optimizers"), 10, 8, True, False, ("yaml", "simulation_db", "history"), ("yaml", "SimulationDB")),
         "boundary_advisor": SubagentDefinition("boundary_advisor", "Recommend soft search regions while preserving hard bounds.", ("read_yaml", "read_process_context"), 6, 4, False, False, ("yaml", "process_context"), ("yaml", "ProcessContext")),
-        "kinetics_advisor": SubagentDefinition("kinetics_advisor", "Review kinetics fits and parameter evidence without writing or simulating.", ("read_files", "read_simulation_db"), 8, 6, True, False, ("files", "simulation_db"), ("files", "SimulationDB")),
-        "risk_reviewer": SubagentDefinition("risk_reviewer", "Review constraints, failure modes and action impact.", ("read_process_context", "read_checkpoint"), 6, 4, True, False, ("process_context", "history"), ("ProcessContext", "checkpoint")),
+        "kinetics_advisor": SubagentDefinition("kinetics_advisor", "Review kinetics fits and parameter evidence without writing or simulating.", ("read_files", "read_simulation_db", "fit_arrhenius_linear"), 8, 6, True, False, ("files", "simulation_db"), ("files", "SimulationDB")),
+        "risk_reviewer": SubagentDefinition("risk_reviewer", "Review constraints, failure modes and action impact.", ("read_process_context", "read_simulation_db"), 6, 4, True, False, ("process_context", "history"), ("ProcessContext", "SimulationDB")),
         "code_engineer": SubagentDefinition("code_engineer", "Analyze code and produce modification proposals without writing.", ("read_files",), 8, 5, False, False, ("files",), ("files", "user")),
         "report_writer": SubagentDefinition("report_writer", "Draft reports from validated Evidence only.", ("read_evidence", "read_files"), 8, 5, False, False, ("files", "history"), ("Evidence", "files")),
         "general_agent": SubagentDefinition("general_agent", "Handle general questions without execution tools.", (), 4, 2, True, False, ("none",), ("user",)),
     }
-    from functools import partial
-    from .tool_runtime import default_tools
-    registry.tools = tools or default_tools(definitions)
-    for name, definition in definitions.items():
-        registry.register(name, partial(_reasoning_agent, llm_config=llm_config, llm_call=llm_call, definition=definition, tools=registry.tools), definition=definition)
-    return registry
 
 
 def default_tools_for_roles():

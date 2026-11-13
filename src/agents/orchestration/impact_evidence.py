@@ -300,5 +300,8 @@ def execution_evidence(result, plan):
         "evaluations": deepcopy(result.get("evaluations", [])),
         "resources": deepcopy(result.get("resources", {})),
         "statistics": deepcopy(result.get("sensitivity", {}))}
+    if spec.get("kind") == "optimization":
+        summary = result.get("summary") or {}
+        packet["optimization"] = deepcopy(summary.get("unified", summary))
     packet["evidence_digest"] = digest(packet)
     return packet

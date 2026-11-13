@@ -14,7 +14,9 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
     preview: ActionPreview | None = None
 
-_SAFE_PATH = __import__('re').compile(r"^\\(?:[A-Za-z0-9_ .-]+\\)*[A-Za-z0-9_ .-]+$")
+# Aspen node names include ratio identifiers such as B:F. This is a COM
+# tree path, never a shell command or Windows filesystem destination.
+_SAFE_PATH = __import__('re').compile(r"^\\(?:[A-Za-z0-9_ .:-]+\\)*[A-Za-z0-9_ .:-]+$")
 
 def _finite(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))

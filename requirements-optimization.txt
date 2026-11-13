@@ -1,0 +1,7 @@
+# Optional backends, installed explicitly by the operator, never by PAO Agents.
+# Target pymoo API: 0.6.1.5. PSO/NSGA-II/GA analytic tests exercise the real
+# distribution. See docs/conversation_optimization.md for conversation selection.
+pymoo==0.6.1.5
+torch>=2.0.0
+botorch>=0.10.0
+gpytorch>=1.11.0

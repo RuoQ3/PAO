@@ -1,0 +1,16 @@
+simulator:
+  filepath: user-model.bkp
+  timeout: 120
+design_variables:
+  - {name: temperature, type: continuous, aspen_path: '\Data\Blocks\B1\Input\TEMP', lower_bound: 20, upper_bound: 100, unit: C}
+objectives:
+  - {name: duty, type: aspen_path, aspen_path: '\Data\Blocks\B1\Output\DUTY', minimize: true, unit: kW}
+  - {name: recovery, type: aspen_path, aspen_path: '\Data\Streams\PRODUCT\Output\MOLEFRAC\MIXED\A', minimize: false, unit: '1'}
+constraints:
+  - {name: recovery_min, aspen_path: '\Data\Streams\PRODUCT\Output\MOLEFRAC\MIXED\A', operator: '>=', threshold: 0.9, scale: 0.1, unit: '1'}
+optimizer:
+  type: nsga2
+  backend: pymoo
+  random_seed: 42
+  parameters: {pop_size: 8, generations: 4, crossover_probability: 0.9, crossover_eta: 15.0, mutation_eta: 20.0, mutation_probability: 0.1}
+execution: {max_evaluations: 32, max_failures: 5, max_seconds: 1800}

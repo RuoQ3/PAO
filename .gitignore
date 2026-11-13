@@ -4,7 +4,11 @@ venv/
 env/
 .venv312/
 # 测试运行时产物（跟踪测试源码 .py，只忽略运行时产物）
-tests/
+tests/*
+!tests/test_batch3_tools_projects.py
+!tests/test_optimizer_protocol.py
+!tests/test_conversation_optimization.py
+.test_batch3*/
 
 # Python 编译缓存
 __pycache__/
@@ -64,7 +68,11 @@ ehthumbs.db
 scripts/
 .pytest_cache/
 
-docs/
+docs/*
+!docs/specialist_tools_projects.md
+!docs/optimizer_adapters.md
+!docs/conversation_optimization.md
+!docs/pao_agent_live_test_prompt.md
 reports/
 runs/
 

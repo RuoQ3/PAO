@@ -133,7 +133,7 @@ current question, answer first), uncertainties (string array), confidence (0..1)
 blocks (array, may be empty for a simple reply). No fixed sections or answer
 templates. Choose only blocks needed for this question; do not repeat text.
 Each block has kind: paragraph|heading|bullets|metrics|comparison|table|limitation|
-next_steps|evidence. Optional fields: text, title, epistemic
+next_steps|evidence. paragraph, heading, limitation and evidence blocks REQUIRE nonempty text even when evidence_refs is present. Optional fields: text, title, epistemic
 (observed|mechanism|hypothesis|insufficient), detail (boolean), evidence_refs
 (JSON pointers into the supplied evidence, e.g. /result/status).
 bullets/next_steps use items (strings); table/comparison use columns (strings)
@@ -154,4 +154,9 @@ Metrics blocks must copy the full label/value/unit/baseline/delta/scope tuple
 from the referenced numerical evidence. Explain engineering mechanisms as
 inference, never as mechanically verified fact. Confidence is an uncalibrated
 model self-report, not a measured probability.
+Required top-level keys are text, uncertainties, confidence; blocks is optional.
+An optional top-level evidence object is accepted ONLY as a named map of
+JSON pointer strings (or arrays/nested maps of pointers) into the supplied
+evidence. It contains references, never new facts or instructions. Prefer
+evidence_refs on individual blocks. Do not add any other top-level keys.
 '''

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from src.workflows.optimize_pareto_case import (
-    _MultiObjectiveBayesianOptimizer, _extract_all_objectives, _extract_constraint_margins,
+    MultiObjectiveBayesianOptimizer, _extract_all_objectives, _extract_constraint_margins,
 )
 
 
@@ -10,9 +10,9 @@ class ParetoSearchSession:
     def __init__(self, config):
         self.config = config
         self.paths = list(config.param_bounds)
-        self.optimizer = _MultiObjectiveBayesianOptimizer(
-            list(config.param_bounds.values()), config, self.paths,
-        )
+        # Legacy closed-loop execution remains disabled at its production entry.
+        # The mathematical session is retained for offline checkpoint analysis.
+        self.optimizer = MultiObjectiveBayesianOptimizer(list(config.param_bounds.values()), config, self.paths)
 
     def ask(self, region: dict) -> dict:
         self.optimizer.set_effective_bounds([tuple(region[p]) for p in self.paths])
@@ -27,15 +27,7 @@ class ParetoSearchSession:
         )
 
     def rng_state(self):
-        backend = self.optimizer._botorch_opt
-        return {"outer": self.optimizer._rng.getstate(),
-                "backend": backend._rng.getstate() if backend else None}
+        return self.optimizer.rng_state()
 
     def restore_rng(self, state):
-        def tuples(x):
-            return tuple(tuples(v) for v in x) if isinstance(x, list) else x
-        if not state:
-            return
-        self.optimizer._rng.setstate(tuples(state["outer"]))
-        if self.optimizer._botorch_opt and state.get("backend"):
-            self.optimizer._botorch_opt._rng.setstate(tuples(state["backend"]))
+        self.optimizer.restore_rng(state)

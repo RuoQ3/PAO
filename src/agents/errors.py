@@ -33,9 +33,23 @@ class AgentInternalError(AgentUnavailableError):
     """Protocol/routing defect, distinct from an unavailable component."""
 
 
+def _failure_message(code: str, stage: str) -> str:
+    reasons = {
+        "llm_low_confidence": "现有证据不足以形成可靠回答，请明确问题范围或补充已保存的执行记录",
+        "llm_timeout": "LLM 请求超时",
+        "llm_request_failed": "LLM 服务请求失败",
+        "llm_provider_unavailable": "LLM 服务依赖不可用",
+        "llm_invalid_json": "LLM 返回的 JSON 协议无效",
+        "llm_schema_invalid": "LLM 返回的字段格式无效",
+        "llm_repair_failed": "LLM 协议修复未通过",
+    }
+    reason = reasons.get(code, "Agent 无法完成本次请求")
+    return f"{reason}（{code}，阶段 {stage}）。本次请求已停止；已有结果保留在审计中。请修正后使用新会话重试。"
+
+
 def internal_error(code: str, *, stage: str) -> AgentInternalError:
     return AgentInternalError(code=code, stage=stage,
-        user_message=f"Agent internal error ({code}); the request was stopped.")
+        user_message=_failure_message(code, stage))
 
 
 def unavailable(code: str, *, stage: str, retry_count: int = 0,
@@ -45,8 +59,7 @@ def unavailable(code: str, *, stage: str, retry_count: int = 0,
     error_type = AgentInternalError if protocol_error else AgentUnavailableError
     return error_type(
         code=code,
-        user_message=user_message or (f"Agent internal error ({code}); the request was stopped."
-                                      if protocol_error else "Agent unavailable; the request was stopped."),
+        user_message=user_message or _failure_message(code, stage),
         stage=stage, retry_count=retry_count,
         cause_type=type(cause).__name__ if cause else None,
     )

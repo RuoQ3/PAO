@@ -58,15 +58,16 @@ def validate_scope(scope, schema):
         validate_inputs({path: interval[1]}, standalone, scope)
 
 
-def build_optimization_plan(config_path):
+def build_optimization_plan(config_path, *, overrides=None):
     """Bind the complete YAML and model contents, separately from iteration count."""
     import yaml
-    from src.utils.file_io import load_optimize_config
+    from src.utils.file_io import load_optimize_config, apply_config_overrides
     path = Path(config_path).resolve()
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = apply_config_overrides(raw, overrides)
     objective_modules = {str(Path(obj["module"]).resolve()): file_digest(obj["module"])
                          for obj in raw.get("objectives", []) if obj.get("type") == "custom_module"}
-    config, model, _ = load_optimize_config(path)
+    config, model, _ = load_optimize_config(path, **({"overrides": overrides} if overrides else {}))
     if getattr(config, "agent_loop", {}).get("enabled"):
         raise ValueError("legacy Agent closed-loop execution is disabled; no approved envelope adapter")
     if config.derived_var_specs or config.run_config.recycle_warmstart is not None:
@@ -95,21 +96,20 @@ def build_optimization_plan(config_path):
             "model_path": str(model.resolve()), "model_hash": file_digest(model),
             "objective_module_hashes": objective_modules,
             "configuration": raw, "scope": scope, "limits": limits,
-            "algorithm": {"type": raw.get("optimizer", {}).get("type", "bayesian"),
-                          "surrogate_model": config.surrogate_model,
-                          "acquisition": config.acquisition, "xi": config.xi, "kappa": config.kappa,
-                          "n_initial": config.n_initial, "n_initial_min": config.n_initial_min,
-                          "n_iterations": config.n_iterations, "random_seed": config.random_seed,
-                          "scalarization": getattr(config, "scalarization", None)},
+            "algorithm": optimization_identity(config, raw),
             "policy": {"all_phases_share_budget": True, "automatic_replay": False,
                        "feasibility_search": raw.get("feasibility_search"),
                        "sensitivity_probe": raw.get("sensitivity_probe"),
                        "retries": "each attempt consumes budget", "verification": "each run consumes budget"}}
+    if overrides:
+        from copy import deepcopy
+        plan["configuration_overrides"] = deepcopy(overrides)
     return plan, schema
 
 
 def validate_optimization_plan(plan, schema):
-    current, _ = build_optimization_plan(plan["config_path"])
+    current, _ = build_optimization_plan(plan["config_path"], **(
+        {"overrides": plan["configuration_overrides"]} if plan.get("configuration_overrides") else {}))
     if digest(current) != digest(plan):
         raise ExecutionBoundaryError("optimization model/configuration/algorithm changed; preview and approve again")
     validate_scope(plan["scope"], schema)
@@ -118,8 +118,11 @@ def validate_optimization_plan(plan, schema):
 
 def preflight_optimizer(config):
     """Initialize the requested backend before any model open, DOE or probe."""
-    from src.optimization.surrogate import SurrogateConfig, make_surrogate_optimizer
-    from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig, _MultiObjectiveBayesianOptimizer
+    from src.workflows.optimize_population import PopulationOptimizeConfig
+    from src.optimization.registry import create_optimizer
+    if isinstance(config, PopulationOptimizeConfig):
+        return create_optimizer(config.problem, config.algorithm_spec)
+    from src.workflows.optimize_pareto_case import ParetoOptimizeCaseConfig
     ff = config.feasibility_filter
     if ff.enabled and ff.model != "random":
         from src.optimization.feasibility import FeasibilityClassifier, _HAS_SKLEARN
@@ -129,20 +132,31 @@ def preflight_optimizer(config):
     if isinstance(config, ParetoOptimizeCaseConfig):
         from src.workflows.optimize_pareto_case import _validate_config
         _validate_config(config)
-        return _MultiObjectiveBayesianOptimizer(list(config.param_bounds.values()), config, list(config.param_bounds))
+        from src.optimization.bo_adapter import make_legacy_bo
+        return make_legacy_bo(config)
     from src.workflows.optimize_case import _validate_config
     _validate_config(config)
     if len(config.run_config.objective_fns) != 1:
         raise ValueError("single-objective optimizer requires exactly one objective")
-    return make_surrogate_optimizer(list(config.param_bounds.values()), SurrogateConfig(
-        model=config.surrogate_model, acquisition=config.acquisition, xi=config.xi,
-        kappa=config.kappa, n_initial_min=config.n_initial_min, random_seed=config.random_seed),
-        {i for i, p in enumerate(config.param_bounds) if p in config.integer_var_paths})
+    from src.optimization.bo_adapter import make_legacy_bo
+    return make_legacy_bo(config)
+
+
+def optimization_identity(config, raw):
+    from src.optimization.registry import from_config, identity
+    problem, spec = from_config(config)
+    resolved = identity(problem, spec)
+    # Historical fields stay available to existing previews and consumers.
+    return {**resolved, "type": raw.get("optimizer", {}).get("type", "bayesian"),
+            "surrogate_model": getattr(config, "surrogate_model", None),
+            "random_seed": spec.seed, "n_initial": config.n_initial, "n_iterations": config.n_iterations,
+            **{k: getattr(config, k, None) for k in ("acquisition", "xi", "kappa", "n_initial_min", "scalarization")}}
 
 
 def execute_optimization(plan):
     from src.utils.file_io import load_optimize_config
-    config, model, kwargs = load_optimize_config(plan["config_path"])
+    config, model, kwargs = load_optimize_config(plan["config_path"], **(
+        {"overrides": plan["configuration_overrides"]} if plan.get("configuration_overrides") else {}))
     from dataclasses import asdict
     from .authorization import require_authorization
     grant = require_authorization()
@@ -186,9 +200,29 @@ def execute_optimization(plan):
         driver.stop_requested = unit.stop_requested
         driver.__enter__()
         driver.open(copied)
-        result = optimize_pareto_case(driver, config) if isinstance(config, ParetoOptimizeCaseConfig) else optimize_case(driver, config)
-        return {"status": "execution_completed", "simulated": bool(getattr(driver, "simulated", False)),
-                "algorithm": plan["algorithm"], "summary": result.to_summary()}
+        from src.workflows.optimize_population import PopulationOptimizeConfig, optimize_population
+        result = (optimize_population(driver, config) if isinstance(config, PopulationOptimizeConfig) else
+                  optimize_pareto_case(driver, config) if isinstance(config, ParetoOptimizeCaseConfig) else optimize_case(driver, config))
+        reason = getattr(result, "stop_reason", None) or ""
+        status = ("outcome_unknown" if "unknown" in reason else "failed" if any(s in reason for s in
+                  ("fault", "failed", "invalid_", "illegal_", "exceeds_")) else "execution_completed")
+        summary = result.to_summary()
+        if not isinstance(config, PopulationOptimizeConfig):
+            from src.optimization.registry import from_config, identity
+            from src.optimization.problem import Candidate
+            from src.optimization.execution import UnifiedResult, observe_case
+            from dataclasses import asdict
+            problem, spec = from_config(config)
+            unified = UnifiedResult(identity(problem, spec), evaluations_used=grant.used,
+                stop_reason=getattr(result, "early_stop_reason", None) or "planned_evaluations_completed")
+            for i, case in enumerate(result.cases):
+                x = tuple(case.design_vars.get(v.path) for v in problem.variables)
+                candidate = Candidate(str(i), x, i)
+                unified.records.append({"candidate": asdict(candidate), "inputs": case.design_vars,
+                    "observation": asdict(observe_case(case, candidate, problem))})
+            summary["unified"] = unified.to_summary()
+        return {"status": status, "simulated": bool(getattr(driver, "simulated", False)),
+                "algorithm": plan["algorithm"], "summary": summary}
     try:
         output = unit.invoke(execute, timeout=max(.001, grant.deadline - __import__("time").monotonic()), cleanup_timeout=5)
     except ExecutionBoundaryError as primary:

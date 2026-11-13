@@ -10,7 +10,7 @@ def markdown_answer(answer):
         if block.title:
             lines.extend(["## " + block.title, ""])
         if block.epistemic:
-            lines.extend(["*" + {"observed": "实测", "mechanism": "机理解释", "hypothesis": "推测", "insufficient": "数据不足"}[block.epistemic] + "*", ""])
+            lines.extend(["*" + {"observed": "证据记录", "mechanism": "机理解释", "hypothesis": "推测", "insufficient": "数据不足"}[block.epistemic] + "*", ""])
         if block.text:
             lines.extend([("## " if block.kind == "heading" else "") + block.text, ""])
         lines.extend("- " + item for item in block.items)

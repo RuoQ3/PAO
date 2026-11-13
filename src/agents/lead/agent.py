@@ -42,9 +42,34 @@ class LeadAgent:
         self.llm_config = llm_config
         self.intent_classifier = intent_classifier or IntentClassifier(
             llm_config=llm_config, enabled=self.use_llm, llm_call=llm_call,
+            role_definitions=self.registry.definitions(),
         )
         self._pending_closed_loops: dict[str, dict[str, Any]] = {}
         self._case_adapters: dict[str, ProcessCaseAdapter] = {}
+
+    def capabilities(self, session):
+        from src.agents.reasoning import snapshot
+        from src.agents.lead.llm_client import is_configured
+        draft_context = session.runtime_state.get("project_static_evidence")
+        context = snapshot(draft_context) if draft_context and self.context_builder is None else snapshot(self._load_context(
+            ["process_context", "yaml", "node_db", "simulation_db", "files"], session).context)
+        tools = getattr(self.registry, "tools", None)
+        catalogue = tools.catalogue(context) if tools else []
+        labels = {"read": "只读工具", "plan": "待审批计划", "unavailable": "不可用 / 未接入"}
+        rows = [[x["id"], labels[x["status"]], ", ".join(x["roles"]) or "无",
+                 x["description"]] for x in catalogue]
+        from src.optimization.registry import algorithm_catalogue
+        algorithms = algorithm_catalogue()
+        configured = self.use_llm and is_configured(self.llm_config or getattr(self.intent_classifier, "llm_config", None))
+        return Answer("专业解释需要可用 LLM；当前配置" + ("已提供（未探测服务）" if configured else "不可用") +
+                      "。工具状态来自实际处理器与当前已选资料；计划工具本身不运行 Aspen。",
+            blocks=[AnswerBlock("table", columns=["能力 / 工具", "状态", "允许角色", "范围"], rows=rows),
+                    AnswerBlock("table", columns=["算法", "状态", "后端", "目标 / 变量"], rows=[
+                        [x["id"], x["status"], x.get("backend", "未接入"),
+                         x.get("objectives", "—") + " / " + ", ".join(x.get("variable_types", []))] for x in algorithms]),
+                    AnswerBlock("limitation", text="code_engineer 仅分析与建议。执行需 Gateway、具体计划、人工审批及可用执行器；本清单不探测 COM 或外部服务。")],
+            details={"tools": catalogue, "optimizers": algorithms, "roles": [vars(d) for d in self.registry.definitions().values()],
+                     "execution_gateway_connected": self.action_gateway is not None})
 
     @session_boundary
     def answer(self, question: str, session: SessionState | None = None) -> Answer:
@@ -57,9 +82,12 @@ class LeadAgent:
         self._revoke_restored_approvals(session)
         task = session.pending_task
         if task is not None and task.active:
+            was_awaiting_approval = task.phase == "awaiting_approval"
             # Refresh/migrate the resource repair contract before interpreting
             # a reply, including tasks restored from older checkpoints.
             self._check_case_resource(task, session)
+            if task.verified_intent.intent == "optimization_request":
+                validate_task(task, self._task_context(task.verified_intent, session).context)
             decision = interpret_turn(self, task, question)
             task.audit.append({"event": "turn_routed", "kind": decision["kind"]})
             if decision["kind"] in {"cancel", "new_task"}:
@@ -81,10 +109,14 @@ class LeadAgent:
                     return resource_answer
                 context = self._task_context(task.verified_intent, session).context
                 valid = validate_task(task, context)
-                if had_blockers and valid and (previous_evidence != task.evidence_digest or decision["kind"] == "answer"):
+                if had_blockers and valid and not decision["updates"] and (
+                        previous_evidence != task.evidence_digest or decision["kind"] == "answer"):
                     return self._continue_task(task, session)
                 if not merged or not valid:
                     task.phase = "clarifying"
+                    if (was_awaiting_approval and valid and not decision["updates"]
+                            and task.verified_intent.intent == "optimization_request"):
+                        return Answer(text="旧审批已撤销，尚未执行。请说明要修改的字段及新值，例如总评估次数、总时限、最大失败次数、种群或代数；随后会重新校验并生成预览。")
                     if had_blockers and not merged and valid:
                         return Answer(text="需要补充 case 证据：" + "；".join(b["message"] for b in task.planning_blockers))
                     return clarification(task, prefix="请明确要补充或修改的字段。\n" if not merged else "")
@@ -105,12 +137,21 @@ class LeadAgent:
             "retry_count": classification.retry_count, "intent": intent.to_dict(),
         })
         loaded = self._task_context(intent, session)
-        task = new_task(self, question, intent, loaded.context)
+        task = new_task(self, question, intent, loaded.context, audit=session.audit_events)
         session.pending_task = task
         resource_answer = self._check_case_resource(task, session)
         if resource_answer is not None:
             return resource_answer
         if not validate_task(task, loaded.context):
+            if intent.intent == "optimization_request":
+                from src.optimization.requests import prepare_request, OptimizationRequestError
+                try:
+                    prepare_request(intent.analysis, loaded.context)
+                except OptimizationRequestError as exc:
+                    # Static algorithm/scope failures are useful before budget
+                    # collection; a missing budget remains ordinary clarification.
+                    if exc.field is None and not str(exc).startswith("请补充有效的执行预算"):
+                        return Answer(text=str(exc))
             return clarification(task)
         return self._continue_task(task, session)
 
@@ -154,16 +195,40 @@ class LeadAgent:
         question = task_prompt(task) if task.parameters else task.original_goal
         if intent.intent == "parameter_impact":
             intent.analysis = dict(task.parameters)
+        elif intent.intent == "optimization_request":
+            for name in ("algorithm", "equipment", "component", "target_component", "target_stream", "metric", "target"):
+                intent.analysis[name] = task.parameters.get(name)
+            intent.analysis["execution"] = {k: task.parameters[k] for k in
+                ("max_evaluations", "max_seconds", "max_failures") if task.parameters.get(k) is not None}
+            params = {k: task.parameters[k] for k in ("pop_size", "generations") if task.parameters.get(k) is not None}
+            from src.optimization.requests import canonical_algorithm
+            population_algorithm = canonical_algorithm(task.parameters.get("algorithm")) in {"GA", "PSO", "NSGA-II"}
+            if params and population_algorithm:
+                intent.analysis["optimizer_parameters"] = {**intent.analysis.get("optimizer_parameters", {}), **params}
+            elif not population_algorithm and "optimizer_parameters" in intent.analysis:
+                intent.analysis["optimizer_parameters"] = {k: v for k, v in intent.analysis["optimizer_parameters"].items()
+                    if k not in {"pop_size", "generations"}}
         session.intent = intent
         classification = Classification(intent=intent, classification_source=session.classification_source or "llm")
         answer = self._execute_intent(question, session, classification, loaded)
-        if task.phase != "clarifying":
+        if session.pending_approval is not None:
+            task.phase = "awaiting_approval"
+        elif task.phase != "clarifying":
             task.phase = "awaiting_approval" if session.pending_approval is not None else "completed"
         task.audit.append({"event": "task_phase", "phase": task.phase})
         return answer
 
     def _execute_intent(self, question, session, classification, loaded):
         intent = classification.intent
+        executions = [e for e in session.audit_events if e.get("event") == "action_executed"]
+        if executions and intent.action_type in {"none", "read"} and intent.intent in {"project_query", "analysis", "report_request", "general_question", "chat"}:
+            from src.agents.reasoning import snapshot
+            data, evidence = reason(question, context={**snapshot(loaded.context),
+                "saved_execution": executions[-1], "conversation": conversation_context(session)},
+                role="saved_execution_analysis", llm_config=self.llm_config, llm_call=self.llm_call,
+                role_contract="Answer from the saved execution audit. Never run Aspen or treat prior assistant prose as evidence. Distinguish optimizer convergence from solver validity: generations_completed does not prove optimizer convergence, whereas simulation_valid and status_counts identify valid simulations separately from infeasible purity. Distinguish feasibility, budget, and unknown cleanup. Cite /saved_execution for execution facts.")
+            return Answer(text=data["text"], blocks=data.get("blocks", []), uncertainties=data["uncertainties"],
+                          details={"reasoning_evidence": evidence, "execution_repeated": False})
         if intent.intent == "parameter_impact":
             slots = dict(intent.analysis)
             context = loaded.context
@@ -180,6 +245,15 @@ class LeadAgent:
                 candidate_parameters=slots.get("candidate_parameters") or None,
                 max_cases=max(1, min(int(slots.get("max_cases") or 20), self.policy.total_budget)),
             )
+            for key in ("max_seconds", "max_failures"):
+                if key in slots:
+                    value = slots[key]
+                    if type(value) not in (int, float) or value <= 0 or (key == "max_failures" and type(value) is not int):
+                        return Answer(text=f"参数影响预算 {key} 必须为有限正数，失败次数须为整数。未执行 Aspen。")
+                    import math
+                    if not math.isfinite(value):
+                        return Answer(text=f"参数影响预算 {key} 必须为有限正数。未执行 Aspen。")
+                    impact.perturbation_policy[key] = value
             eligible = [p for p in impact.parameters if not parameter_issues(p)]
             decisions = []
             if eligible:
@@ -280,6 +354,114 @@ class LeadAgent:
                           uncertainties=reasoning["uncertainties"], details={**payload, "reasoning_evidence": reasoning_evidence},
                           blocks=reasoning.get("blocks", []))
         if intent.action_type in {"modify_file", "set_parameter", "simulate_once", "optimize", "modify_structure"}:
+            if intent.action_type == "optimize":
+                from src.optimization.requests import prepare_request, OptimizationRequestError
+                try:
+                    request = prepare_request(intent.analysis, loaded.context)
+                except OptimizationRequestError as exc:
+                    if session.pending_task is not None:
+                        task = session.pending_task
+                        task.phase = "clarifying"
+                        task.planning_blockers = [b for b in task.planning_blockers
+                                                  if b.get("source") != "optimization_request"]
+                        task.planning_blockers.append({"field": exc.field or "optimization_request",
+                            "message": str(exc), "source": "optimization_request"})
+                        if exc.field in task.field_specs:
+                            task.missing_fields = list(dict.fromkeys([*task.missing_fields, exc.field]))
+                            task.waiting_fields = [exc.field]
+                    return Answer(str(exc), facts=[{"kind": "optimization_request_blocked", "field": exc.field, "executed": False}])
+                if session.pending_task is not None:
+                    session.pending_task.planning_blockers = [b for b in session.pending_task.planning_blockers
+                                                              if b.get("source") != "optimization_request"]
+                version = getattr(loaded.context, "dependency_versions", None) or (
+                    loaded.context.get("dependency_versions", {}) if isinstance(loaded.context, dict) else {})
+                expected_plan = None
+                if (version.get("yaml") or {}).get("status") == "available":
+                    from src.agents.actions.plans import build_optimization_plan, preflight_optimizer
+                    from src.utils.file_io import load_optimize_config
+                    try:
+                        plan, _ = build_optimization_plan(version["yaml"]["path"], overrides=request["overrides"])
+                        expected_plan = plan
+                        config, _, _ = load_optimize_config(version["yaml"]["path"], overrides=request["overrides"])
+                        preflight_optimizer(config)
+                    except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
+                        if session.pending_task is not None:
+                            session.pending_task.phase = "clarifying"
+                        from src.agents.reasoning import redact
+                        return Answer(f"优化计划尚不能执行：{redact(str(exc), self.llm_config)}。请补充或修正配置；已保留算法 {request['algorithm']}，未执行 Aspen。")
+                session.audit_events.append({"event": "optimization_request_prepared", **request})
+                # Use the same specialist/tool boundary for an explicit execution
+                # request. Only a host-built complete proposal can reach Gateway.
+                if "optimization_advisor" not in self.registry.names():
+                    raise unavailable("subagent_unavailable", stage="optimization_planning")
+                definition = self.registry.definition("optimization_advisor")
+                spec = TaskSpec(agent="optimization_advisor", prompt=question,
+                    tool_allowlist=list(definition.tool_allowlist), max_steps=definition.max_steps,
+                    budget=definition.budget, timeout_seconds=180, metadata={"session_id": session.session_id,
+                                                       "optimization_request": request})
+                runtime = OrchestrationRuntime(self.registry.as_mapping(), policy=self.policy,
+                    audit=session.audit_events, role_definitions=self.registry.definitions())
+                try:
+                    result = runtime.run([spec], context=loaded.context)[0]
+                except AgentUnavailableError as exc:
+                    if exc.code != "agent_output_invalid":
+                        raise
+                    # No invalid advice/proposal enters approval. Keep verified
+                    # user fields so a formatting defect cannot erase the task.
+                    task = session.pending_task
+                    if task is not None:
+                        task.phase = "clarifying"
+                        task.planning_blockers = [{"field": "optimization_explanation",
+                            "message": "顾问回答未通过证据或格式校验，请要求重新生成计划或修改任务条件"}]
+                        task.audit.append({"event": "optimization_explanation_rejected", **exc.to_dict()})
+                    session.audit_events.append({"event": "optimization_explanation_rejected", **exc.to_dict()})
+                    return Answer("预算和算法设置已保留，但顾问回答修复后仍未通过证据或格式校验，"
+                                  "未生成审批、未执行 Aspen。可以继续要求重新生成计划或修改任务条件。")
+                if session.pending_task is not None:
+                    session.pending_task.planning_blockers = []
+                session.task_results.append(result)
+                proposals = result.recommended_actions
+                approval = None
+                if proposals:
+                    if len(proposals) != 1 or self.action_gateway is None:
+                        raise unavailable("action_gateway_unavailable", stage="tool_plan_preview")
+                    proposal = ActionProposal.from_dict(proposals[0])
+                    from src.agents.actions.authorization import digest
+                    proposed_plan = proposal.payload.get("optimization_plan", {})
+                    if expected_plan is None or digest(proposed_plan) != digest(expected_plan):
+                        raise internal_error("optimization_selection_mismatch", stage="optimization_planning")
+                    proposal.payload["session_id"] = session.session_id
+                    preview = self.action_gateway.preview_proposal(proposal)
+                    if not preview.get("valid"):
+                        raise unavailable("tool_plan_invalid", stage="tool_plan_preview")
+                    approval = ApprovalRequest(proposal, preview=preview, message="请审核具体优化计划，尚未执行 Aspen。")
+                    session.pending_approval = approval
+                if approval is None and session.pending_task is not None:
+                    session.pending_task.phase = "clarifying"
+                    session.pending_task.planning_blockers = [{"field": "optimization_review",
+                        "message": "顾问尚未提交具体优化计划，可以补充条件或要求重新生成计划"}]
+                summary = result.summary
+                blocks = list(result.blocks)
+                if approval is not None:
+                    selected = proposed_plan["algorithm"]
+                    selection_text = (f"优化算法：{selected['actual_algorithm']} / {selected['actual_backend']}"
+                               f"（来源：{'对话选择' if request['source'] == 'conversation' else '项目配置'}）。\n"
+                               + "\n".join(request["changes"]) + "\n"
+                               + f"总评估上限：{proposed_plan['limits']['max_evaluations']}；"
+                               + f"总时限：{proposed_plan['limits']['max_seconds']} 秒。")
+                    schedule = request.get("evaluation_schedule")
+                    if schedule:
+                        capacity = schedule["max_evaluations"] // schedule["pop_size"]
+                        selection_text += (f"\n每代 {schedule['pop_size']} 个个体，共 {schedule['generations']} 代（含初始代），"
+                                           f"计划评估 {schedule['planned_evaluations']} 次。")
+                        if capacity < schedule["generations"]:
+                            selection_text += f"当前评估预算最多支持 {capacity} 个完整种群；达到预算或时限后停止。"
+                    summary = selection_text + "\n" + summary
+                    if blocks:
+                        blocks.insert(0, AnswerBlock("paragraph", text=selection_text))
+                return Answer(summary, blocks=blocks, evidence=result.evidence,
+                    uncertainties=result.uncertainties, task_results=[result], approval_request=approval,
+                    recommendations=proposals)
             from src.agents.reasoning import snapshot
             analysis, analysis_evidence = reason(question, context={**snapshot(loaded.context), "conversation": conversation_context(session)},
                                  role="action_planning", llm_config=self.llm_config, llm_call=self.llm_call)
@@ -305,6 +487,16 @@ class LeadAgent:
                     raise
                 except Exception as exc:
                     raise unavailable("action_gateway_unavailable", stage="plan_preview", cause=exc) from None
+            if approval.preview is not None and approval.preview.get("valid") is False:
+                session.pending_approval = None
+                session.audit_events.append({"event": "action_preview_rejected", "preview": approval.preview,
+                                             "action_type": proposal.action_type})
+                errors = "; ".join(str(e) for e in approval.preview.get("errors", []))
+                return Answer(text="计划未通过 Gateway 校验，未生成待审批动作，未执行 Aspen。" +
+                              (f"原因：{errors}。\n" if errors else "\n") + analysis["text"],
+                              blocks=analysis.get("blocks", []), uncertainties=analysis["uncertainties"],
+                              details={"reasoning_evidence": analysis_evidence, "rejected_preview": approval.preview},
+                              facts=self._classification_facts(classification))
             session.pending_approval = approval
             return Answer(text=analysis["text"], blocks=analysis.get("blocks", []), uncertainties=analysis["uncertainties"],
                           details={"reasoning_evidence": analysis_evidence},
@@ -366,7 +558,7 @@ class LeadAgent:
         session.context_summary = loaded.summary
         session.context_sources = loaded.sources
         results = runtime.rank_results(runtime.run(task_specs, context=context))
-        session.runtime_state = runtime.resident_state()
+        session.runtime_state.update(runtime.resident_state())
         issues = runtime.validate_results(results)
         session.task_results.extend(results)
         if not results or any(r.status.value != "completed" for r in results):
@@ -714,8 +906,9 @@ class LeadAgent:
 
     def _task_context(self, intent, session):
         required = list(intent.context_required)
-        if intent.intent == "parameter_impact":
+        if intent.intent in {"parameter_impact", "optimization_request"}:
             required = list(dict.fromkeys([*required, "process_context", "yaml", "node_db"]))
+            required = [name for name in required if name != "none"]
         return self._load_context(required, session)
 
     @staticmethod

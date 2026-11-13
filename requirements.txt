@@ -8,16 +8,12 @@
 # ------------------------------------------------------------------------------
 pywin32==311                  # Aspen Plus COM 自动化 (pythoncom, win32com.client)
 numpy==2.2.6                  # 数值计算、LHS 拉丁超立方采样加速
-scikit-optimize==0.10.2       # 贝叶斯优化代理模型 (GP / RF / ET / GBRT)，qEHVI 路径的 fallback
+scikit-optimize==0.10.2       # BO / ParEGO surrogate backend; required when selected
 scikit-learn==1.7.2           # 机器学习算法（scikit-optimize 依赖）
 scipy==1.15.3                 # 科学计算（scikit-optimize / Pareto 超体积计算依赖）
 
-# BoTorch 多目标 BO 后端（可选加速，不安装时自动退化为 skopt GP）
-# 安装：pip install torch botorch gpytorch
-# 不安装时 surrogate_model: qEHVI/NEHVI 将退化为 GP（skopt）
-torch>=2.0.0                  # PyTorch，BoTorch 依赖，自动检测 CUDA
-botorch>=0.10.0               # qEHVI / qNEHVI / FuRBO Trust Region
-gpytorch>=1.11.0              # BoTorch 依赖的高斯过程库
+# Optional optimizer backends are in requirements-optimization.txt.
+# Missing/failed selected dependencies stop execution; production never installs.
 PyYAML==6.0.3                 # YAML 配置文件解析
 python-dotenv==1.0.0          # 从 .env 文件加载环境变量（LLM key 管理）
 
@@ -64,7 +60,7 @@ typing_extensions==4.15.0
 # 注意事项
 # ------------------------------------------------------------------------------
 # 1. pywin32 仅支持 Windows，在非 Windows 平台驱动层无法运行
-# 2. scikit-optimize 为可选降级：若未安装，代码自动回退到随机采样
+# 2. BO requires scikit-optimize; missing backends never trigger random substitution
 # 3. numpy 为可选加速：若未安装，LHS 采样回退到随机网格
 # 4. 安装命令：pip install -r requirements.txt
 

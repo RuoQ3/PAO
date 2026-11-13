@@ -90,7 +90,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="python -m src.main",
         description="PAO — Aspen Plus 贝叶斯优化框架",
     )
-    parser.add_argument("config", help="case_config.yaml 路径（--conversation 模式下作为 Aspen 文件目录提示）")
+    parser.add_argument("config", nargs="?", help="已有 YAML 或 Aspen 模型路径；--new-project 可省略")
+    parser.add_argument("--new-project", action="store_true", help="进入无需手写 YAML 的项目建立对话")
+    parser.add_argument("--project-draft", default=None, metavar="PATH", help="恢复项目草稿 JSON；不恢复执行授权")
     parser.add_argument("--db",       default=None, help="结果数据库路径（.db）")
     parser.add_argument("--log",      default="INFO", help="日志级别（默认 INFO）")
     parser.add_argument("--console-log", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -114,7 +116,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="统一对话使用的 YAML 配置路径")
     parser.add_argument("--node-db", dest="node_db_path", default=None, metavar="PATH",
                         help="NodeDB 路径（可选）")
-    return parser.parse_args(argv)
+    parser.add_argument("--file", dest="file_paths", action="append", default=[], metavar="PATH",
+                        help="明确选择供专业角色只读访问的 UTF-8 文件，可重复指定；不执行代码")
+    args = parser.parse_args(argv)
+    if args.new_project or args.project_draft:
+        args.conversation = True
+    if not args.config and not args.new_project and not args.project_draft:
+        parser.error("需要已有配置路径，或使用 --new-project / --project-draft")
+    return args
 
 
 def _print_single_summary(log: logging.Logger, result: object, db_path: Path) -> None:
@@ -279,6 +288,8 @@ def _print_backtest_progress(event: dict) -> None:
 def _run_unified_chat_loop(
     *, config_path: Path, yaml_path: Path | None, db_path: Path | None,
     node_db_path: Path | None, initial_intent: str, log: logging.Logger,
+    new_project: bool = False, project_draft: str | None = None,
+    file_paths: list[str] | None = None,
 ) -> int:
     """Run the unified Lead Agent conversation entry point."""
     from src.agents.lead import ConversationSession, LeadAgent
@@ -310,9 +321,24 @@ def _run_unified_chat_loop(
     # Build the gateway at the CLI boundary.  The context remains read-only;
     # Aspen is opened lazily by the runner only after preview + approval.
     sim_db = None
-    def create_gateway():
+    def create_gateway(optimization_plan=None):
         nonlocal sim_db
-        context = builder.build(session=session.state)
+        current_builder = session.lead.context_builder
+        context = current_builder.build(session=session.state)
+        selected_yaml = getattr(current_builder, "yaml_path", None) or session.state.context_refs.get("case_config")
+        if selected_yaml:
+            from src.agents.actions.plans import build_optimization_plan
+            # Only complete optimization configurations expose optimization approval.
+            if optimization_plan is not None or context.configuration.get("execution"):
+                if optimization_plan is not None and Path(optimization_plan["config_path"]).resolve() != Path(selected_yaml).resolve():
+                    raise ValueError("optimization proposal does not match selected project")
+                _, schema = build_optimization_plan(selected_yaml, **(
+                    {"overrides": optimization_plan["configuration_overrides"]}
+                    if optimization_plan and optimization_plan.get("configuration_overrides") else {}))
+                sim_db = SimulationDB(db_path)
+                runner = AspenSandboxRunner(driver_factory=lambda _path: __import__("src.aspen_driver.driver", fromlist=["AspenDriver"]).AspenDriver(),
+                    allowed_paths=set(schema.parameters), require_path_whitelist=True, progress_callback=_print_backtest_progress)
+                return ActionGateway(schema, simulation_runner=runner, simulation_db=sim_db)
         params = {}
         for item in [
             p for values in (getattr(context, "equipment_parameters", {}) or {}).values()
@@ -325,8 +351,8 @@ def _run_unified_chat_loop(
                                          unit=item.get("unit"), writable=item.get("authorized", item.get("tunable", path in {v.get("aspen_path") or v.get("path") for v in (getattr(context, "variables", {}) or {}).values()})) is True, minimum=item.get("lower", item.get("lower_bound")),
                                          maximum=item.get("upper", item.get("upper_bound")), integer=bool(item.get("integer")))
         schema = ModelSchema(ModelIdentity(str(getattr(context, "model_id", None) or "model")), parameters=params,
-                             model_path=str(builder.resolve_model_resource(session=session.state).path or ""),
-                             config_path=str(yaml_path) if yaml_path else None,
+                             model_path=str(current_builder.resolve_model_resource(session=session.state).path or ""),
+                             config_path=str(selected_yaml) if selected_yaml else None,
                              current_values=getattr(context, "current_values", {}) or {},
                              permissions={"inspect", "run_simulation"}, targets=("model", ""))
         sim_db = SimulationDB(db_path)
@@ -336,6 +362,20 @@ def _run_unified_chat_loop(
         return ActionGateway(schema, simulation_runner=runner, simulation_db=sim_db)
     class LazyGateway:
         instance = None
+        def preview_proposal(self, proposal):
+            plan = proposal.payload.get("optimization_plan")
+            if plan is not None:
+                self.reset_project()
+                self.instance = create_gateway(plan)
+            elif self.instance is None:
+                self.instance = create_gateway()
+            return self.instance.preview_proposal(proposal)
+        def reset_project(self):
+            nonlocal sim_db
+            self.instance = None
+            if sim_db is not None:
+                sim_db.close()
+                sim_db = None
         def __getattr__(self, name):
             if self.instance is None:
                 self.instance = create_gateway()
@@ -344,6 +384,8 @@ def _run_unified_chat_loop(
     session = ConversationSession(SessionState(), LeadAgent(
         policy=RuntimePolicy(allow_writes=False), context_builder=builder,
         action_gateway=gateway, use_llm=True, llm_config=llm_config))
+    if file_paths:
+        session.state.context_refs["files"] = list(file_paths)
     from src.reporting.answer_terminal import TerminalRenderer
     from src.reporting.answer_export import markdown_answer
     from src.agents.orchestration.models import Answer
@@ -362,7 +404,7 @@ def _run_unified_chat_loop(
                     stream.write(json.dumps(redact(event, llm_config), ensure_ascii=False, default=str) + "\n")
             audit_cursor += len(events)
     print("\nPAO Lead Agent conversation")
-    print("输入问题，exit 退出；/details 查看详情；/value p1 查看完整路径；/export 文件.json 或 .md 导出")
+    print("输入问题，exit 退出；/details 查看详情；/value p1 查看路径；/export 文件.json 或 .md 导出；/project new 建立项目；/capabilities 查看能力")
 
     def run_turn(text: str) -> bool:
         if text.strip().lower() in {"/exit", "exit", "quit"}:
@@ -397,17 +439,27 @@ def _run_unified_chat_loop(
                 except OSError as exc:
                     print(TerminalRenderer().render(Answer(f"导出失败：{exc}")))
             return False
-        if command.startswith("/"):
+        if command.startswith("/") and command not in {"/project", "/capabilities"}:
             print("未知命令；可用 /answer、/details、/value、/export、/exit。")
             return False
         try:
             result = session.submit(text)
+        except (ValueError, OSError) as exc:
+            print(renderer.render(Answer(str(exc))))
+            return False
         finally:
             save_audit()
         print(renderer.render(result))
         return False
 
     try:
+        if project_draft:
+            run_turn('/project resume ' + project_draft)
+        elif new_project:
+            selected = str(config_path) if config_path.suffix.lower() in {".bkp", ".apw"} else ""
+            run_turn('/project from-config ' + str(yaml_path) if yaml_path else '/project new ' + selected)
+            if node_db_path:
+                run_turn('/project node-db ' + str(node_db_path))
         if initial_intent.strip() and run_turn(initial_intent):
             return 0
         while True:
@@ -427,6 +479,9 @@ def _run_unified_chat_loop(
         if sim_db is not None:
             sim_db.close()
         builder.close()
+        current = getattr(session.lead, "context_builder", None)
+        if current is not builder and hasattr(current, "close"):
+            current.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -436,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.db:
         db_path = Path(args.db)
     else:
-        yaml_dir = Path(args.config).resolve().parent
+        yaml_dir = Path(args.config).resolve().parent if args.config else Path.cwd()
         db_path = yaml_dir / "output" / "simulation.db"
 
     # 确定日志文件路径：--log-file 优先，否则默认放在数据库同目录
@@ -455,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     # 必须在 load_optimize_config 之前分支：该函数假定输入是可解析的优化
     # 配置 YAML 加载器不接受 .bkp/.apw；裸模型由 Lead Agent 接入。
     # 识别要处理的场景（用户还没有配置，需要先接入/拟合/推荐边界）。
-    config_path = Path(args.config)
+    config_path = Path(args.config) if args.config else Path.cwd()
     # Unified conversation is explicitly read-only.  It is available with a
     # YAML or Aspen path and never enters the optimization execution branch.
     if args.conversation:
@@ -468,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
             node_db_path=node_db_path,
             initial_intent=args.intent,
             log=log,
+            **({"new_project": args.new_project, "project_draft": args.project_draft} if args.new_project or args.project_draft else {}),
+            **({"file_paths": args.file_paths} if args.file_paths else {}),
         )
     if config_path.suffix.lower() in (".bkp", ".apw") and not args.conversation:
         log.error("Aspen 文件必须通过唯一的 --conversation 入口进入 LeadAgent")

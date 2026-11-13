@@ -77,13 +77,14 @@ def _gateway():
     return ActionGateway(schema, executor=MockExecutor())
 
 
-def test_write_request_creates_pending_approval_and_gateway_requires_confirmation():
+def test_disabled_structure_request_does_not_create_pending_approval():
     gateway = _gateway()
     lead = LeadAgent(action_gateway=gateway, policy=RuntimePolicy(allow_writes=True), **fake_kwargs(kind="modify_request", action="modify_structure"))
     answer = lead.answer("修改边界")
-    assert isinstance(answer.approval_request, ApprovalRequest)
-    assert answer.approval_request.status == "pending"
-    audit_id = answer.approval_request.preview.get("audit_id")
+    assert answer.approval_request is None
+    assert answer.details['rejected_preview']['valid'] is False
+    assert any('structural modification' in e for e in answer.details['rejected_preview']['errors'])
+    audit_id = next(iter(gateway.audit.events)).audit_id
     with pytest.raises(Exception):
         gateway.execute(audit_id)
 

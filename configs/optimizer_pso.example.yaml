@@ -1,0 +1,14 @@
+simulator:
+  filepath: user-model.bkp
+  timeout: 120
+design_variables:
+  - {name: temperature, type: continuous, aspen_path: '\Data\Blocks\B1\Input\TEMP', lower_bound: 20, upper_bound: 100, unit: C}
+objectives:
+  - {name: duty, type: aspen_path, aspen_path: '\Data\Blocks\B1\Output\DUTY', minimize: true, unit: kW}
+optimizer:
+  type: pso
+  backend: pymoo
+  random_seed: 42
+  parameters: {pop_size: 8, generations: 4, w: 0.9, c1: 2.0, c2: 2.0, max_velocity_rate: 0.2}
+execution: {max_evaluations: 30, max_failures: 5, max_seconds: 1800}
+# Only three full generations fit: 24 runs. Six remaining evaluations are not used to fake a generation.

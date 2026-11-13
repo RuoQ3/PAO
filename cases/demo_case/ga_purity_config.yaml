@@ -1,0 +1,76 @@
+# Real Aspen acceptance configuration: GA, 4 individuals x 2 generations.
+# Scalar outputs only; block/stream convergence checks remain enabled.
+simulator:
+  filepath: cases/demo_case/二级氢氰化工段.bkp
+  visible: false
+  suppress_dialogs: true
+  require_type_library: true
+  timeout: 300
+  reinit: true
+  verify_inputs: true
+  input_rtol: 1.0e-06
+design_variables:
+- name: T0301_BF
+  description: T0301 塔底采出比（主要控制 ADN 产量）
+  aspen_path: \Data\Blocks\T0301\Input\B:F
+  type: continuous
+  lower_bound: 0.599964
+  upper_bound: 0.600036
+  initial_value: 0.6
+  unit: '-'
+- name: T0301_FEED_STAGE
+  description: T0301 进料板位置
+  aspen_path: \Data\Blocks\T0301\Input\FEED_STAGE\0318
+  type: integer
+  lower_bound: 10
+  upper_bound: 20
+  initial_value: 15
+  unit: '-'
+- name: T0301_BASIS_RR
+  description: T0301 回流比（主要控制分离效果和能耗）
+  aspen_path: \Data\Blocks\T0301\Input\BASIS_RR
+  type: continuous
+  lower_bound: 1.53846
+  upper_bound: 2.6
+  initial_value: 2.0
+  unit: '-'
+output_paths:
+- \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+- \Data\Streams\ADN\Output\MASSFLOW\MIXED\ADN
+- \Data\Blocks\T0301\Output\REB_DUTY
+objectives:
+- name: requested_purity
+  type: aspen_path
+  aspen_path: \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+  minimize: false
+  unit: '1'
+constraints:
+- name: purity_min
+  description: ADN mass fraction >= 0.9999
+  aspen_path: \Data\Streams\ADN\Output\MASSFRAC\MIXED\ADN
+  operator: '>='
+  threshold: 0.9999
+  scale: 1.0
+extraction:
+  check_status_paths:
+  - \Data\Blocks\T0301
+  - \Data\Streams\ADN
+  blocks: []
+  streams: []
+  strict_extraction: false
+  mode: full
+optimizer:
+  type: ga
+  backend: pymoo
+  parameters:
+    pop_size: 4
+    generations: 2
+    crossover_probability: 0.9
+    crossover_eta: 15.0
+    mutation_eta: 20.0
+    mutation_probability: 0.1
+  random_seed: 42
+execution:
+  max_evaluations: 8
+  max_seconds: 600
+  max_failures: 4

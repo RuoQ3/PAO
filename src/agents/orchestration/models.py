@@ -174,6 +174,61 @@ class SubagentRequest(JsonModel):
             raise TypeError("subagent parallel must be boolean")
 
 
+def validate_optimization_analysis(analysis):
+    """Validate and copy optional slots; null means no user override.
+
+    Providers often emit every optional key with null. Treat only those
+    documented empty values as absent, preserving YAML budgets and seeds.
+    Other invalid types still fail validation.
+    """
+    if not isinstance(analysis, dict):
+        raise TypeError("analysis must be an object")
+    from copy import deepcopy
+    analysis = deepcopy(analysis)
+    for key in ("execution", "optimizer_parameters", "random_seed"):
+        if key in analysis and analysis[key] is None:
+            del analysis[key]
+    allowed = {"algorithm", "method", "equipment", "component", "target_component", "target_stream",
+               "metric", "target", "execution", "optimizer_parameters", "random_seed"}
+    if set(analysis) - allowed:
+        raise ValueError("unknown optimization analysis fields")
+    for key in allowed - {"target", "execution", "optimizer_parameters", "random_seed"}:
+        if key in analysis and analysis[key] is not None and not isinstance(analysis[key], str):
+            raise TypeError(f"analysis.{key} must be a string or null")
+    metric = analysis.get("metric")
+    if metric is not None:
+        aliases = {"质量分数": "mass_fraction", "质量纯度": "mass_fraction", "mass fraction": "mass_fraction",
+                   "摩尔分数": "mole_fraction", "摩尔纯度": "mole_fraction", "mole fraction": "mole_fraction",
+                   "纯度": "purity"}
+        analysis["metric"] = aliases.get(metric.strip().casefold(), metric.strip().casefold())
+    stream = analysis.get("target_stream")
+    if stream:
+        import re
+        label = re.fullmatch(r"(?:最终产品物流|产品物流|物流|stream)\s*[:：]?\s*([A-Za-z0-9_-]+)", stream, re.IGNORECASE)
+        if label:
+            analysis["target_stream"] = label.group(1)
+    target = analysis.get("target")
+    if target is not None and not isinstance(target, str) and (type(target) not in (int, float) or not math.isfinite(target)):
+        raise TypeError("analysis.target must be a finite number, string or null")
+    for key in ("execution", "optimizer_parameters"):
+        if key in analysis and not isinstance(analysis[key], dict):
+            raise TypeError(f"analysis.{key} must be an object")
+    parameters = analysis.get("optimizer_parameters", {})
+    if "population_size" in parameters:
+        value = parameters.pop("population_size")
+        if "pop_size" in parameters and parameters["pop_size"] != value:
+            raise ValueError("conflicting pop_size and population_size")
+        parameters["pop_size"] = value
+    if "include_initial_generation" in parameters:
+        if parameters.pop("include_initial_generation") is not True:
+            raise ValueError("generations must include the initial population")
+    if set(analysis.get("execution", {})) - {"max_evaluations", "max_seconds", "max_failures"}:
+        raise ValueError("unknown optimization execution limits")
+    if "random_seed" in analysis and analysis["random_seed"] is not None and type(analysis["random_seed"]) is not int:
+        raise TypeError("analysis.random_seed must be an integer or null")
+    return analysis
+
+
 @dataclass
 class IntentSchema(JsonModel):
     """Strict, provider-neutral intent contract emitted by the classifier."""
@@ -228,6 +283,8 @@ class IntentSchema(JsonModel):
                 raise ValueError("analysis missing required slots: " + ", ".join(sorted(required_slots - self.analysis.keys())))
             if not isinstance(self.analysis["candidate_parameters"], list) or not all(isinstance(v, str) for v in self.analysis["candidate_parameters"]):
                 raise TypeError("analysis.candidate_parameters must be a list of strings")
+        elif self.intent == "optimization_request":
+            self.analysis = validate_optimization_analysis(self.analysis)
         elif self.analysis:
             raise ValueError("analysis must be {} for ordinary intents")
         if self.action_type in {"modify_file", "set_parameter", "simulate_once", "optimize", "modify_structure"} and not self.requires_confirmation:

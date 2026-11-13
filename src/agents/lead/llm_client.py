@@ -15,7 +15,7 @@ llm_client.py — PAO 大模型客户端（多 provider，密钥仅来自环境�
   ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY  各 provider 密钥
 
 .env 文件支持（项目根目录）：
-  复制 .env.example 为 .env，填入对应 key，本模块首次导入时自动加载。
+  配置加载时自动读取项目根目录 .env；PAO_LOAD_DOTENV=0 可显式禁用。
   .env 已被 .gitignore 排除，不会提交到 git。
 
 典型用法：
@@ -38,16 +38,18 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 自动加载 .env（项目根目录）
+# 配置加载时读取 .env（项目根目录；导入模块不会读取）
 # ---------------------------------------------------------------------------
-# 只在 .env 存在时才加载；未安装 python-dotenv 时静默跳过（不阻断正常使用）。
-# override=False：已有的系统环境变量优先于 .env，避免覆盖 CI/CD 注入的 key。
+# 未安装 python-dotenv 时使用既有简单 KEY=VALUE 解析器。
+# 保持原兼容约定：load_llm_config 传入 override=True，.env 优先。
+
+_PROJECT_ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
 def _load_dotenv_if_present(override: bool = False) -> None:
     # ``llm_client.py`` lives at ``src/agents/lead``; the project ``.env`` is
     # four parents above the file.  The previous three-parent path resolved to
     # ``src/.env`` and silently skipped the repository configuration.
-    env_file = Path(__file__).resolve().parents[3] / ".env"
+    env_file = _PROJECT_ENV_FILE
     if not env_file.exists():
         return
     try:
@@ -69,7 +71,8 @@ def _load_dotenv_if_present(override: bool = False) -> None:
         _log.debug("python-dotenv unavailable; loaded simple .env values from %s", env_file)
 
 
-_load_dotenv_if_present()
+# Loading is deferred to load_llm_config, never performed on import.
+# Simulated tests disable dotenv or select a temporary fake file.
 
 _log = logging.getLogger(__name__)
 
@@ -148,14 +151,15 @@ def load_llm_config(
         LLMConfig。未知 provider 立即失败。
         api_key 仅从对应环境变量读取，缺失时为 None（由 is_configured 判定）。
     """
-    # 每次调用重新加载 .env（override=True：.env 优先于系统环境变量）
+    # 恢复既有 CLI 行为；测试/环境变量专用部署可显式禁用文件读取。
     # 先把空字符串 key 从 os.environ 中删除，防止 dotenv 把空值视为"已设置"而跳过覆盖
     _prov_check = (provider or os.environ.get("PAO_LLM_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
     if _prov_check in _PROVIDER_DEFAULTS:
         _, _key_env = _PROVIDER_DEFAULTS[_prov_check]
         if os.environ.get(_key_env) == "":
             del os.environ[_key_env]
-    _load_dotenv_if_present(override=True)
+    if os.environ.get("PAO_LOAD_DOTENV", "1").strip() != "0":
+        _load_dotenv_if_present(override=True)
 
     prov = (provider or os.environ.get("PAO_LLM_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
     if prov not in _PROVIDER_DEFAULTS:
@@ -297,6 +301,9 @@ def chat(cfg: LLMConfig, system: str, user: str, *, json_mode: bool = False) -> 
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if exc.code == 402:
+                raise unavailable("llm_payment_required", stage="llm_request",
+                    user_message="LLM 服务返回 HTTP 402，当前账户服务拒绝请求。请检查服务账户状态后使用新会话重试；未执行新的 Aspen 动作，已有记录保留。") from None
             raise RuntimeError(f"DeepSeek API returned HTTP {exc.code}") from None
         except TimeoutError:
             raise unavailable("llm_timeout", stage="llm_request") from None

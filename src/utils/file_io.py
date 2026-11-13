@@ -41,6 +41,7 @@ _log = logging.getLogger(__name__)
 
 def load_optimize_config(
     yaml_path: str | Path,
+    *, overrides: dict | None = None,
 ) -> tuple[Any, Path, dict[str, Any]]:
     """
     从 case_config.yaml 加载并构建 OptimizeCaseConfig。
@@ -73,11 +74,27 @@ def load_optimize_config(
 
     with yaml_path.open(encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+    cfg = apply_config_overrides(cfg, overrides)
 
     sim_filepath  = _parse_sim_filepath(cfg, yaml_path)
     driver_kwargs = _parse_driver_kwargs(cfg)
     run_cfg       = _build_run_config(cfg)
     opt_cfg       = _build_optimize_config(cfg, run_cfg)
+    from src.agents.actions.authorization import file_digest
+    source_identity = {"config_hash": file_digest(yaml_path),
+                       "model_hash": file_digest(sim_filepath) if sim_filepath.is_file() else None}
+    if overrides:
+        from src.agents.actions.authorization import digest
+        source_identity["configuration_overrides_hash"] = digest(overrides)
+    if hasattr(opt_cfg, "problem"):
+        from dataclasses import replace
+        opt_cfg.problem = replace(opt_cfg.problem, identity={**opt_cfg.problem.identity, **source_identity})
+    if not hasattr(opt_cfg, "problem"):
+        opt_cfg.objective_definitions = cfg.get("objectives", [])
+        opt_cfg.constraint_definitions = cfg.get("constraints", [])
+        opt_cfg.total_evaluation_budget = (cfg.get("execution") or {}).get("max_evaluations", opt_cfg.n_iterations)
+        opt_cfg.problem_identity = {"design_variables": cfg.get("design_variables", []),
+                                    "simulator": cfg.get("simulator", {}), **source_identity}
     if hasattr(opt_cfg, "agent_loop"):
         from ..workflows.agent_entry import configure_agent
         configure_agent(opt_cfg, cfg, yaml_path, sim_filepath)
@@ -92,6 +109,18 @@ def load_optimize_config(
         opt_cfg.n_iterations,
     )
     return opt_cfg, sim_filepath, driver_kwargs
+
+
+def apply_config_overrides(raw, overrides):
+    """Apply a bounded, approval-bound conversation overlay without editing YAML."""
+    from copy import deepcopy
+    result = deepcopy(raw)
+    allowed = {"optimizer", "objectives", "constraints", "execution", "trust_region", "boundary_refine", "feasibility_filter",
+               "feasibility_search", "sensitivity_probe", "search_region", "agent_loop", "early_stopping", "preflight"}
+    if overrides is not None and (not isinstance(overrides, dict) or set(overrides) - allowed):
+        raise ValueError("unsupported conversation configuration overrides")
+    result.update(deepcopy(overrides or {}))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +182,9 @@ def _build_run_config(cfg: dict) -> Any:
         reinit             = bool(sim.get("reinit", True)),
         verify_inputs      = bool(sim.get("verify_inputs", True)),
         input_rtol         = float(sim.get("input_rtol", 1e-6)),
-        check_status_paths = ext.get("check_status_paths") or None,
-        extract_blocks     = ext.get("blocks") or None,
-        extract_streams    = ext.get("streams") or None,
+        check_status_paths = ext.get("check_status_paths"),
+        extract_blocks     = ext.get("blocks"),
+        extract_streams    = ext.get("streams"),
         block_max_depth    = int(ext.get("block_max_depth", 3)),
         stream_max_depth   = int(ext.get("stream_max_depth", 3)),
         stream_output_subtree = str(
@@ -272,12 +301,14 @@ def _parse_design_variables(cfg: dict) -> tuple[dict, dict, set, list[dict[str, 
                 "设计变量 '%s'（type=integer）纳入 BO 搜索空间 [%s, %s]，将在 repair 阶段 round/clamp。",
                 dv.get("name", path), dv["lower_bound"], dv["upper_bound"],
             )
-        else:
+        elif dv_type == "fixed":
             fixed_vars[path] = dv.get("initial_value", dv.get("lower_bound"))
             _log.debug(
                 "设计变量 '%s'（type=%s）不支持贝叶斯优化，固定为初始值 %s。",
                 dv.get("name", path), dv_type, fixed_vars[path],
             )
+        else:
+            raise ValueError(f"unsupported design variable type: {dv_type!r}; declare fixed explicitly")
 
     return param_bounds, fixed_vars, integer_var_paths, derived_var_specs
 
@@ -306,6 +337,9 @@ def _build_optimize_config(cfg: dict, run_cfg: Any) -> Any:
     if "random_seed" in options and options["random_seed"] is not None and type(options["random_seed"]) is not int:
         raise ValueError("optimizer.random_seed must be an integer or null")
     opt_type = cfg.get("optimizer", {}).get("type", "bayesian")
+    if opt_type in {"pso", "nsga2", "ga"}:
+        from ..optimization.configuration import population_config
+        return population_config(cfg, run_cfg)
     if opt_type not in {"bayesian", "pareto_bayesian"}:
         raise ValueError(f"unsupported optimizer.type: {opt_type!r}")
     if opt_type == "pareto_bayesian":

@@ -50,18 +50,9 @@ class TaskPlanner:
 
     @staticmethod
     def _tools_for(agent: str, intent: IntentSchema) -> list[str]:
-        if intent.action_type != "read":
-            return ["read_context"]
-        return {
-            "project_researcher": ["read_files", "read_yaml", "read_node_db", "read_simulation_db"],
-            "process_advisor": ["read_process_context", "read_node_db", "read_simulation_db"],
-            "optimization_advisor": ["read_yaml", "read_simulation_db", "read_checkpoint", "plan_optimization"],
-            "boundary_advisor": ["read_yaml", "read_process_context"],
-            "kinetics_advisor": ["read_files", "read_simulation_db"],
-            "risk_reviewer": ["read_process_context", "read_checkpoint"],
-            "code_engineer": ["read_files"],
-            "report_writer": ["read_evidence", "read_files"],
-        }.get(agent, ["read_context"])
+        from src.agents.subagents.registry import role_definitions
+        definition = role_definitions().get(agent)
+        return list(definition.tool_allowlist) if definition else []
 
 
 class OrchestrationRuntime:
@@ -83,6 +74,7 @@ class OrchestrationRuntime:
         self._resident: dict[str, Any] = dict(resident or {})
         self._lock = threading.Lock()
         self._unavailable = threading.Event()
+        self._failure: AgentUnavailableError | None = None
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
         self.session_id = session_id or hashlib.sha256(str(self.checkpoint_path or id(self)).encode()).hexdigest()[:16]
         self._checkpoint_results: dict[str, TaskResult] = {}
@@ -266,6 +258,8 @@ class OrchestrationRuntime:
 
     def _execute(self, task: TaskSpec, context: Any, *, attempt: int) -> TaskResult:
         if self._unavailable.is_set():
+            if self._failure is not None:
+                raise self._failure
             raise unavailable("subagent_unavailable", stage="runtime_disabled")
         if task.task_id in self._cancelled:
             return TaskResult.failed(task, "task cancelled", status=TaskStatus.CANCELLED)
@@ -290,12 +284,19 @@ class OrchestrationRuntime:
                     self._resident[task.agent] = {"task_id": task.task_id, "status": result.status.value,
                                               "summary": result.summary[:1000], "updated_at": _now()}
             return result
-        except AgentUnavailableError:
+        except AgentUnavailableError as error:
+            with self._lock:
+                if self._failure is None:
+                    self._failure = error
             self._unavailable.set()
             raise
         except Exception as exc:
+            error = failure_from(exc, "subagent")
+            with self._lock:
+                if self._failure is None:
+                    self._failure = error
             self._unavailable.set()
-            raise failure_from(exc, "subagent") from None
+            raise error from None
 
     def _attempts(self, task: TaskSpec) -> int:
         return 1

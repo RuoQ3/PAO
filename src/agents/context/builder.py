@@ -830,6 +830,9 @@ class ProcessContextBuilder:
         elif self.node_db and not case_id:
             diagnostics.append("未提供 case_id，NodeDB 当前值未绑定到具体工况")
         history: list[EvidenceItem] = []
+        facts.append({"kind": "static_node_catalog", "catalog_id": self.catalog_id,
+                      "evidence_ids": [s.id for s in sources if s.source == EvidenceSource.NODEDB],
+                      "nodes": [dict(x) for x in self._catalog_entries_cache]})
         if self.simulation_db:
             rows = self.simulation_db.query_cases(session_id=session_id, limit=100, newest_first=True) if session_id else self.simulation_db.query_cases(limit=100, newest_first=True)
             if not rows:

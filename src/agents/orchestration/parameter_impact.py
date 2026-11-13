@@ -57,6 +57,16 @@ def resolve_output_spec(context: Any, *, metric: str, stream_id: str | None,
         if stream_id and str(item.get("id") or item.get("name")) == str(stream_id):
             candidates.extend(item.get("output_paths") or item.get("aspen_output_paths") or [])
     basis = metric if metric in {"mole_fraction", "mass_fraction"} else (stream or {}).get("composition_basis")
+    # Prefer a declared scalar output with the exact requested basis/entity.
+    # This avoids a full STR_MAIN traversal and any mass/mole substitution.
+    if basis in {"mass_fraction", "mole_fraction"} and stream_id and component:
+        token = "MASSFRAC" if basis == "mass_fraction" else "MOLEFRAC"
+        exact = rf"\Data\Streams\{stream_id}\Output\{token}\MIXED\{component}"
+        declared = list((getattr(context, "configuration", {}) or {}).get("output_paths", []))
+        declared.extend(str(r.get("aspen_path") or "") for r in (getattr(context, "objectives", []) or []))
+        if any(str(p).casefold() == exact.casefold() for p in declared):
+            return OutputSpec(metric, stream_id, component, [exact], "scalar",
+                              "kg/kg" if basis == "mass_fraction" else "mol/mol", basis)
     if metric == "purity" and basis not in {"mole_fraction", "mass_fraction"}:
         return OutputSpec(metric, stream_id, component, [], "unresolved_basis", None)
     if metric in {"mole_fraction", "mass_fraction", "purity", "recovery"} and base:
@@ -269,7 +279,8 @@ def parameter_catalog(context: Any, equipment_id: str) -> list[dict[str, Any]]:
         entry = grouped.setdefault(key, {"aspen_path": path, "aliases": [], "records": [], "configured": False})
         entry["configured"] |= configured
         entry["records"].append(row)
-        entry["aliases"] = list(dict.fromkeys([*entry["aliases"], path, *[v for v in (alias, row.get("name")) if v]]))
+        entry["aliases"] = list(dict.fromkeys([*entry["aliases"], path, path.rsplit("\\", 1)[-1],
+                                              *[v for v in (alias, row.get("name")) if v]]))
     current = getattr(context, "current_values", {}) or {}
     result = []
     for group in grouped.values():

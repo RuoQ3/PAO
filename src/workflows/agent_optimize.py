@@ -334,6 +334,8 @@ def optimize_agent_case(driver, config, *, settings: LoopConfig, checkpoint_path
     evaluator(driver, actual_inputs, run_config, iteration, tags) can be injected for tests.
     A resumed run reconstructs the surrogate from observations, not a pickled LLM/COM object.
     """
+    if resume and config.surrogate_model in {"qEHVI", "NEHVI"}:
+        raise ValueError("BoTorch exact backend resume unsupported; no automatic reinitialization")
     settings = LoopConfig.from_dict(asdict(settings))
     agent = agent or ProcessDecisionAgent()
     if evaluator is None:

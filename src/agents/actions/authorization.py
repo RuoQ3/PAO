@@ -201,7 +201,11 @@ def evaluated_case(fn):
             case.impact_outputs["_source"] = {"execution_id": grant.action_id,
                 "model_path": str(getattr(grant, "execution_model", "")),
                 "model_hash": getattr(grant, "model_hash", None)}
-            if not case.success:
+            # Converged but infeasible candidates are valid optimizer feedback,
+            # not failed simulations. Otherwise a strict purity target exhausts
+            # max_failures before GA can use constraint residuals to improve.
+            if (not case.simulation_valid or not case.objectives_available
+                    or case.has_constraints and not case.constraints_available):
                 grant.failures += 1
             case.execution_algorithm = deepcopy(grant.algorithm)
             if grant.ledger:
